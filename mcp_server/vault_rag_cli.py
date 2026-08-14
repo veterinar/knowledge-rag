@@ -1,12 +1,15 @@
 """vault-rag — local terminal Vault-RAG client for the knowledge-rag MCP server.
 
 Retrieves ranked veterinary excerpts from the already-running local MCP
-endpoint (``search_knowledge`` over streamable HTTP), then generates a
-grounded Russian answer through the local Hermes CLI (inference-only) and
-prints the answer followed by a compact numbered Sources section. MCP and
-Hermes are internal transports only — the user sees plain terminal output.
-Когда генерация не проходит дословную проверку цитат, вместо неё печатается
-детерминированный «Ответ по источникам» из точных блоков найденных документов.
+endpoint (``search_knowledge`` over streamable HTTP), derives concise
+natural-language evidence units from the fetched documents, asks the local
+Hermes CLI (inference-only) to select the most relevant units by their
+opaque IDs, and prints a deterministic Russian answer followed by a compact
+numbered Sources section. MCP and Hermes are internal transports only — the
+user sees plain terminal output. Модель только выбирает готовые фрагменты
+по их идентификаторам, поэтому в ответ не может попасть текст, которого нет
+в найденных документах; при непригодном выборе печатаются детерминированно
+отобранные самые релевантные фрагменты.
 """
 
 import argparse
@@ -16,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import namedtuple
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -29,23 +33,20 @@ DEFAULT_HERMES_MODEL = "qwen2.5-vl-7b-instruct"
 # servers that must not be launched from this CLI (task order, 2026-08-14).
 DEFAULT_HERMES_HOME = "/Users/alis/.local/share/vetclub-knowledge-rag/hermes-vault-rag"
 # The task order requires a bounded timeout; the exact figure is a default
-# sized for a local 7B model answering from a few kilobytes of context.
+# sized for a local 7B model selecting from a few kilobytes of context.
 HERMES_TIMEOUT_SECONDS = 300
-# Deterministic context caps (task order: bound the prompt size; raised
-# 2026-08-14 after the E2E showed 1200 truncated a decisive azotemia matrix).
-MAX_FRAGMENT_CHARS = 4000
+# Deterministic context cap (task order: bound the prompt size).
 MAX_CONTEXT_CHARS = 16000
-# Full-document evidence windows (task order, 2026-08-14): ~5000 chars per
-# document so up to three windows fit the 16000-char context budget.
-DOC_WINDOW_CHARS = 5000
-WINDOW_STEP_CHARS = 1000  # deterministic scan stride for window selection
-# Grounding validation bound (task order, 2026-08-14): a quoted span shorter
-# than this cannot anchor a factual claim.
-MIN_QUOTE_CHARS = 12
-# «Ответ по источникам» bound (task order, 2026-08-14: the fallback is a
-# concise cited answer, never an excerpt dump). Equal to MAX_FRAGMENT_CHARS so
-# one decisive block (the azotemia matrix that set that cap) still fits whole.
-EVIDENCE_TOTAL_CHARS = MAX_FRAGMENT_CHARS
+# Evidence-unit bounds (task order, 2026-08-14): concise natural-language
+# units derived from fetched documents/chunks. The model only selects among
+# them by ID, so these caps also bound the printed answer.
+MIN_UNIT_CHARS = 30
+MAX_UNIT_CHARS = 500
+MAX_UNITS = 12
+# The model must pick 1..MAX_SELECTED unit IDs; when its output is unusable,
+# the deterministic fallback picks the FALLBACK_SELECTED top-scored units.
+MAX_SELECTED = 5
+FALLBACK_SELECTED = 3
 
 # CLI method -> search_knowledge arguments. The tool accepts only
 # auto|hybrid|fts5; per its docstring semantic/keyword are hybrid with
@@ -58,40 +59,30 @@ _METHOD_PARAMS = {
     "fts5": {"search_method": "fts5"},
 }
 
-# Output grammar (task order, 2026-08-14): the prompt and _validate_answer
-# describe the same machine-checkable format, so a drift between them is a
-# defect. Every non-empty answer line is built only of verbatim «quote» [n]
-# pairs joined by the connector phrases listed below; citation-free lines are
-# never accepted — generation runs only with non-empty retrieval results, so
-# an answer that cites nothing falls back to the deterministic «Ответ по
-# источникам» instead of being printed as abstention.
-_PROMPT_HEADER = (
-    "Ты — ассистент локальной ветеринарной базы знаний. Ответь на вопрос, "
-    "используя ТОЛЬКО приведённые ниже фрагменты.\n"
-    "Формат ответа жёсткий, его проверяет программа:\n"
-    "1. Отвечай по-русски, коротким списком пунктов.\n"
-    "2. Пункт с фактом состоит ТОЛЬКО из дословных цитат из фрагментов в "
-    "«кавычках», каждая сразу со ссылкой [n] на номер своего фрагмента, и "
-    "связок «и», «а», «но», «а также», «при этом», «тогда как» со знаками "
-    "препинания. Ни одного другого слова вне «кавычек» в пункте с фактом "
-    "быть не должно: пересказ, выводы и пояснения своими словами запрещены.\n"
-    "   Пример пункта: — «мочевина повышена» [1], но «креатинин без "
-    "изменений» [2].\n"
-    "3. Цитата — законченная фраза или строка фрагмента, скопированная "
-    "дословно, без изменений и сокращений; направления и отрицания "
-    "(«повышен», «снижен», «в норме», «не повышен») могут стоять только "
-    "внутри цитат. Стрелки, тире и знаки (↑, ↓, →, =, >, <, /, \\, +, -) "
-    "вне «кавычек» запрещены.\n"
-    "4. Заголовков, меток и строк с двоеточием не пиши: любая строка без "
-    "«кавычек» со ссылкой [n] не пройдёт проверку.\n"
-    "5. Показатель, о котором фрагменты молчат, просто не упоминай: слова "
-    "вне «кавычек», кроме перечисленных связок, запрещены.\n"
-    "6. Даже если фрагменты отвечают на вопрос лишь частично, приводи "
-    "только точные цитаты со ссылками по правилу 2; ничего не выдумывай и "
-    "не дописывай от себя.\n"
-    "7. Это справка по базе знаний, а не рекомендация по лечению: не "
-    "добавляй назначений и доз, которых нет во фрагментах дословно.\n"
-)
+# Selection contract (task order, 2026-08-14): the model never writes answer
+# text. It only returns the opaque IDs of the evidence units to print, as one
+# strict JSON object, so no unsupported model prose can enter the answer.
+_Unit = namedtuple("_Unit", "uid rank position score text")
+
+
+def _selection_prompt(query: str, units: list) -> str:
+    lines = [
+        "Ты — селектор доказательств для локальной ветеринарной базы знаний.",
+        "Ниже вопрос и пронумерованные фрагменты (E1, E2, …) из найденных документов.",
+        f"Выбери от 1 до {MAX_SELECTED} фрагментов, которые лучше всего отвечают на вопрос.",
+        "Верни СТРОГО один JSON-объект и ничего больше, по образцу:",
+        '{"evidence_ids": ["E3", "E7"]}',
+        "Правила: только идентификаторы из списка ниже, без повторов, в том порядке,",
+        "в котором фрагменты должны идти в ответе; никакого другого текста, пояснений",
+        "или Markdown вне JSON.",
+        "",
+        f"Вопрос: {query}",
+        "",
+        "Фрагменты:",
+    ]
+    for unit in units:
+        lines.append(f"{unit.uid}: {unit.text}")
+    return "\n".join(lines) + "\n"
 
 
 def _limit(value: str) -> int:
@@ -190,137 +181,8 @@ def _query_stems(query: str) -> list:
     return stems
 
 
-def _select_window(full_text: str, stems: list, size: int = DOC_WINDOW_CHARS) -> str:
-    """Pick the query-densest window of the document; '' when no stem matches."""
-    if not full_text:
-        return ""
-    if len(full_text) <= size:
-        return full_text
-    lowered = full_text.lower()
-    starts = list(range(0, len(full_text) - size + 1, WINDOW_STEP_CHARS))
-    if starts[-1] != len(full_text) - size:
-        starts.append(len(full_text) - size)
-    best_start, best_score = 0, (0, 0)
-    for start in starts:
-        window = lowered[start:start + size]
-        distinct, weighted = 0, 0
-        for stem in stems:
-            count = window.count(stem)
-            if count:
-                distinct += 1
-                weighted += len(stem) * count
-        score = (distinct, weighted)
-        if score > best_score:  # strict: earliest window wins ties (deterministic)
-            best_score, best_start = score, start
-    if best_score == (0, 0):
-        return ""
-    return full_text[best_start:best_start + size]
-
-
 def _fragment_label(item: dict) -> str:
     return str(item.get("filename") or item.get("source") or "<файл не указан>")
-
-
-def _fragment_evidence(item: dict, stems: list) -> str:
-    """Evidence text for one result: query-dense full-doc window, else the chunk."""
-    window = _select_window(str(item.get("_full_document") or ""), stems)
-    if window:
-        return " ".join(window.split())
-    content = " ".join(str(item.get("content") or "").split())
-    if len(content) > MAX_FRAGMENT_CHARS:
-        content = content[:MAX_FRAGMENT_CHARS].rstrip() + "…"
-    return content
-
-
-def _build_prompt(query: str, results: list) -> tuple:
-    """Build the bounded prompt; return (prompt, used fragments, per-[n] evidence)."""
-    stems = _query_stems(query)
-    used, blocks, evidences, total = [], [], [], 0
-    for item in results:
-        evidence = _fragment_evidence(item, stems)
-        block = f"[{len(used) + 1}] {_fragment_label(item)}: {evidence}"
-        if used and total + len(block) > MAX_CONTEXT_CHARS:
-            break  # deterministic bound: keep the highest-ranked fragments
-        used.append(item)
-        blocks.append(block)
-        evidences.append(evidence)
-        total += len(block)
-    prompt = f"{_PROMPT_HEADER}\nВопрос: {query}\n\nФрагменты:\n" + "\n\n".join(blocks) + "\n"
-    return prompt, used, evidences
-
-
-def _normalize_span(span: str) -> str:
-    return " ".join(span.casefold().replace("ё", "е").split())
-
-
-_QUOTE_CITE_RES = (
-    re.compile(r"«([^«»]+)»\s*\[(\d+)\]"),
-    re.compile(r"[\"“]([^\"“”]+)[\"”]\s*\[(\d+)\]"),
-)
-# Connector phrases a factual line may carry outside «quote» [n] pairs — the
-# exact whole phrases advertised in _PROMPT_HEADER rule 2. Function words
-# only: none of them can assert an indicator, a direction or a value.
-_CONNECTOR_RE = re.compile(r"\b(?:а\s+также|при\s+этом|тогда\s+как|и|а|но)\b", re.IGNORECASE)
-# Anchored residue allowlist: besides connector phrases, only whitespace and
-# neutral punctuation (, . ; : and parentheses) may remain. Everything else —
-# bare words, digits, uncited quotes, bullets and arrow/operator/direction
-# symbols (↑ ↓ → = < > / \ + - – —) — fails the line. Leading list markers
-# are stripped before validation; none of these symbols may remain in the
-# residue itself.
-_RESIDUE_ALLOWED_RE = re.compile(r"^[\s,.;:()]*$")
-
-
-def _line_quote_pairs(line: str) -> list:
-    pairs = []
-    for pattern in _QUOTE_CITE_RES:
-        pairs.extend(pattern.findall(line))
-    return pairs
-
-
-def _strip_quote_pairs(line: str) -> str:
-    for pattern in _QUOTE_CITE_RES:
-        line = pattern.sub(" ", line)
-    return line
-
-
-def _residue_is_nonfactual(residue: str) -> bool:
-    """True when the text left after removing «quote» [n] pairs adds no fact:
-    only advertised connector phrases, whitespace and neutral punctuation
-    from the anchored allowlist may remain."""
-    residue = _CONNECTOR_RE.sub(" ", residue)
-    return _RESIDUE_ALLOWED_RE.fullmatch(residue) is not None
-
-
-def _validate_answer(answer: str, evidences: list) -> bool:
-    """Accept only answers matching the prompt's output grammar: every quote
-    on a factual line must verify verbatim against its cited evidence and the
-    rest of the line must pass the anchored connector allowlist. Citation-free
-    lines always fail: generation runs only with non-empty retrieval results,
-    so model abstention falls through to the exact-source fallback."""
-    content_lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
-    normalized_evidences = [_normalize_span(ev) for ev in evidences]
-    verified_pairs = 0
-    for raw_line in content_lines:
-        line = raw_line.lstrip("-*•–—# ").strip()
-        line = re.sub(r"^\d+[.)]\s+", "", line).rstrip("*").strip()
-        if not line:
-            continue
-        pairs = _line_quote_pairs(line)
-        if not pairs:
-            # A citation-free line — heading, label, paraphrase, or an
-            # abstention sentence — fails closed.
-            return False
-        for quote, n_str in pairs:
-            span = _normalize_span(quote)
-            index = int(n_str) - 1
-            if not (len(span) >= MIN_QUOTE_CHARS
-                    and 0 <= index < len(normalized_evidences)
-                    and span in normalized_evidences[index]):
-                return False  # every pair must verify, not merely one of them
-        if not _residue_is_nonfactual(_strip_quote_pairs(line)):
-            return False  # a verified quote must not bless a factual tail
-        verified_pairs += len(pairs)
-    return verified_pairs > 0
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -342,49 +204,115 @@ def _score_block(block: str, stems: list) -> tuple:
     return (distinct, weighted)
 
 
-def _evidence_answer(query: str, used: list) -> str:
-    """Deterministic «Ответ по источникам»: the most query-relevant exact
-    source blocks with [n] citations. The rejected generation is never
-    printed, and no per-document dump is produced."""
-    stems = _query_stems(query)
-    candidates = []
-    for rank, item in enumerate(used, 1):
-        text = _strip_frontmatter(str(item.get("_full_document") or ""))
-        blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
-        for position, block in enumerate(blocks):
-            score = _score_block(block, stems)
-            if score > (0, 0):
-                candidates.append((score, rank, position, block))
-    if not candidates:
-        for rank, item in enumerate(used, 1):
-            chunk = " ".join(str(item.get("content") or "").split())
-            if chunk:
-                candidates.append(((0, 0), rank, 0, chunk))
-                break
-    candidates.sort(key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]))
-    chosen, total = [], 0
-    for _score, rank, position, block in candidates:
-        block = block[:EVIDENCE_TOTAL_CHARS]
-        if chosen and total + len(block) > EVIDENCE_TOTAL_CHARS:
+# Fenced ``` / ~~~ blocks (code, YAML, mermaid…) are never evidence.
+_FENCED_BLOCK_RE = re.compile(r"^[ \t]*(```|~~~).*?^[ \t]*\1[^\n]*$", re.MULTILINE | re.DOTALL)
+
+
+def _natural_lines(block: str) -> list:
+    """Keep only natural-language lines of a block: drop headings, table rows,
+    table rules and stray fence markers; strip list markers so a unit reads
+    as plain prose."""
+    kept = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "|", "```", "~~~")):
             continue
-        chosen.append((rank, position, block))
-        total += len(block)
-        if total >= EVIDENCE_TOTAL_CHARS:
+        if re.fullmatch(r"[|\s:+=_-]+", line):
+            continue
+        line = re.sub(r"^(?:[-*•>–—]|\d+[.)])\s+", "", line).strip()
+        if line:
+            kept.append(line)
+    return kept
+
+
+def _evidence_units(query: str, results: list) -> list:
+    """Bounded, query-relevant natural-language evidence units derived from
+    the fetched documents (search chunks when a document is unavailable).
+    Each unit stays bound to its source rank and carries an opaque ID; the
+    printed answer is assembled only from these units."""
+    stems = _query_stems(query)
+    scored, seen = [], set()
+    for rank, item in enumerate(results, 1):
+        text = _strip_frontmatter(str(item.get("_full_document") or ""))
+        if not text.strip():
+            text = str(item.get("content") or "")
+        text = _FENCED_BLOCK_RE.sub("", text)
+        for position, block in enumerate(re.split(r"\n\s*\n", text)):
+            unit_text = " ".join(" ".join(_natural_lines(block)).split())
+            if len(unit_text) < MIN_UNIT_CHARS:
+                continue
+            if len(unit_text) > MAX_UNIT_CHARS:
+                unit_text = unit_text[:MAX_UNIT_CHARS].rstrip() + "…"
+            key = unit_text.casefold()
+            if key in seen:  # the same document can back several results
+                continue
+            seen.add(key)
+            scored.append((_score_block(unit_text, stems), rank, position, unit_text))
+    relevant = [entry for entry in scored if entry[0] > (0, 0)] or scored
+    relevant.sort(key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]))
+    chosen, total = [], 0
+    for entry in relevant:
+        if len(chosen) >= MAX_UNITS or total + len(entry[3]) > MAX_CONTEXT_CHARS:
             break
-    lines = [
-        "Ответ по источникам (локальная генерация не прошла проверку цитат; "
-        "ниже — точные выдержки из найденных документов):",
+        chosen.append(entry)
+        total += len(entry[3])
+    chosen.sort(key=lambda entry: (entry[1], entry[2]))  # document order for the prompt
+    return [
+        _Unit(f"E{number}", rank, position, score, text)
+        for number, (score, rank, position, text) in enumerate(chosen, 1)
     ]
-    if not chosen:
-        lines.append("Дословных блоков по запросу выделить не удалось — см. список источников ниже.")
-    for rank, _position, block in sorted(chosen):
-        lines.append("")
-        lines.append(f"«{block}» [{rank}]")
+
+
+# Optional fence around the model's JSON — tolerated, everything else strict.
+_FENCE_WRAP_RE = re.compile(r"^```[\w-]*\s*\n(.*?)\n?\s*```$", re.DOTALL)
+
+
+def _parse_selection(raw: str, units: list):
+    """IDs from a strict {"evidence_ids": [...]} model output, or None.
+    A fenced ```json``` wrapper is tolerated; anything else — extra keys,
+    prose, unknown/repeated IDs, wrong count — rejects the whole output and
+    the deterministic fallback answers instead."""
+    text = (raw or "").strip()
+    fenced = _FENCE_WRAP_RE.match(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"evidence_ids"}:
+        return None
+    ids = payload["evidence_ids"]
+    known = {unit.uid for unit in units}
+    if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_SELECTED
+            or len(set(ids)) != len(ids)
+            or not all(isinstance(uid, str) and uid in known for uid in ids)):
+        return None
+    return ids
+
+
+def _fallback_ids(units: list) -> list:
+    """Deterministic choice when the model output is unusable: the top-scored
+    units, cited in source order."""
+    ranked = sorted(units, key=lambda u: (-u.score[0], -u.score[1], u.rank, u.position))
+    picked = sorted(ranked[:FALLBACK_SELECTED], key=lambda u: (u.rank, u.position))
+    return [unit.uid for unit in picked]
+
+
+def _compose_answer(ids: list, units: list) -> str:
+    """Concise deterministic answer: neutral heading, then one clean bullet
+    per selected unit with its [source-rank] citation."""
+    by_id = {unit.uid: unit for unit in units}
+    lines = ["Ответ по источникам:"]
+    for uid in ids:
+        unit = by_id[uid]
+        lines.append(f"— {unit.text} [{unit.rank}]")
     return "\n".join(lines)
 
 
 def _generate_answer(prompt: str) -> str:
-    """Run the local Hermes CLI non-interactively and return the answer text."""
+    """Run the local Hermes CLI non-interactively and return its raw output
+    (expected: one strict JSON object with the selected evidence IDs)."""
     hermes_bin = os.environ.get("VAULT_RAG_HERMES_BIN") or DEFAULT_HERMES_BIN
     provider = os.environ.get("VAULT_RAG_HERMES_PROVIDER") or DEFAULT_HERMES_PROVIDER
     model = os.environ.get("VAULT_RAG_HERMES_MODEL") or DEFAULT_HERMES_MODEL
@@ -494,9 +422,16 @@ def main() -> int:
         print(f"Сервер вернул ошибку: {message}", file=sys.stderr)
         return 1
 
-    prompt, used, evidences = _build_prompt(query, results)
+    units = _evidence_units(query, results)
+    if not units:
+        answer = ("Ответ по источникам:\n"
+                  "— Подходящих текстовых фрагментов выделить не удалось; "
+                  "см. список источников ниже.")
+        _render(answer, results, len(results))
+        return 0
+
     try:
-        answer = _generate_answer(prompt)
+        selection = _generate_answer(_selection_prompt(query, units))
     except KeyboardInterrupt:
         print("Прервано пользователем.", file=sys.stderr)
         return 130
@@ -504,10 +439,10 @@ def main() -> int:
         print(f"Ошибка генерации ответа (Hermes): {exc}", file=sys.stderr)
         return 3
 
-    if not _validate_answer(answer, evidences):
-        # Never print an ungrounded generation; fall back to exact excerpts.
-        answer = _evidence_answer(query, used)
-    _render(answer, used, len(results))
+    # The model only selects unit IDs; an unusable selection falls back to
+    # the deterministic top-scored units, never to the raw model output.
+    ids = _parse_selection(selection, units) or _fallback_ids(units)
+    _render(_compose_answer(ids, units), results, len(results))
     return 0
 
 

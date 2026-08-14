@@ -359,6 +359,11 @@ flowchart TB
         C5[VS Code · Cline · Gemini CLI · Zed]
     end
 
+    subgraph VAULTRAG["vault-rag Terminal Client (local CLI)"]
+        VR[vault-rag<br/>grounded Russian answers]
+        HL[Local Hermes CLI · Qwen 7B<br/>evidence selector · JSON IDs only]
+    end
+
     subgraph TRANSPORT["Transport Layer"]
         T1[stdio<br/>1 process per client]
         T2[SSE / streamable-http<br/>1 server serves N clients]
@@ -416,6 +421,8 @@ flowchart TB
 
     C1 & C2 & C3 & C4 & C5 -->|MCP protocol| T1
     C1 & C2 & C3 & C4 & C5 -.->|remote deploy| T2
+    VR -->|streamable-http| T2
+    VR -->|evidence units| HL
     T1 --> MCP
     T2 --> M1 --> M2 --> M3 --> MCP
 
@@ -460,7 +467,7 @@ flowchart TB
     classDef obs fill:#dc2626,stroke:#7f1d1d,color:#fff
     classDef ingest fill:#f59e0b,stroke:#78350f,color:#fff
 
-    class C1,C2,C3,C4,C5 client
+    class C1,C2,C3,C4,C5,VR,HL client
     class T1,T2 transport
     class M1,M2,M3 middleware
     class CH,FT,MD storage
