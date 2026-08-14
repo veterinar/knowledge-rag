@@ -15,67 +15,74 @@ search:
     enabled: true
 ```
 
-Restart the daemon. On the next `KnowledgeOrchestrator` init the migration
-detects a missing (or non-`complete`) marker file and dispatches a background
-thread that populates `<data_dir>/fts5_index.db` from ChromaDB.
+Restart the daemon. Construction only creates handles (Package B): the single
+startup dispatch in `main()` is a bounded admission — a background worker
+captures the Chroma snapshot and either proves live FTS == that exact source
+(publishing ready) or rebuilds from zero; hybrid serves in the meantime.
 
 ## 2. Wait for the migration to finish
 
-While the migration runs, lexical queries fall back to the hybrid path and
-emit `fast_path_fallback_total{reason="disabled"}` plus a warning log
-`FTS5 migration in progress`. The daemon continues serving queries the
-entire time — the migration never blocks the request path.
+While the rebuild runs, `ready=false` is observable immediately: automatic
+lexical queries fall back to the hybrid path
+(`fast_path_fallback_total{reason="disabled"}`) while explicit
+`search_method="fts5"` raises `Fts5NotReadyError`. The daemon keeps serving
+queries the entire time — the rebuild never blocks the request path.
 
 Expected timings (SSD SATA):
 - 3865 docs (canonical bench corpus): ~60 s
 - 10 000 docs: ~2–3 min
 - 100 000 docs: ~15–30 min
 
-Progress is logged every 10 % (`[FTS5] migration progress: 30% (30/100)`)
-and exposed on `/metrics`:
-
-- `knowledge_rag_fast_path_migration_docs_indexed` gauge
-- `knowledge_rag_fast_path_migration_docs_total` gauge
+On `/metrics`, `…migration_docs_total` is set at snapshot capture, while
+`…migration_docs_indexed` resets to 0 at each admitted start and on failure and
+is set only after a verified complete (no incremental 10 % logs).
 
 ## 3. Verify the marker file
 
-`<data_dir>/fts5_migration.state` — canonical JSON schema:
+`<data_dir>/fts5_migration.state` — canonical schema v2 (Package B):
 
 ```json
 {
+  "schema_version": 2,
+  "generation": 1,
   "status": "complete",
   "docs_total": 3865,
   "docs_indexed": 3865,
+  "source_rows_sha256": "<64-hex canonical source digest>",
+  "verified_fts_rows_sha256": "<64-hex read-back digest>",
   "started_at": "2026-08-07T12:00:00+00:00",
   "completed_at": "2026-08-07T12:01:02+00:00",
   "error": null
 }
 ```
 
-- `status: "complete"` → fast-path is live, queries dispatch to FTS5.
-- `status: "in_progress"` → migration still running (or was interrupted).
-  The daemon resumes from `docs_indexed` on the next restart — it never
-  rebuilds from zero.
-- `status: "failed"` → see `error` field for the exception class + message.
-  Queries fall back permanently until you rebuild manually.
+- Serving readiness requires full credibility: schema v2, strict integer
+  generation/counts, matching 64-hex digests, exact counts, and a recomputed
+  live read-back digest equal to the *currently captured* Chroma source —
+  after a corpus swap the old index is never re-advertised (P1-2).
+- `status: "in_progress"` / `"invalidated"` (durable reset) — or anything
+  unversioned/malformed/inconsistent — rebuilds from zero; there is no resume.
+- `status: "failed"` → `error` holds the sanitized exception class only.
+  Queries fall back until a rebuild succeeds.
 
 ## 4. Manual rebuild
 
-Use `scripts/build_fts5_index.py` when the marker file shows `failed`,
-when you suspect index corruption, or when a maintenance window makes a
-foreground rebuild convenient:
+`scripts/build_fts5_index.py` runs the same content-bound primitive the
+daemon uses (capture → digest → staging → read-back verify → guarded swap →
+schema-v2 marker), offline-only until Package C closes direct-CRUD parity.
+`--data-dir` binds the Chroma source (`<root>/chroma_db`) AND the FTS target:
 
 ```bash
-# Drop the DB + marker and rebuild synchronously.
+# Staged, atomic rebuild bound to one data root.
 python scripts/build_fts5_index.py --data-dir data/ --force --foreground --verbose
 ```
 
 Flags:
-- `--data-dir <path>` — defaults to `config.data_dir`; override for tests.
-- `--force` — remove `fts5_index.db`, `fts5_index.db-wal`, `fts5_index.db-shm`,
-  and `fts5_migration.state` before starting.
+- `--data-dir <path>` — data root for the Chroma source and FTS target (defaults to `config.data_dir`).
+- `--force` — force a staged rebuild; the prior credible DB/marker are never
+  unlinked before source capture (the swap is atomic).
 - `--foreground` — block until complete (default; kept for parity).
-- `--verbose` / `-v` — emit a log line per 100-row batch.
+- `--verbose` / `-v` — reserved for compatibility; the rebuild emits no per-batch output.
 
 The script exits `0` on success, prints an elapsed-time banner, and leaves
 the marker file at `status: "complete"`.
@@ -91,11 +98,11 @@ practices:
 - Prefer `scripts/build_fts5_index.py --foreground` in ops runbooks: the
   operator sees progress synchronously and cannot accidentally reboot the
   daemon mid-rebuild.
-- If the daemon is killed mid-migration, the marker file preserves the
-  last checkpointed `docs_indexed`. Restart the daemon and the worker
-  resumes from that batch.
-- CRUD writes that happen during migration are appended incrementally via
-  `add_document` (ADR-008), so ingestion is never blocked.
+- If the daemon is killed mid-rebuild, the marker stays non-credible and the
+  next startup dispatch rebuilds from zero — nothing resumes positionally.
+- Direct CRUD during a rebuild lands outside the captured snapshot; that
+  parity boundary belongs to Package C, which is also why the builder stays
+  offline-only until Package C is accepted.
 
 ## Related
 

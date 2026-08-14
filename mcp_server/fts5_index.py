@@ -14,19 +14,20 @@ References:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import struct
 import tempfile
 import threading
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 ChunkRow = Tuple[str, str, str, str]
-ChunkIterFactory = Callable[[], Iterable[ChunkRow]]
-ProgressCallback = Callable[[int, int], None]
 
 _FTS5_TOKENIZER = "unicode61 remove_diacritics 2 tokenchars '-_.'"
 
@@ -146,13 +147,68 @@ class Fts5MigrationState:
         return bool(data) and data.get("status") == "complete"
 
 
-class Fts5LexicalIndex:
-    """SQLite FTS5 wrapper — search, connection lifecycle, readiness flag.
+_FTS5_ROWS_DOMAIN = b"knowledge-rag.fts5.rows.v1\x00"
+MARKER_SCHEMA_VERSION = 2  # marker schema v2 (task: v4.8.3 Gate 0 Package B)
+_HEX64 = re.compile(r"[0-9a-f]{64}")  # digest fields must be exact 64-hex (P1-5)
 
-    Task 05 will extend this class with ``add_document``/``remove_document``/
-    ``update_document``/``start_migration_background``. For Fase 1 only
-    read-side + lifecycle primitives ship.
-    """
+
+def _is_uint(value: Any, minimum: int = 0) -> bool:  # strict schema ints: bool is rejected
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def compute_rows_digest(rows: Iterable[ChunkRow]) -> Tuple[str, int]:  # canonical digest: str(value or "") UTF-8 fields, raw-byte sort, dup-reject
+    encoded, seen = [], set()
+    for row in rows:
+        fields = tuple(str(value or "").encode("utf-8") for value in row)
+        if fields[0] in seen:
+            raise Fts5MigrationError(f"duplicate chunk_id in row set: {fields[0]!r}")
+        seen.add(fields[0])
+        encoded.append(fields)
+    encoded.sort(key=lambda fields: fields[0])
+    digest = hashlib.sha256(_FTS5_ROWS_DOMAIN + struct.pack(">Q", len(encoded)))
+    for fields in encoded:
+        for field in fields:
+            digest.update(struct.pack(">Q", len(field)) + field)
+    return digest.hexdigest(), len(encoded)
+
+
+def capture_chunk_rows(collection: Any, batch_size: int = 500) -> List[ChunkRow]:  # exact id listing + explicit-ID hydration mapped by returned id (B03/D4)
+    ids = [str(chunk_id) for chunk_id in (collection.get(include=[]) or {}).get("ids") or []]
+    if len(ids) != int(collection.count()) or len(set(ids)) != len(ids):
+        raise Fts5MigrationError("snapshot id listing count/duplicate mismatch")
+    ids.sort(key=lambda chunk_id: chunk_id.encode("utf-8"))  # canonical global population order (P1-6)
+    rows: List[ChunkRow] = []
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start : start + batch_size]
+        fetched = collection.get(ids=list(batch), include=["documents", "metadatas"]) or {}
+        got_ids = [str(rid) for rid in fetched.get("ids") or []]
+        docs, metas = fetched.get("documents") or [], fetched.get("metadatas") or []
+        position_by_id = {rid: i for i, rid in enumerate(got_ids)}
+        if not (len(got_ids) == len(docs) == len(metas) == len(position_by_id)) or not set(got_ids).issubset(batch):
+            raise Fts5MigrationError("snapshot response cardinality/identity mismatch")
+        for chunk_id in batch:
+            i = position_by_id.get(chunk_id)
+            if i is None:
+                raise Fts5MigrationError(f"snapshot read missing chunk_id {chunk_id!r}")
+            rows.append((str(chunk_id or ""), str(docs[i] or ""),
+                         str((metas[i] or {}).get("filename") or ""), str((metas[i] or {}).get("category") or "")))
+    return rows
+
+
+def is_credible_v2_marker(payload: Optional[dict], live_row_count: int) -> bool:  # complete schema-v2 marker: strict int generation/counts, matching 64-hex digests
+    if not isinstance(payload, dict):
+        return False
+    source = payload.get("source_rows_sha256")
+    return (payload.get("schema_version") == MARKER_SCHEMA_VERSION and payload.get("status") == "complete"
+            and _is_uint(payload.get("generation"), 1) and isinstance(source, str)
+            and bool(_HEX64.fullmatch(source)) and source == payload.get("verified_fts_rows_sha256")
+            and _is_uint(payload.get("docs_total")) and _is_uint(payload.get("docs_indexed"))
+            and payload.get("docs_total") == payload.get("docs_indexed") == live_row_count)
+
+
+class Fts5LexicalIndex:
+    """SQLite FTS5 wrapper — search, CRUD sync, and the Package-B content-bound
+    generation rebuild (schema-v2 markers; the positional resume path is retired)."""
 
     def __init__(self, db_path: Path, state_path: Path) -> None:
         self._db_path = Path(db_path)
@@ -161,9 +217,14 @@ class Fts5LexicalIndex:
         self._fts5_lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         self._ready: bool = False
+        self._generation = 1  # in-place generation coordination (reset never swaps objects)
+        self._invalidated, self._active_rebuild_gen, self._rollback_snapshot, self._mutation_epoch = False, None, None, 0
         self._connect_and_configure()
         self._migration_state = Fts5MigrationState(self._state_path)
-        self._ready = self._migration_state.is_complete()
+        payload = self._migration_state.read()
+        if isinstance(payload, dict) and isinstance(payload.get("generation"), int):
+            self._generation = max(1, payload["generation"])  # D2: reopen restores the counter
+        self._ready = False  # promoted only by verified rebuild/publication/restore (P1-1)
 
     @property
     def db_path(self) -> Path:
@@ -190,20 +251,77 @@ class Fts5LexicalIndex:
                 return 0
 
     def is_ready(self) -> bool:
-        """Return True once migration has completed at least once.
+        with self._fts5_lock:  # flag only; promotion solely via verified rebuild/publication/restore (P1-1/P1-2)
+            return self._ready
 
-        Re-checks the marker file when the cached flag is False so a
-        background migration finishing AFTER this instance was constructed
-        (e.g. an orchestrator built during nuclear_rebuild swap while the
-        FTS5 migration is still running) flips ``_ready`` on the next call
-        instead of being permanently stuck at False.
-        """
-        if self._ready:
-            return True
-        if self._migration_state.is_complete():
+    def _live_digest(self) -> Optional[Tuple[str, int, int]]:  # (digest, distinct, epoch); short lock holds (Locks §4/P1-B)
+        rows, last_rowid, epoch = [], 0, None
+        while True:
             with self._fts5_lock:
-                self._ready = True
-        return self._ready
+                if self._conn is None or epoch not in (None, self._mutation_epoch):
+                    return None  # live mutated between pages (P1-B)
+                epoch = self._mutation_epoch
+                page = self._conn.execute("SELECT rowid, chunk_id, content, filename, category FROM fts5_documents WHERE rowid > ? ORDER BY rowid LIMIT 400", (last_rowid,)).fetchall()
+            if not page:
+                try:
+                    digest, distinct = compute_rows_digest(rows)
+                except Fts5MigrationError:
+                    return None  # duplicate chunk_ids in the live table
+                return digest, distinct, epoch
+            last_rowid = page[-1][0]
+            rows.extend(tuple(row[1:]) for row in page)
+
+    def _live_matches(self, payload: Optional[dict]) -> bool:  # exact live read-back vs marker (P1-5/D3)
+        if self._conn is None or not is_credible_v2_marker(payload, self.count()):
+            return False
+        live = self._live_digest()
+        return live is not None and live[:2] == (payload["verified_fts_rows_sha256"], payload["docs_total"])
+
+    def verify_and_publish(self, source_digest: str, total: int, generation: int, started_at: Optional[str] = None) -> bool:  # BC-04 exact publisher: live count/distinct/digest must equal the source identity under the current generation
+        try:
+            live = self._live_digest()  # paged short lock holds — searches stay responsive (Locks §4)
+        except Exception as exc:  # F5: read failure fails the candidate generation closed
+            self.publish_rebuild_failure(generation, exc)
+            raise
+        if live is None or live[:2] != (source_digest, total):
+            return False
+        with self._fts5_lock:
+            if (self._generation != generation or self._conn is None or self.count() != total
+                    or self._mutation_epoch != live[2]):  # P1-B: reject any mutation since the scan
+                return False
+            now = datetime.now(timezone.utc).isoformat()
+            if not self._write_v2_marker(generation, "complete", total, total, source_digest, source_digest, started_at or now, now, None):
+                return False
+            self._ready = True
+            self._invalidated = False
+            self._drop_table_quiet(f"fts5_documents_backup_g{generation}")  # P1-A: reconcile crash leftovers
+            return True
+
+    def search_if_ready(self, query: str, top_k: int = 20) -> Optional[List[Tuple[str, float]]]:
+        with self._fts5_lock:  # atomic serving path: readiness flag + search under one lock hold (BC-03)
+            return self.search(query, top_k=top_k) if self._ready else None
+
+    def invalidate_generation(self) -> int:
+        with self._fts5_lock:  # retire the generation (reset); a blocked worker's late writes go stale
+            self._rollback_snapshot = prior if is_credible_v2_marker((prior := self._migration_state.read()), self.count()) else None
+            self._generation += 1
+            self._ready = False
+            self._invalidated = True
+            with suppress(Exception):  # D2 durable; restart stays fail-closed via source compare even if this write fails
+                self._write_v2_marker(self._generation, "invalidated", 0, 0, None, None, datetime.now(timezone.utc).isoformat(), None, None)
+            return self._generation
+
+    def begin_rebuild(self) -> Optional[int]:
+        with self._fts5_lock:  # single-flight admission: None while this generation has a worker
+            if self._active_rebuild_gen == self._generation:
+                return None
+            self._active_rebuild_gen = self._generation
+            return self._generation
+
+    def end_rebuild(self, generation: int) -> None:
+        with self._fts5_lock:
+            if self._active_rebuild_gen == generation:
+                self._active_rebuild_gen = None
 
     def _connect_and_configure(self) -> None:
         """Open the SQLite connection and apply ADR-001 PRAGMAs + schema."""
@@ -303,7 +421,7 @@ class Fts5LexicalIndex:
                 "INSERT INTO fts5_documents (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)",
                 (chunk_id, content, filename, category),
             )
-            self._conn.commit()
+            self._commit_live()
 
     def remove_document(self, chunk_id: str) -> None:
         """Delete every row matching ``chunk_id`` (ADR-008)."""
@@ -314,7 +432,7 @@ class Fts5LexicalIndex:
                 "DELETE FROM fts5_documents WHERE chunk_id = ?",
                 (chunk_id,),
             )
-            self._conn.commit()
+            self._commit_live()
 
     def update_document(self, chunk_id: str, content: str, filename: str, category: str) -> None:
         """DELETE + INSERT atomico — FTS5 nao tem UPDATE efficient em virtual table."""
@@ -326,138 +444,169 @@ class Fts5LexicalIndex:
                 "INSERT INTO fts5_documents (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)",
                 (chunk_id, content, filename, category),
             )
+            self._commit_live()
+
+    def rebuild_content_bound(self, rows: Sequence[ChunkRow], *, generation: Optional[int] = None) -> dict:  # digest -> stage -> read-back -> guarded swap -> publish (T1-T9)
+        if self._conn is None:
+            raise Fts5MigrationError("FTS5 connection is closed")
+        with self._fts5_lock:
+            gen = self._generation if generation is None else int(generation)
+            prior = self._rollback_snapshot if self._invalidated else self._migration_state.read()
+            if self._generation == gen:
+                self._ready = False  # observable quickly (T1); population runs outside the lock
+        started_at = datetime.now(timezone.utc).isoformat()
+        try:
+            source_digest, total = compute_rows_digest(rows)
+        except Exception as exc:
+            self.publish_rebuild_failure(gen, exc)
+            raise
+        try:
+            if not self._write_v2_marker(gen, "in_progress", total, 0, source_digest, None, started_at, None, None):
+                return {"status": "stale", "generation": gen}  # P1-2: delayed generation retreats pre-marker
+        except Exception as exc:  # F2/T2: prior credible live marker stays untouched and serving
+            self._restore_prior_or_fail(prior, gen, exc, source_digest)
+            return {"status": "failed", "generation": gen}
+        staging = f"fts5_documents_staging_g{gen}"
+        try:
+            verified_digest = self._populate_staging(staging, rows, source_digest, total)
+        except Exception as exc:
+            self.publish_rebuild_failure(gen, exc), self._drop_table_quiet(staging)
+            raise
+        return self._finalize_rebuild(gen, staging, prior, source_digest, verified_digest, total, started_at)
+
+    def _populate_staging(self, staging: str, rows: Sequence[ChunkRow], source_digest: str, total: int) -> str:
+        with self._fts5_lock:  # stage in short lock-held batches; counts alone never suffice (§9)
+            self._conn.execute(f'DROP TABLE IF EXISTS "{staging}"')
+            self._conn.execute(_FTS5_SCHEMA.replace("fts5_documents", f'"{staging}"', 1))
             self._conn.commit()
+        ordered = sorted((tuple(str(value or "") for value in row) for row in rows), key=lambda row: row[0].encode("utf-8"))  # canonical order (D4)
+        for start in range(0, len(ordered), 100):
+            with self._fts5_lock:
+                self._conn.executemany(f'INSERT INTO "{staging}" (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)', ordered[start : start + 100])
+                self._conn.commit()
+        with self._fts5_lock:
+            read_back = self._conn.execute(f'SELECT chunk_id, content, filename, category FROM "{staging}"').fetchall()
+        verified_digest, verified_count = compute_rows_digest(read_back)
+        if verified_digest != source_digest or verified_count != total:
+            raise Fts5MigrationError(f"staging verification failed: rows {verified_count}/{total}, digest {verified_digest[:12]} != source {source_digest[:12]}")
+        return verified_digest
 
-    # -----------------------------------------------------------------
-    # Migration lifecycle (Task 05). ``start_migration_background``
-    # dispara uma thread nao-daemon (join graceful no shutdown), que
-    # persiste checkpoint a cada 100 docs no marker file. Retomavel:
-    # se marker mostra ``in_progress`` + ``docs_indexed=N``, o worker
-    # skipa as primeiras N rows do iterator e continua do batch N+1.
-    # -----------------------------------------------------------------
+    def _finalize_rebuild(self, gen: int, staging: str, prior: Optional[dict], source_digest: str,
+                          verified_digest: str, total: int, started_at: str) -> dict:
+        backup = f"fts5_documents_backup_g{gen}"
+        with self._fts5_lock:  # guarded final transition (T6-T8); a stale generation only cleans its staging
+            if self._generation != gen or self._conn is None:
+                self._drop_table_quiet(staging)
+                return {"status": "stale", "generation": gen}
+            self._drop_table_quiet(backup)  # P1-A: a stale crash backup must never collide
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(f'ALTER TABLE fts5_documents RENAME TO "{backup}"')
+                self._conn.execute(f'ALTER TABLE "{staging}" RENAME TO fts5_documents')
+                self._commit_live()
+            except sqlite3.DatabaseError as exc:
+                with suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
+                self._restore_prior_or_fail(prior, gen, exc, source_digest)  # B09: rollback left the prior table live
+                self._drop_table_quiet(staging)
+                raise Fts5MigrationError(f"guarded swap failed: {exc.__class__.__name__}") from exc
+        # F1: the post-swap digest/publication runs OUTSIDE the outer lock hold —
+        # ready=false searches return promptly; publish/rollback stays generation-guarded.
+        try:
+            published = self.verify_and_publish(source_digest, total, gen, started_at)
+        except Exception as exc:  # P1-1/D3: backup survives publication; restore only after a good reverse swap
+            if self._reverse_swap(staging, backup):
+                self._restore_prior_or_fail(prior, gen, exc, source_digest)
+            else:
+                self.publish_rebuild_failure(gen, exc)
+            raise Fts5MigrationError(f"complete-marker publication failed: {exc.__class__.__name__}") from exc
+        if not published:
+            rejected = Fts5MigrationError("post-swap exact verification rejected")
+            if self._reverse_swap(staging, backup):
+                self._restore_prior_or_fail(prior, gen, rejected, source_digest)
+            else:
+                self.publish_rebuild_failure(gen, rejected)
+            raise rejected
+        self._drop_table_quiet(backup)
+        return {"status": "complete", "generation": gen, "docs_indexed": total,
+                "source_rows_sha256": source_digest, "verified_fts_rows_sha256": verified_digest}
 
-    def start_migration_background(
-        self,
-        chunk_iter_factory: ChunkIterFactory,
-        docs_total: int,
-        *,
-        resume_from: int = 0,
-        on_progress: Optional[ProgressCallback] = None,
-    ) -> threading.Thread:
-        """Launch the migration daemon thread. Returns the started thread."""
-        thread = threading.Thread(
-            target=self._migration_worker,
-            args=(chunk_iter_factory, docs_total, resume_from, on_progress),
-            name="fts5-migration",
-            daemon=False,
-        )
+    def _reverse_swap(self, staging: str, backup: str) -> bool:  # atomic prior-table restore, reports outcome (D3)
+        with self._fts5_lock:
+            return self._reverse_swap_locked(staging, backup)
+
+    def _reverse_swap_locked(self, staging: str, backup: str) -> bool:
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(f'ALTER TABLE fts5_documents RENAME TO "{staging}"')
+            self._conn.execute(f'ALTER TABLE "{backup}" RENAME TO fts5_documents')
+            self._commit_live()
+            self._drop_table_quiet(staging)
+            return True
+        except sqlite3.DatabaseError:
+            with suppress(sqlite3.DatabaseError):
+                self._conn.rollback()
+            return False
+
+    def _restore_prior_or_fail(self, prior: Optional[dict], gen: int, exc: BaseException, current_source: Optional[str]) -> None:
+        if self._live_matches(prior) and prior.get("source_rows_sha256") == current_source:  # D3/P1-2
+            with self._fts5_lock:
+                restored = self._generation == gen  # F1: generation-guarded restore
+                if restored:
+                    self._ready = True
+            if restored:
+                with suppress(Exception):  # disk usually already holds prior; rewrite is best-effort
+                    self._migration_state.write(prior)
+                return
+        self.publish_rebuild_failure(gen, exc)
+
+    def publish_rebuild_failure(self, generation: int, exc: BaseException) -> None:
+        with self._fts5_lock:  # generation-guarded failed/non-ready publication; stale handlers dropped (T9/B10)
+            if self._generation != generation:
+                return
+            self._ready = False
+            with suppress(Exception):  # P1-10: sanitized error (class only); a failing writer cannot resurrect readiness
+                self._write_v2_marker(generation, "failed", 0, 0, None, None, datetime.now(timezone.utc).isoformat(), None, exc.__class__.__name__)
+
+    def _write_v2_marker(self, generation: int, status: str, docs_total: int, docs_indexed: int, source_digest: Optional[str],
+                         verified_digest: Optional[str], started_at: Optional[str], completed_at: Optional[str], error: Optional[str]) -> bool:
+        with self._fts5_lock:  # P1-2: shared marker writes are generation-checked under the lock
+            if self._generation != int(generation):
+                return False
+            self._migration_state.write({
+                "schema_version": MARKER_SCHEMA_VERSION, "generation": int(generation), "status": status,
+                "docs_total": int(docs_total), "docs_indexed": int(docs_indexed), "started_at": started_at,
+                "source_rows_sha256": source_digest, "verified_fts_rows_sha256": verified_digest,
+                "completed_at": completed_at, "error": error})
+            return True
+
+    def start_migration_background(self, chunk_iter_factory: Any, docs_total: int, *, resume_from: int = 0, on_progress: Any = None) -> threading.Thread:  # legacy API shim: content-bound rebuild-from-zero; resume_from is call-compat only, never a cursor
+        def _runner() -> None:
+            generation = self.begin_rebuild()
+            if generation is None:
+                return
+            try:
+                rows = list(chunk_iter_factory())
+                if len(rows) != int(docs_total):  # F4: caller-declared total must match, fail closed
+                    raise Fts5MigrationError(f"docs_total mismatch: declared {docs_total}, captured {len(rows)}")
+                result = self.rebuild_content_bound(rows, generation=generation)
+                if on_progress is not None and result.get("status") == "complete":
+                    on_progress(result["docs_indexed"], docs_total)
+            except Exception as exc:  # noqa: BLE001 — fail closed, generation-guarded (F4/TQ-1)
+                self.publish_rebuild_failure(generation, exc)
+                print(f"[FTS5] migration failed: {exc.__class__.__name__}")
+            finally:
+                self.end_rebuild(generation)
+        thread = threading.Thread(target=_runner, name="fts5-migration", daemon=True)
         thread.start()
         return thread
 
-    def _migration_worker(
-        self,
-        chunk_iter_factory: ChunkIterFactory,
-        docs_total: int,
-        resume_from: int,
-        on_progress: Optional[ProgressCallback],
-    ) -> None:
-        started_at = datetime.now(timezone.utc).isoformat()
-        docs_indexed = int(resume_from)
-        self._write_state("in_progress", docs_total, docs_indexed, started_at, None, None)
-        try:
-            docs_indexed = self._run_migration_batches(
-                chunk_iter_factory, docs_total, docs_indexed, started_at, on_progress
-            )
-        except Exception as exc:  # noqa: BLE001 — one place to record every failure
-            self._write_state(
-                "failed",
-                docs_total,
-                docs_indexed,
-                started_at,
-                None,
-                f"{exc.__class__.__name__}: {exc}",
-            )
-            print(f"[FTS5] migration failed at {docs_indexed}/{docs_total}: {exc}")
-            return
-        completed_at = datetime.now(timezone.utc).isoformat()
-        self._write_state("complete", docs_total, docs_indexed, started_at, completed_at, None)
-        with self._fts5_lock:
-            self._ready = True
-        print(f"[FTS5] migration complete: {docs_indexed} docs indexed")
+    def _commit_live(self) -> None:  # commit + mutation-epoch bump for live-table changes (P1-B)
+        self._conn.commit()
+        self._mutation_epoch += 1
 
-    def _run_migration_batches(
-        self,
-        chunk_iter_factory: ChunkIterFactory,
-        docs_total: int,
-        docs_indexed: int,
-        started_at: str,
-        on_progress: Optional[ProgressCallback],
-    ) -> int:
-        """Consume the iterator batch-by-batch. Returns the final ``docs_indexed``."""
-        resume_from = docs_indexed
-        seen = 0
-        batch: List[ChunkRow] = []
-        last_percent_logged = -10
-        for row in chunk_iter_factory():
-            if seen < resume_from:
-                seen += 1
-                continue
-            seen += 1
-            batch.append(row)
-            if len(batch) >= 100:
-                self._populate_batch(batch)
-                docs_indexed += len(batch)
-                batch = []
-                self._write_state("in_progress", docs_total, docs_indexed, started_at, None, None)
-                if on_progress is not None:
-                    on_progress(docs_indexed, docs_total)
-                last_percent_logged = self._maybe_log_progress(docs_indexed, docs_total, last_percent_logged)
-        if batch:
-            self._populate_batch(batch)
-            docs_indexed += len(batch)
-            if on_progress is not None:
-                on_progress(docs_indexed, docs_total)
-        return docs_indexed
-
-    @staticmethod
-    def _maybe_log_progress(docs_indexed: int, docs_total: int, last_percent_logged: int) -> int:
-        """Emit an INFO log line every 10% of progress. Returns the new watermark."""
-        if docs_total <= 0:
-            return last_percent_logged
-        percent = int(100 * docs_indexed / docs_total)
-        if percent >= last_percent_logged + 10:
-            print(f"[FTS5] migration progress: {percent}% ({docs_indexed}/{docs_total})")
-            return percent
-        return last_percent_logged
-
-    def _populate_batch(self, rows: Sequence[ChunkRow]) -> None:
-        """Insert a batch under ``_fts5_lock``. Raises on SQL failure."""
-        if self._conn is None:
-            raise Fts5MigrationError("FTS5 connection is closed during migration")
-        with self._fts5_lock:
-            self._conn.executemany(
-                "INSERT INTO fts5_documents (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)",
-                rows,
-            )
-            self._conn.commit()
-
-    def _write_state(
-        self,
-        status: str,
-        docs_total: int,
-        docs_indexed: int,
-        started_at: str,
-        completed_at: Optional[str],
-        error: Optional[str],
-    ) -> None:
-        """Persist the marker file with the canonical schema (TechSpec §Q3)."""
-        self._migration_state.write(
-            {
-                "status": status,
-                "docs_total": int(docs_total),
-                "docs_indexed": int(docs_indexed),
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "error": error,
-            }
-        )
+    def _drop_table_quiet(self, table: str) -> None:  # owner-only staging cleanup (T10)
+        with suppress(sqlite3.DatabaseError), self._fts5_lock:
+            if self._conn is not None:
+                self._conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                self._conn.commit()

@@ -37,7 +37,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ChromaDB
 import chromadb
@@ -60,8 +60,9 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 # Local imports
+from . import __version__
 from .config import config
-from .fts5_index import Fts5LexicalIndex, Fts5NotReadyError
+from .fts5_index import Fts5LexicalIndex, Fts5NotReadyError, capture_chunk_rows, compute_rows_digest
 from .ingestion import Document, DocumentParser
 from .metrics import (
     FAST_PATH_ERRORS_TOTAL,
@@ -1067,6 +1068,11 @@ def _enable_wal_mode(chroma_dir: Path) -> None:
 # FILE WATCHER (auto-reindex on document changes)
 # =============================================================================
 
+# Watcher retry-backoff ceiling in seconds (controller-accepted product
+# bound, corrective 8). The effective ceiling never drops below the
+# configured debounce.
+RETRY_BACKOFF_CAP_SECONDS = 300.0
+
 
 class DocumentWatcher(FileSystemEventHandler):
     """Watches documents directory and triggers reindex on changes.
@@ -1074,39 +1080,161 @@ class DocumentWatcher(FileSystemEventHandler):
     Uses accumulate-mode debounce: collects changed paths during a silence
     window instead of resetting the timer on every file event.  This prevents
     bulk file copies (1000+ files) from starving the reindex trigger.
+
+    Timing is owned by one lazily started persistent scheduler thread
+    (corrective 4): events and retries only move an absolute monotonic due
+    time under a Condition. No per-shot ``threading.Timer`` is ever created,
+    so exactly one timing/callback thread identity exists per watcher and
+    successor scheduling can never overlap a finishing timer thread.
     """
 
     def __init__(self, orchestrator_getter, debounce_seconds: float = 10.0):
         self._get_orchestrator = orchestrator_getter
         self._debounce = debounce_seconds
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._pending_paths: set = set()
-        self._timer = None
+        self._due_at: Optional[float] = None
+        self._retry_attempt = 0
         self._reindex_lock = threading.Lock()
+        self._scheduler: Optional[threading.Thread] = None
+        self._stopped = False
+
+    def _ensure_scheduler_locked(self) -> None:
+        """Start the single scheduler thread lazily. Caller holds ``self._lock``.
+
+        ``self._scheduler`` is published only after a successful start: a
+        failed ``Thread.start`` propagates with the slot still None, so a
+        later event can retry scheduler admission instead of being stranded
+        behind a dead unstarted object (corrective 6).
+        """
+        if self._scheduler is None and not self._stopped:
+            thread = threading.Thread(
+                target=self._scheduler_loop, name="knowledge-rag-watcher", daemon=True
+            )
+            thread.start()
+            self._scheduler = thread
+
+    def _scheduler_loop(self) -> None:
+        """Single persistent timing thread: sleep until due, run one cycle."""
+        while True:
+            with self._cond:
+                while not self._stopped:
+                    if self._due_at is None:
+                        self._cond.wait()
+                        continue
+                    remaining = self._due_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._cond.wait(timeout=remaining)
+                if self._stopped:
+                    return
+                batch = set(self._pending_paths)
+                self._pending_paths.clear()
+                self._due_at = None
+            # Indexing runs outside the state lock so events keep flowing in;
+            # an empty batch never reaches index_all.
+            if batch:
+                self._run_cycle(batch)
+
+    def stop(self, timeout: Optional[float] = None) -> None:
+        """Stop the scheduler thread and ignore any later events.
+
+        Idempotent; the join is bounded by the caller-supplied ``timeout``.
+        Terminal for this instance: paths still pending are left in place
+        for inspection but will never be processed, and events arriving
+        after stop are ignored because no thread could ever serve them.
+
+        Supported from the scheduler thread itself (orchestrator callbacks
+        run there): the self-join is skipped and the loop exits on its next
+        iteration instead of raising ``cannot join current thread``.
+        """
+        with self._cond:
+            self._stopped = True
+            scheduler = self._scheduler
+            self._cond.notify_all()
+        if scheduler is not None and scheduler is not threading.current_thread():
+            scheduler.join(timeout)
+
+    def _retry_delay_locked(self) -> float:
+        """Exponential retry delay. Caller must hold ``self._lock``.
+
+        Capped at ``RETRY_BACKOFF_CAP_SECONDS`` — the controller-accepted
+        product bound (corrective 8) — but the effective ceiling is never
+        below the configured debounce. A successful run resets the exponent.
+        """
+        ceiling = max(RETRY_BACKOFF_CAP_SECONDS, self._debounce)
+        try:
+            return min(self._debounce * (2**self._retry_attempt), ceiling)
+        except OverflowError:
+            return ceiling
+
+    def _merge_retry(self, batch: set) -> None:
+        """Merge the attempted batch back exactly once and set the retry deadline.
+
+        The retry deadline overrides any due time an event established during
+        the failed cycle, so an incoming event can never shorten the backoff.
+        """
+        with self._cond:
+            self._pending_paths.update(batch)
+            delay = self._retry_delay_locked()
+            self._retry_attempt += 1
+            self._due_at = time.monotonic() + delay
+            self._cond.notify_all()
 
     def _schedule_reindex(self, path: str):
-        """Accumulate-mode debounce: collect paths, fire once after silence."""
-        with self._lock:
-            self._pending_paths.add(path)
-            if self._timer is None or not self._timer.is_alive():
-                self._timer = threading.Timer(self._debounce, self._do_reindex)
-                self._timer.daemon = True
-                self._timer.start()
+        """Accumulate-mode debounce: collect paths, fire once after silence.
 
-    def _do_reindex(self):
-        """Perform incremental reindex in background (serialized)."""
+        The first event establishes the due time; later events only extend
+        the batch, never move an existing deadline (debounce or retry).
+        Events after ``stop()`` are ignored.
+        """
+        with self._cond:
+            if self._stopped:
+                return
+            self._pending_paths.add(path)
+            if self._due_at is None:
+                self._due_at = time.monotonic() + self._debounce
+            # Unconditional: a due time may already exist from an event whose
+            # scheduler admission failed — every event retries admission.
+            # Admission failure is contained here because watchdog's
+            # dispatcher does not catch handler exceptions: a raise would
+            # kill event delivery permanently. Pending/due state is already
+            # recorded, so the next event retries with nothing lost.
+            try:
+                self._ensure_scheduler_locked()
+            except Exception as exc:  # noqa: BLE001 — event boundary must survive
+                print(f"[WATCHER] scheduler admission failed, will retry on next event: {exc}")
+            self._cond.notify_all()
+
+    def _run_cycle(self, batch: set) -> None:
+        """Run one indexing cycle (serialized against direct/manual calls)."""
         if not self._reindex_lock.acquire(blocking=False):
-            print("[WATCHER] Reindex already in progress, skipping")
+            print("[WATCHER] Reindex already in progress, retrying later")
+            self._merge_retry(batch)
             return
         try:
-            with self._lock:
-                count = len(self._pending_paths)
-                self._pending_paths.clear()
-            if count == 0:
-                return
-            print(f"[WATCHER] {count} file(s) changed, starting incremental reindex...")
+            print(f"[WATCHER] {len(batch)} file(s) changed, starting incremental reindex...")
             orch = self._get_orchestrator()
             stats = orch.index_all(force=False)
+            if stats.get("skipped_reason") == "reindex_already_running":
+                print("[WATCHER] Manual reindex owns the index, retrying changed paths later")
+                self._merge_retry(batch)
+                return
+            if stats.get("errors", 0) > 0:
+                print(
+                    f"[WATCHER] Reindex completed with {stats['errors']} error(s), "
+                    "retrying changed paths later"
+                )
+                self._merge_retry(batch)
+                return
+            with self._cond:
+                self._retry_attempt = 0
+                # Defensive: paths injected without an event (direct/manual)
+                # must still get a successor cycle.
+                if self._pending_paths and self._due_at is None:
+                    self._due_at = time.monotonic() + self._debounce
+                    self._cond.notify_all()
             changed = stats.get("indexed", 0) + stats.get("updated", 0) + stats.get("deleted", 0)
             if changed > 0:
                 print(
@@ -1117,6 +1245,7 @@ class DocumentWatcher(FileSystemEventHandler):
             import traceback as _tb
 
             print(f"[WATCHER] Reindex failed: {e}\n{_tb.format_exc()}")
+            self._merge_retry(batch)
         finally:
             self._reindex_lock.release()
 
@@ -1161,7 +1290,15 @@ class KnowledgeOrchestrator:
         # staging orch was garbage-collected while holding the lock, the class
         # attribute stayed acquired forever and every subsequent reindex
         # returned `reindex_already_running` despite `active: false`.
-        self._index_lock = threading.Lock()
+        # Re-entrant: reindex_all holds it across Chroma indexing, BM25
+        # rebuild and cache invalidation while its inner index_all call
+        # re-acquires it on the same thread.
+        self._index_lock = threading.RLock()
+
+        # Serializes start_reindex_background admission so two simultaneous
+        # callers cannot both pass the `active` check and clobber each
+        # other's progress dict.
+        self._reindex_admission_lock = threading.Lock()
 
         # GH #161 (v4.8.3): _staging_target holds the staging collection
         # while populate is running. Write helpers dispatch through
@@ -1169,6 +1306,11 @@ class KnowledgeOrchestrator:
         # keeps reading ``self.collection`` (production) unchanged.
         # Zero-downtime is now real, not just a docs promise.
         self._staging_target = None
+
+        self._fts5_startup_dispatch_done = False  # pre-main rebuilds defer to the single startup dispatch (C2)
+        self._fts5_dispatch_lock = threading.Lock()  # D1: one queued/live rebuild worker
+        self._fts5_dispatch_active = False
+        self._fts5_dispatch_pending = False  # BC-05: lossless recovery handoff
 
         self.parser = DocumentParser()
         self.embed_fn = FastEmbedEmbeddings()
@@ -1394,23 +1536,28 @@ class KnowledgeOrchestrator:
         interrupted run left off.
         """
         if not self._index_lock.acquire(blocking=False):
-            return {
-                "total_files": 0,
-                "indexed": 0,
-                "updated": 0,
-                "skipped": 0,
-                "deleted": 0,
-                "errors": 0,
-                "chunks_added": 0,
-                "chunks_removed": 0,
-                "dedup_skipped": 0,
-                "categories": {},
-                "skipped_reason": "reindex_already_running",
-            }
+            return self._index_busy_stats()
         try:
             return self._index_all_impl(force, resume_state=resume_state)
         finally:
             self._index_lock.release()
+
+    @staticmethod
+    def _index_busy_stats() -> Dict[str, Any]:
+        """Stable result envelope for a rejected concurrent indexing attempt."""
+        return {
+            "total_files": 0,
+            "indexed": 0,
+            "updated": 0,
+            "skipped": 0,
+            "deleted": 0,
+            "errors": 0,
+            "chunks_added": 0,
+            "chunks_removed": 0,
+            "dedup_skipped": 0,
+            "categories": {},
+            "skipped_reason": "reindex_already_running",
+        }
 
     def _index_all_impl(
         self,
@@ -1899,24 +2046,34 @@ class KnowledgeOrchestrator:
         the previous run's checkpoint and continues chunk counting from
         where it stopped.
         """
-        if self._reindex_progress.get("active"):
-            return {"status": "already_running", "progress": dict(self._reindex_progress)}
+        with self._reindex_admission_lock:
+            if self._reindex_progress.get("active"):
+                return {"status": "already_running", "progress": dict(self._reindex_progress)}
 
-        self._reindex_progress = self._fresh_reindex_progress(mode, resume_state)
+            self._reindex_progress = self._fresh_reindex_progress(mode, resume_state)
 
-        # GH #163 (v4.8.3): propagate force through smart_reindex so
-        # reindex_documents(force=True) actually re-embeds files after a
-        # prefix/model change (the pre-fix path skipped every unchanged
-        # file). Nuclear_rebuild always re-embeds regardless.
-        target = {
-            "incremental": lambda: self.index_all(force=False),
-            "smart_reindex": lambda: self.reindex_all(resume_state=resume_state, force=True),
-            "nuclear_rebuild": self.nuclear_rebuild,
-        }[mode]
+            try:
+                # GH #163 (v4.8.3): propagate force through smart_reindex so
+                # reindex_documents(force=True) actually re-embeds files after a
+                # prefix/model change (the pre-fix path skipped every unchanged
+                # file). Nuclear_rebuild always re-embeds regardless.
+                target = {
+                    "incremental": lambda: self.index_all(force=False),
+                    "smart_reindex": lambda: self.reindex_all(resume_state=resume_state, force=True),
+                    "nuclear_rebuild": self.nuclear_rebuild,
+                }[mode]
 
-        thread = threading.Thread(target=self._run_reindex, args=(target,), daemon=True)
-        thread.start()
-        return {"status": "started", "operation": mode}
+                thread = threading.Thread(target=self._run_reindex, args=(target,), daemon=True)
+                thread.start()
+            except Exception as e:
+                # No thread exists to run _run_reindex's finally, so roll the
+                # admission back here or ownership stays phantom forever and
+                # every later call is rejected as already_running. Error is
+                # recorded the same way _run_reindex records a failed run.
+                self._reindex_progress["error"] = str(e)
+                self._reindex_progress["active"] = False
+                raise
+            return {"status": "started", "operation": mode}
 
     @staticmethod
     def _fresh_reindex_progress(mode: str, resume_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1966,8 +2123,6 @@ class KnowledgeOrchestrator:
         migration path documented in ``docs/migration-v4.8.0.md`` relies on
         this to re-embed unchanged files after prefix/model changes.
         """
-        import shutil
-
         if resume_state:
             print(
                 f"[REINDEX] Resuming smart reindex from checkpoint "
@@ -1980,37 +2135,39 @@ class KnowledgeOrchestrator:
             print("[REINDEX] Starting smart incremental reindex...")
         start_time = time.time()
 
-        stats = self.index_all(force=force, resume_state=resume_state)
+        # Hold the (re-entrant) index lock across indexing, BM25 rebuild and
+        # cache invalidation: a watcher-triggered index_all between those
+        # steps would otherwise interleave with a half-rebuilt BM25 state.
+        if not self._index_lock.acquire(blocking=False):
+            return self._index_busy_stats()
+        try:
+            stats = self.index_all(force=force, resume_state=resume_state)
 
-        print("[REINDEX] Rebuilding BM25 index...")
-        self.bm25_index.clear()
-        self._bm25_initialized = False
-        self._ensure_bm25_index()
+            print("[REINDEX] Rebuilding BM25 index...")
+            self.bm25_index.clear()
+            self._bm25_initialized = False
+            self._ensure_bm25_index()
 
-        chroma_dir = config.chroma_dir
-        orphans_cleaned = 0
-        if chroma_dir.exists():
-            for item in chroma_dir.iterdir():
-                if item.is_dir() and len(item.name) == 36 and "-" in item.name:
-                    try:
-                        if not any(item.iterdir()):
-                            shutil.rmtree(item)
-                            orphans_cleaned += 1
-                    except Exception:
-                        pass
+            # Chroma owns its internal segment directories. Removing a UUID-
+            # named directory here can race an open SQLite segment and corrupt
+            # the active index; smart reindex therefore performs no filesystem
+            # cleanup below ``config.chroma_dir``.
+            orphans_cleaned = 0
 
-        self.query_cache.invalidate()
+            self.query_cache.invalidate()
 
-        elapsed = time.time() - start_time
-        stats["orphan_folders_cleaned"] = orphans_cleaned
-        stats["elapsed_seconds"] = round(elapsed, 2)
-        print(
-            f"[REINDEX] Completed in {elapsed:.1f}s "
-            f"(indexed: {stats['indexed']}, updated: {stats['updated']}, "
-            f"skipped: {stats['skipped']}, deleted: {stats['deleted']})"
-        )
+            elapsed = time.time() - start_time
+            stats["orphan_folders_cleaned"] = orphans_cleaned
+            stats["elapsed_seconds"] = round(elapsed, 2)
+            print(
+                f"[REINDEX] Completed in {elapsed:.1f}s "
+                f"(indexed: {stats['indexed']}, updated: {stats['updated']}, "
+                f"skipped: {stats['skipped']}, deleted: {stats['deleted']})"
+            )
 
-        return stats
+            return stats
+        finally:
+            self._index_lock.release()
 
     # =========================================================================
     # v4.8.0 Fase 5: zero-downtime rebuild via staging collection + atomic swap
@@ -2448,10 +2605,21 @@ class KnowledgeOrchestrator:
                 Queries return empty results during the rebuild window
                 (minutes to hours depending on corpus size + hardware).
                 Preserved for backwards-compat and forced-cleanup cases.
+
+        One-writer envelope (v4.8.3 corrective): the whole lifecycle —
+        cleanup/create/populate/validate/swap (or destroy/rebuild), BM25,
+        cache, metadata — runs under the instance ``_index_lock``. A
+        concurrent owner yields the standard busy envelope BEFORE any
+        mutation; the inner ``index_all`` re-acquires the RLock re-entrantly.
         """
-        if swap:
-            return self._rebuild_via_swap()
-        return self._rebuild_destructive()
+        if not self._index_lock.acquire(blocking=False):
+            return self._index_busy_stats()
+        try:
+            if swap:
+                return self._rebuild_via_swap()
+            return self._rebuild_destructive()
+        finally:
+            self._index_lock.release()
 
     # =========================================================================
     # Search
@@ -2468,12 +2636,8 @@ class KnowledgeOrchestrator:
         (config typo vs Chroma issue vs FTS5 issue) and callers can retry after
         fixing config without rebuilding the whole orchestrator.
 
-        Task 05: after instantiation, inspect the marker file. When status is
-        anything other than ``complete``, dispatch the lazy background
-        migration so first-time users (fresh install / zero-touch upgrade)
-        get a populated index without editing config or running a script.
-        Interrupted migrations (``in_progress`` with a partial
-        ``docs_indexed`` count) resume from the last checkpointed batch.
+        Package B: construction creates handles only (no migration launch, no
+        marker write); the single startup dispatch runs in ``main()`` (C1/C2).
         """
         db_path = config.data_dir / "fts5_index.db"
         state_path = config.data_dir / "fts5_migration.state"
@@ -2482,125 +2646,83 @@ class KnowledgeOrchestrator:
         # malformed — treat that as a fatal startup error so the operator
         # sees the broken pattern immediately instead of on the first query.
         self.query_router = QueryRouter(config.fts5_patterns)
-        self._maybe_start_fts5_migration()
 
-    def _maybe_start_fts5_migration(self) -> None:
-        """Dispatch the lazy FTS5 rebuild when the marker isn't ``complete``.
+    def _dispatch_fts5_startup_rebuild(self) -> None:
+        """One-shot idempotent startup dispatch (C2/B02/D1/P1-1/F6): bounded admission
+        only — the worker verifies source identity or rebuilds; hybrid serves meanwhile."""
+        if self._fts5_startup_dispatch_done:
+            return  # F6: truly one-shot
+        self._fts5_startup_dispatch_done = True
+        if config.fts5_enabled and isinstance(self.fts5_index, Fts5LexicalIndex):
+            self._start_fts5_rebuild_worker()
 
-        v4.8.3 sanity check: even when the marker says ``complete``, cross-
-        check FTS5 row count against Chroma. A stale marker with an empty
-        FTS5 index (post-swap orphan cleanup, manual truncate, disk
-        corruption) previously left the fast-path permanently silent —
-        queries returned no_results forever without any error surfaced.
-        """
-        if self.fts5_index is None:
-            return
-        state_payload = self.fts5_index.state.read() or {}
-        status = state_payload.get("status")
-        if status == "complete":
-            if not self._fts5_marker_matches_reality():
-                print("[FTS5] stale complete marker detected — forcing rebuild")
-                # Fall through to dispatch a fresh migration below.
-            else:
+    def _spawn_fts5_worker(self) -> bool:
+        try:
+            threading.Thread(target=self._fts5_rebuild_worker, name="fts5-rebuild", daemon=True).start()
+            return True
+        except Exception as exc:  # noqa: BLE001 — dispatch failure must not wedge admission
+            print(f"[FTS5] rebuild dispatch failed: {exc}")
+            return False
+
+    def _start_fts5_rebuild_worker(self, material: bool = False) -> None:
+        """Reserve one queued/live worker (D1). Ordinary duplicates coalesce into
+        the live worker; only a material reset/new-generation request queues one
+        successor (P1-C/BC-05). A failed Thread.start is retried once for
+        material work and never strands it (bounded, no tight loop)."""
+        with self._fts5_dispatch_lock:
+            if self._fts5_dispatch_active:
+                if material:
+                    self._fts5_dispatch_pending = True
                 return
-        resume_from = int(state_payload.get("docs_indexed", 0)) if status == "in_progress" else 0
+            self._fts5_dispatch_active = True
+        if not self._spawn_fts5_worker():
+            with self._fts5_dispatch_lock:
+                retry_material = material or self._fts5_dispatch_pending
+                self._fts5_dispatch_pending = False
+                if not retry_material:
+                    self._fts5_dispatch_active = False
+            if retry_material and not self._spawn_fts5_worker():
+                with self._fts5_dispatch_lock:
+                    self._fts5_dispatch_active = False  # bounded: give up after one retry
+
+    def _fts5_rebuild_worker(self) -> None:
+        """Package-B worker: admission + capture through final complete/ready, all inside ``_index_lock`` (Locks §1, B06, P1-2)."""
+        index = self.fts5_index
+        generation = None
         try:
-            docs_total = int(self.collection.count())
-        except Exception as exc:  # noqa: BLE001 — Chroma error must not kill startup
-            print(f"[FTS5] migration skipped — cannot count corpus: {exc}")
-            return
-        if docs_total <= 0:
-            # Empty corpus: nothing to rebuild. Mark as complete so the
-            # fast-path becomes ready immediately for future writes.
-            self.fts5_index._write_state(  # noqa: SLF001 — trusted internal
-                "complete",
-                0,
-                0,
-                datetime.now().isoformat(),
-                datetime.now().isoformat(),
-                None,
-            )
-            with self.fts5_index._fts5_lock:  # noqa: SLF001
-                self.fts5_index._ready = True  # noqa: SLF001
-            return
-        print(f"[FTS5] migration starting (resume_from={resume_from}, docs_total={docs_total})")
-        get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_TOTAL, float(docs_total))
-        get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, float(resume_from))
-        self.fts5_index.start_migration_background(
-            self._iter_chroma_chunks_for_fts5,
-            docs_total,
-            resume_from=resume_from,
-            on_progress=self._fts5_migration_progress,
-        )
-
-    def _fts5_marker_matches_reality(self) -> bool:
-        """Return True when the FTS5 marker is credible vs actual state.
-
-        Rejects markers claiming ``complete`` while the FTS5 index holds far
-        fewer rows than Chroma. Threshold is 10% because a small drift is
-        normal (chunk-level dedup, deletes), but a >90% deficit means the
-        marker is lying about a rebuild that didn't actually populate.
-        """
-        try:
-            fts5_count = self.fts5_index.count()
-            chroma_count = self.collection.count()
-        except Exception:
-            return True  # can't check → trust the marker (fail-safe)
-        if chroma_count == 0:
-            return True  # empty corpus, marker complete is legitimate
-        return fts5_count >= chroma_count * 0.1
-
-    @staticmethod
-    def _fts5_migration_progress(docs_indexed: int, docs_total: int) -> None:
-        """Push the migration checkpoint into Prometheus gauges."""
-        metrics = get_metrics()
-        metrics.set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, float(docs_indexed))
-        metrics.set_gauge(FAST_PATH_MIGRATION_DOCS_TOTAL, float(docs_total))
-
-    def _iter_chroma_chunks_for_fts5(self) -> Iterable[Tuple[str, str, str, str]]:
-        """Yield ``(chunk_id, content, filename, category)`` rows in stable order.
-
-        Batches via offset+limit to avoid the SQLite ``too many SQL variables``
-        error (chromadb 1.x rebuilds an ``IN (?, ?, ...)`` clause for every
-        returned row; a single ``limit=48184`` call blows past the 999 default
-        max_variable_number and the whole migration fails). Deterministic order
-        is preserved by sorting each batch by ``chunk_id`` — good enough for
-        resume-from-index semantics since chunk_ids are UUIDs.
-        """
-        try:
-            count = self.collection.count()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[FTS5] chunk iterator aborted — Chroma count failed: {exc}")
-            return
-        if count == 0:
-            return
-        batch_size = 500  # SQLite default max_variable_number is 999
-        offset = 0
-        while offset < count:
-            try:
-                fetched = self.collection.get(
-                    include=["documents", "metadatas"],
-                    limit=batch_size,
-                    offset=offset,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[FTS5] chunk batch failed at offset={offset}: {exc}")
-                return
-            ids = fetched.get("ids") or []
-            docs = fetched.get("documents") or []
-            metas = fetched.get("metadatas") or []
-            if not ids:
-                break
-            order = sorted(range(len(ids)), key=lambda i: ids[i])
-            for i in order:
-                meta = metas[i] or {}
-                yield (
-                    str(ids[i]),
-                    str(docs[i] or ""),
-                    str(meta.get("filename", "") or ""),
-                    str(meta.get("category", "") or ""),
-                )
-            offset += len(ids)
+            with self._index_lock:
+                generation = index.begin_rebuild()
+                if generation is None:
+                    return  # single-flight: this generation already has a worker
+                get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, 0.0)  # D6: reset BOTH at admitted start
+                get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_TOTAL, 0.0)
+                try:
+                    rows = capture_chunk_rows(self.collection)
+                except Exception as exc:
+                    index.publish_rebuild_failure(generation, exc)
+                    raise
+                get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_TOTAL, float(len(rows)))
+                source_digest, total = compute_rows_digest(rows)
+                if index.verify_and_publish(source_digest, total, generation):  # P1-1/P1-2/BC-04: source-verified promotion
+                    get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, float(total))
+                    return
+                result = index.rebuild_content_bound(rows, generation=generation)
+                get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, float(result.get("docs_indexed") or 0) if result.get("status") == "complete" else 0.0)  # D6
+        except Exception as exc:  # noqa: BLE001 — TQ-1: fail closed, demote the current generation
+            if generation is not None:
+                index.publish_rebuild_failure(generation, exc)
+            get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, 0.0)  # D6: failure leaves 0
+            print(f"[FTS5] content-bound rebuild failed: {exc}")
+        finally:
+            if generation is not None:
+                index.end_rebuild(generation)
+            with self._fts5_dispatch_lock:  # P1-C: hand the reservation to a queued material successor
+                successor, self._fts5_dispatch_pending = self._fts5_dispatch_pending, False
+                if not successor:
+                    self._fts5_dispatch_active = False
+            if successor and not self._spawn_fts5_worker() and not self._spawn_fts5_worker():
+                with self._fts5_dispatch_lock:  # F3: one bounded retry for a queued material successor
+                    self._fts5_dispatch_active = False
 
     def _fts5_sync_add(self, ids: Sequence[str], docs: Sequence[str], metas: Sequence[Dict[str, Any]]) -> None:
         """Best-effort CRUD sync hook after a successful ChromaDB write.
@@ -2642,27 +2764,14 @@ class KnowledgeOrchestrator:
                 print(f"[FTS5] remove sync failed for chunk_id={chunk_id}: {exc}")
 
     def _fts5_reset_and_rebuild(self) -> None:
-        """Drop the FTS5 database + marker file then start a fresh migration.
-
-        Called from ``nuclear_rebuild`` and swap-based rebuilds — the corpus
-        was recreated from scratch so the derived FTS5 index MUST be dropped
-        and repopulated from the swapped-in ChromaDB contents.
-        """
-        if not (config.fts5_enabled and self.fts5_index is not None):
+        """Retire the current generation (C4) keeping the in-place index/lock domain
+        (Locks §5); startup rebuilds defer to ``main()``'s single dispatch (C2)."""
+        if not (config.fts5_enabled and isinstance(getattr(self, "fts5_index", None), Fts5LexicalIndex)):
+            return  # attribute-guarded (C3): immutable Package-A shells lack the handle
+        self.fts5_index.invalidate_generation()
+        if not self._fts5_startup_dispatch_done:
             return
-        try:
-            self.fts5_index.close()
-        except Exception:  # noqa: BLE001 — best-effort close
-            pass
-        db_path = config.data_dir / "fts5_index.db"
-        state_path = config.data_dir / "fts5_migration.state"
-        for path in (db_path, state_path, db_path.with_suffix(".db-wal"), db_path.with_suffix(".db-shm")):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                print(f"[FTS5] could not remove {path}: {exc}")
-        self.fts5_index = Fts5LexicalIndex(db_path=db_path, state_path=state_path)
-        self._maybe_start_fts5_migration()
+        self._start_fts5_rebuild_worker(material=True)  # P1-C: a reset is a material request
 
     def _maybe_dispatch_fts5(
         self,
@@ -2700,8 +2809,9 @@ class KnowledgeOrchestrator:
             return None, "fallback"
         try:
             result = self._run_fts5_search(query_text, max_results, category_filter, skip_min_hits=False)
-        except Fts5NotReadyError:
-            raise
+        except Fts5NotReadyError:  # P1-3 reset race: auto falls back; explicit raises upstream
+            metrics.inc(FAST_PATH_FALLBACK_TOTAL, '{reason="disabled"}')
+            return None, "fallback"
         except Exception as exc:  # noqa: BLE001 — every FTS5 failure must fall back
             metrics.inc(FAST_PATH_ERRORS_TOTAL, f'{{error_class="{exc.__class__.__name__}"}}')
             metrics.inc(FAST_PATH_FALLBACK_TOTAL, '{reason="error"}')
@@ -2737,9 +2847,19 @@ class KnowledgeOrchestrator:
         candidates = max(max_results * 3, 20)
         start = time.monotonic()
         try:
-            hits = self.fts5_index.search(query_text, top_k=candidates)
+            if isinstance(self.fts5_index, Fts5LexicalIndex):
+                # P1-3: the single atomic ready-generation search is authoritative;
+                # the else branch exists only for duck-typed immutable doubles (Locks §8).
+                hits = self.fts5_index.search_if_ready(query_text, top_k=candidates)
+            else:
+                hits = self.fts5_index.search(query_text, top_k=candidates)
         finally:
             metrics.observe(FAST_PATH_LATENCY_SECONDS, time.monotonic() - start)
+        if hits is None:
+            raise Fts5NotReadyError(
+                "FTS5 index is not ready (migration in progress). "
+                "Suggestion: use search_method='auto' to fallback gracefully."
+            )
         if not skip_min_hits and len(hits) < config.fts5_min_hits:
             return None
         formatted = self._format_fts5_results(hits, max_results, category_filter)
@@ -3837,7 +3957,7 @@ class KnowledgeOrchestrator:
 
 mcp = MCPServer(
     "knowledge-rag",
-    version="4.6.0",
+    version=__version__,
 )
 
 _orchestrator: Optional[KnowledgeOrchestrator] = None
@@ -4576,6 +4696,55 @@ def _run_transport(transport: str) -> None:
     uvicorn.run(served, host=config.server_host, port=config.server_port)
 
 
+# Shutdown bound in seconds for the observer join and watcher stop below
+# (controller-accepted, corrective 8).
+WATCHER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
+def _stop_watcher_stack(observer, watcher) -> None:
+    """Stop observer then watcher; each cleanup step is an independent attempt.
+
+    A failed ``observer.stop()`` must not skip the bounded join, and no step's
+    failure may mask the caller's original exception or prevent later steps —
+    every failure is logged instead. Idempotent: both components tolerate
+    repeated stop calls, so callers may invoke this from overlapping cleanup
+    paths without double-stop hazards.
+    """
+    if observer is not None:
+        try:
+            observer.stop()
+        except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+            print(f"[WATCHER] observer stop failed: {exc}", file=sys.stderr)
+        try:
+            observer.join(WATCHER_SHUTDOWN_TIMEOUT_SECONDS)
+            if observer.is_alive():
+                print("[WATCHER] observer still alive past shutdown bound", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+            print(f"[WATCHER] observer join failed: {exc}", file=sys.stderr)
+    if watcher is not None:
+        try:
+            watcher.stop(timeout=WATCHER_SHUTDOWN_TIMEOUT_SECONDS)
+            scheduler = watcher._scheduler
+            if scheduler is not None and scheduler.is_alive():
+                print("[WATCHER] scheduler still alive past shutdown bound", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — never mask the caller's error
+            print(f"[WATCHER] watcher shutdown failed: {exc}", file=sys.stderr)
+
+
+def _serve_with_lifecycle(transport: str, observer, watcher) -> None:
+    """Run the transport, then stop the observer and watcher in fixed order.
+
+    Cleanup runs on return AND on exception without masking the transport's
+    own error: ``observer.stop()`` → ``observer.join(bound)`` →
+    ``watcher.stop(bound)``. A component still alive past its bound is
+    logged, never raised.
+    """
+    try:
+        _run_transport(transport)
+    finally:
+        _stop_watcher_stack(observer, watcher)
+
+
 def main():
     """Run the MCP server"""
     if len(sys.argv) > 1 and sys.argv[1] == "init":
@@ -4632,7 +4801,14 @@ def main():
                 stats = orchestrator.index_all()
                 print(f"[INFO] Indexed {stats['indexed']} documents with {stats['chunks_added']} chunks")
 
+            # Package B: single explicit FTS5 startup dispatch after the primary indexing decision (C2/C3).
+            fts5_dispatch = getattr(orchestrator, "_dispatch_fts5_startup_rebuild", None)
+            if callable(fts5_dispatch):
+                fts5_dispatch()
+
             # Start file watcher for auto-reindex on document changes
+            watcher = None
+            observer = None
             if os.environ.get("KNOWLEDGE_RAG_WATCHER_DISABLED", "").strip() == "1":
                 print("[WATCHER] Disabled via KNOWLEDGE_RAG_WATCHER_DISABLED=1")
             else:
@@ -4646,33 +4822,54 @@ def main():
                 except Exception as e:
                     print(f"[WARN] Failed to start file watcher: {e}")
                     print("[WARN] Auto-reindexing disabled. Use reindex_documents tool manually.")
+                    # Immediate cleanup: a partially-created stack (e.g. a
+                    # started observer whose later startup step failed) must
+                    # not keep running unowned while the server continues.
+                    _stop_watcher_stack(observer, watcher)
+                    watcher = None
+                    observer = None
+                except BaseException:
+                    # Shutdown-class exceptions: clean the partial stack, then
+                    # re-raise the original (_stop_watcher_stack never raises,
+                    # so cleanup failure cannot mask it).
+                    _stop_watcher_stack(observer, watcher)
+                    raise
 
-            # Start optional metrics server
-            if config.metrics_enabled and config.transport != "stdio":
-                from .metrics import start_metrics_server
+            try:
+                # Start optional metrics server
+                if config.metrics_enabled and config.transport != "stdio":
+                    from .metrics import start_metrics_server
 
-                start_metrics_server(config.metrics_port)
+                    start_metrics_server(config.metrics_port)
 
-            # Restore real stdout for MCP JSON-RPC, keep print() going to stderr
-            from . import _original_stdout
+                # Restore real stdout for MCP JSON-RPC, keep print() going to stderr
+                from . import _original_stdout
 
-            sys.stdout = _original_stdout
+                sys.stdout = _original_stdout
 
-            # Parse --transport CLI override
-            transport = config.transport
-            for i, arg in enumerate(sys.argv[1:], 1):
-                if arg == "--transport" and i < len(sys.argv) - 1:
-                    transport = sys.argv[i + 1]
-                elif arg.startswith("--transport="):
-                    transport = arg.split("=", 1)[1]
+                # Parse --transport CLI override
+                transport = config.transport
+                for i, arg in enumerate(sys.argv[1:], 1):
+                    if arg == "--transport" and i < len(sys.argv) - 1:
+                        transport = sys.argv[i + 1]
+                    elif arg.startswith("--transport="):
+                        transport = arg.split("=", 1)[1]
 
-            if transport != "stdio":
-                print(
-                    f"[SERVER] Starting {transport} server on {config.server_host}:{config.server_port}",
-                    file=sys.stderr,
-                )
+                if transport != "stdio":
+                    print(
+                        f"[SERVER] Starting {transport} server on {config.server_host}:{config.server_port}",
+                        file=sys.stderr,
+                    )
+            except BaseException:
+                # A failure between watcher startup and the transport hand-off
+                # (e.g. metrics startup) would otherwise leave the observer
+                # running with no owner. _serve_with_lifecycle cleans up its
+                # own paths; this covers everything before it, preserving the
+                # original exception.
+                _stop_watcher_stack(observer, watcher)
+                raise
 
-            _run_transport(transport)
+            _serve_with_lifecycle(transport, observer, watcher)
     except AlreadyRunningError as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         raise SystemExit(ALREADY_RUNNING_EXIT_CODE) from e

@@ -140,6 +140,9 @@ def _fresh_orch(prod_collection_name: str = "knowledge_base") -> KnowledgeOrches
     orch._source_to_docid = {}
     orch.query_cache = MagicMock()
     orch._reindex_progress = {"active": False}
+    # Mirrors production __init__ (v4.8.3 runtime corrective, Package A):
+    # nuclear_rebuild/reindex_all acquire this re-entrant one-writer lock.
+    orch._index_lock = threading.RLock()
     orch._metadata_file = MagicMock()
     orch._save_metadata = MagicMock()
     orch._ensure_bm25_index = MagicMock()
