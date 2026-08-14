@@ -198,14 +198,19 @@ def _strip_frontmatter(text: str) -> str:
 
 
 def _score_block(block: str, stems: list) -> tuple:
+    """(distinct stems matched, length-weighted occurrences, matched stems).
+
+    Only the first two elements order units; the third names *which* query
+    terms a block answered, which the relevance gate reads."""
     lowered = block.casefold()
-    distinct, weighted = 0, 0
+    distinct, weighted, matched = 0, 0, []
     for stem in stems:
         count = lowered.count(stem)
         if count:
             distinct += 1
             weighted += len(stem) * count
-    return (distinct, weighted)
+            matched.append(stem)
+    return (distinct, weighted, frozenset(matched))
 
 
 # Fenced ``` / ~~~ blocks (code, YAML, mermaid…) are never evidence.
@@ -263,8 +268,26 @@ def _evidence_units(query: str, results: list) -> list:
     # matches any stem the best coverage is 0, no unit is eligible, and the
     # caller keeps its safe no-evidence answer instead of filling from
     # unrelated blocks.
-    best_distinct = max((entry[0][0] for entry in scored), default=0)
-    relevant = [entry for entry in scored if 2 * entry[0][0] > best_distinct]
+    #
+    # Counting stems alone treats every query word as evidence, so on a query
+    # whose subject is one term ("…сказано об азотемии") a block answering only
+    # the question's scaffolding ties the best coverage and prints beside real
+    # evidence (acceptance 2026-08-14). A unit must therefore also share a stem
+    # with the strongest unit — the query terms the retrieved corpus actually
+    # answered — which a scaffolding-only match never does. The anchor is one
+    # unit taken in the ordering below, never the union of units tied at the
+    # top: a scaffolding-only unit tied there would otherwise readmit itself.
+    # No stop-word list, subject term or result score enters this decision.
+    anchor = min(
+        scored,
+        key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]),
+        default=None,
+    )
+    best_distinct = anchor[0][0] if anchor else 0
+    core = anchor[0][2] if anchor else frozenset()
+    relevant = [
+        entry for entry in scored if 2 * entry[0][0] > best_distinct and entry[0][2] & core
+    ]
     relevant.sort(key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]))
     chosen, total = [], 0
     for entry in relevant:
