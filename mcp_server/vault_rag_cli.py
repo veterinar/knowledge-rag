@@ -173,10 +173,25 @@ async def _search(url: str, query: str, limit: int, method: str) -> dict:
     return payload
 
 
+# Generic Russian question/request wrapper tokens: they ask for material rather
+# than name the subject, so a block matching only these answers nothing. Fixed
+# and subject-free — no veterinary term appears here, and nothing reads a score.
+_SCAFFOLDING_TOKENS = frozenset({"что", "чем", "чём", "чего", "чему"})
+_SCAFFOLDING_PREFIXES = (
+    "как", "наш", "материал", "сказ", "говор", "рассказ", "расскаж",
+    "информац", "данн", "известн", "описан", "упомян", "упомин",
+)
+
+
 def _query_stems(query: str) -> list:
-    """Deterministic crude stems: lowercase word tokens >=3 chars, first 6 chars."""
+    """Deterministic crude stems: lowercase word tokens >=3 chars, first 6 chars.
+    Wrapper tokens above are dropped before stemming, so "Что в наших материалах
+    сказано об азотемии?" stems to its subject alone. A query that is nothing but
+    scaffolding yields no stems, and the caller then finds no evidence at all."""
     stems = []
     for token in re.findall(r"\w+", query.lower()):
+        if token in _SCAFFOLDING_TOKENS or token.startswith(_SCAFFOLDING_PREFIXES):
+            continue
         if len(token) < 3:
             continue
         stem = token[:6]
@@ -198,19 +213,14 @@ def _strip_frontmatter(text: str) -> str:
 
 
 def _score_block(block: str, stems: list) -> tuple:
-    """(distinct stems matched, length-weighted occurrences, matched stems).
-
-    Only the first two elements order units; the third names *which* query
-    terms a block answered, which the relevance gate reads."""
     lowered = block.casefold()
-    distinct, weighted, matched = 0, 0, []
+    distinct, weighted = 0, 0
     for stem in stems:
         count = lowered.count(stem)
         if count:
             distinct += 1
             weighted += len(stem) * count
-            matched.append(stem)
-    return (distinct, weighted, frozenset(matched))
+    return (distinct, weighted)
 
 
 # Fenced ``` / ~~~ blocks (code, YAML, mermaid…) are never evidence.
@@ -268,26 +278,8 @@ def _evidence_units(query: str, results: list) -> list:
     # matches any stem the best coverage is 0, no unit is eligible, and the
     # caller keeps its safe no-evidence answer instead of filling from
     # unrelated blocks.
-    #
-    # Counting stems alone treats every query word as evidence, so on a query
-    # whose subject is one term ("…сказано об азотемии") a block answering only
-    # the question's scaffolding ties the best coverage and prints beside real
-    # evidence (acceptance 2026-08-14). A unit must therefore also share a stem
-    # with the strongest unit — the query terms the retrieved corpus actually
-    # answered — which a scaffolding-only match never does. The anchor is one
-    # unit taken in the ordering below, never the union of units tied at the
-    # top: a scaffolding-only unit tied there would otherwise readmit itself.
-    # No stop-word list, subject term or result score enters this decision.
-    anchor = min(
-        scored,
-        key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]),
-        default=None,
-    )
-    best_distinct = anchor[0][0] if anchor else 0
-    core = anchor[0][2] if anchor else frozenset()
-    relevant = [
-        entry for entry in scored if 2 * entry[0][0] > best_distinct and entry[0][2] & core
-    ]
+    best_distinct = max((entry[0][0] for entry in scored), default=0)
+    relevant = [entry for entry in scored if 2 * entry[0][0] > best_distinct]
     relevant.sort(key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]))
     chosen, total = [], 0
     for entry in relevant:
