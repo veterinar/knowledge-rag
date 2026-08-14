@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -32,6 +33,10 @@ HERMES_TIMEOUT_SECONDS = 300
 # 2026-08-14 after the E2E showed 1200 truncated a decisive azotemia matrix).
 MAX_FRAGMENT_CHARS = 4000
 MAX_CONTEXT_CHARS = 16000
+# Full-document evidence windows (task order, 2026-08-14): ~5000 chars per
+# document so up to three windows fit the 16000-char context budget.
+DOC_WINDOW_CHARS = 5000
+WINDOW_STEP_CHARS = 1000  # deterministic scan stride for window selection
 
 # CLI method -> search_knowledge arguments. The tool accepts only
 # auto|hybrid|fts5; per its docstring semantic/keyword are hybrid with
@@ -75,17 +80,11 @@ def _limit(value: str) -> int:
     return limit
 
 
-async def _search(url: str, query: str, limit: int, method: str) -> dict:
-    """Call search_knowledge over streamable HTTP and return its parsed JSON payload."""
-    arguments = {"query": query, "max_results": limit, **_METHOD_PARAMS[method]}
-    async with streamable_http_client(url) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            result = await session.call_tool("search_knowledge", arguments)
-
+def _tool_payload(result) -> dict:
+    """Extract and parse a tool's JSON envelope from an MCP CallToolResult."""
     texts = [item.text for item in (result.content or []) if getattr(item, "type", "") == "text"]
     if getattr(result, "is_error", False):
-        raise RuntimeError("; ".join(texts) or "инструмент search_knowledge вернул ошибку без текста")
+        raise RuntimeError("; ".join(texts) or "инструмент вернул ошибку без текста")
     if not texts:
         structured = getattr(result, "structured_content", None)
         if isinstance(structured, dict):
@@ -100,18 +99,121 @@ async def _search(url: str, query: str, limit: int, method: str) -> dict:
     return payload
 
 
+def _document_candidates(item: dict) -> list:
+    """Paths to try with get_document for a search result, most specific first."""
+    source = str(item.get("source") or "").strip()
+    filename = str(item.get("filename") or "").strip()
+    category = str(item.get("category") or "").strip()
+    candidates = []
+    if source:
+        candidates.append(source)
+    if category and filename:
+        candidates.append(f"{category}/{filename}")
+    if filename:
+        candidates.append(filename)
+    return [c for i, c in enumerate(candidates) if c not in candidates[:i]]
+
+
+async def _fetch_full_document(session, item: dict, cache: dict) -> str:
+    """Fetch the full document behind a search result; '' when unavailable."""
+    candidates = _document_candidates(item)
+    key = "\x00".join(candidates)
+    if not candidates:
+        return ""
+    if key in cache:
+        return cache[key]
+    content = ""
+    for candidate in candidates:
+        try:
+            payload = _tool_payload(await session.call_tool("get_document", {"filepath": candidate}))
+        except Exception:  # noqa: BLE001 — per-document failure keeps the original chunk
+            continue
+        document = payload.get("document") if payload.get("status") == "success" else None
+        if isinstance(document, dict) and str(document.get("content") or "").strip():
+            content = str(document["content"])
+            break
+    cache[key] = content
+    return content
+
+
+async def _search(url: str, query: str, limit: int, method: str) -> dict:
+    """Search, then attach full documents to top results in the same MCP session."""
+    arguments = {"query": query, "max_results": limit, **_METHOD_PARAMS[method]}
+    async with streamable_http_client(url) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            payload = _tool_payload(await session.call_tool("search_knowledge", arguments))
+            if payload.get("status") == "success":
+                cache = {}
+                for item in (payload.get("results") or [])[:limit]:
+                    if not isinstance(item, dict):
+                        continue
+                    full = await _fetch_full_document(session, item, cache)
+                    if full:
+                        item["_full_document"] = full  # private: never printed in Sources
+    return payload
+
+
+def _query_stems(query: str) -> list:
+    """Deterministic crude stems: lowercase word tokens >=3 chars, first 6 chars."""
+    stems = []
+    for token in re.findall(r"\w+", query.lower()):
+        if len(token) < 3:
+            continue
+        stem = token[:6]
+        if stem not in stems:
+            stems.append(stem)
+    return stems
+
+
+def _select_window(full_text: str, stems: list, size: int = DOC_WINDOW_CHARS) -> str:
+    """Pick the query-densest window of the document; '' when no stem matches."""
+    if not full_text:
+        return ""
+    if len(full_text) <= size:
+        return full_text
+    lowered = full_text.lower()
+    starts = list(range(0, len(full_text) - size + 1, WINDOW_STEP_CHARS))
+    if starts[-1] != len(full_text) - size:
+        starts.append(len(full_text) - size)
+    best_start, best_score = 0, (0, 0)
+    for start in starts:
+        window = lowered[start:start + size]
+        distinct, weighted = 0, 0
+        for stem in stems:
+            count = window.count(stem)
+            if count:
+                distinct += 1
+                weighted += len(stem) * count
+        score = (distinct, weighted)
+        if score > best_score:  # strict: earliest window wins ties (deterministic)
+            best_score, best_start = score, start
+    if best_score == (0, 0):
+        return ""
+    return full_text[best_start:best_start + size]
+
+
 def _fragment_label(item: dict) -> str:
     return str(item.get("filename") or item.get("source") or "<файл не указан>")
 
 
+def _fragment_evidence(item: dict, stems: list) -> str:
+    """Evidence text for one result: query-dense full-doc window, else the chunk."""
+    window = _select_window(str(item.get("_full_document") or ""), stems)
+    if window:
+        return " ".join(window.split())
+    content = " ".join(str(item.get("content") or "").split())
+    if len(content) > MAX_FRAGMENT_CHARS:
+        content = content[:MAX_FRAGMENT_CHARS].rstrip() + "…"
+    return content
+
+
 def _build_prompt(query: str, results: list) -> tuple:
     """Build the bounded Russian prompt; return (prompt, fragments actually included)."""
+    stems = _query_stems(query)
     used, blocks, total = [], [], 0
     for item in results:
-        content = " ".join(str(item.get("content") or "").split())
-        if len(content) > MAX_FRAGMENT_CHARS:
-            content = content[:MAX_FRAGMENT_CHARS].rstrip() + "…"
-        block = f"[{len(used) + 1}] {_fragment_label(item)}: {content}"
+        block = f"[{len(used) + 1}] {_fragment_label(item)}: {_fragment_evidence(item, stems)}"
         if used and total + len(block) > MAX_CONTEXT_CHARS:
             break  # deterministic bound: keep the highest-ranked fragments
         used.append(item)
