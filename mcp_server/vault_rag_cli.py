@@ -21,8 +21,14 @@ import subprocess
 import sys
 from collections import namedtuple
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+# mcp 2.0.0's Client is the supported entry point: given a URL it builds the
+# streamable-HTTP transport itself and negotiates the protocol era (mode="auto"
+# probes server/discover at 2026-07-28, falling back to the initialize
+# handshake). The knowledge-rag server serves the 2026-07-28 core, which
+# retires that handshake — a hand-rolled ClientSession pinned to
+# session.initialize() dies on it, inside the transport's anyio task group, so
+# the real cause reaches the terminal only as "unhandled errors in a TaskGroup".
+from mcp import Client
 
 DEFAULT_URL = "http://127.0.0.1:8179/mcp"  # local knowledge-rag endpoint (task order, 2026-08-14)
 
@@ -129,7 +135,7 @@ def _document_candidates(item: dict) -> list:
     return [c for i, c in enumerate(candidates) if c not in candidates[:i]]
 
 
-async def _fetch_full_document(session, item: dict, cache: dict) -> str:
+async def _fetch_full_document(client, item: dict, cache: dict) -> str:
     """Fetch the full document behind a search result; '' when unavailable."""
     candidates = _document_candidates(item)
     key = "\x00".join(candidates)
@@ -140,7 +146,7 @@ async def _fetch_full_document(session, item: dict, cache: dict) -> str:
     content = ""
     for candidate in candidates:
         try:
-            payload = _tool_payload(await session.call_tool("get_document", {"filepath": candidate}))
+            payload = _tool_payload(await client.call_tool("get_document", {"filepath": candidate}))
         except Exception:  # noqa: BLE001 — per-document failure keeps the original chunk
             continue
         document = payload.get("document") if payload.get("status") == "success" else None
@@ -154,18 +160,16 @@ async def _fetch_full_document(session, item: dict, cache: dict) -> str:
 async def _search(url: str, query: str, limit: int, method: str) -> dict:
     """Search, then attach full documents to top results in the same MCP session."""
     arguments = {"query": query, "max_results": limit, **_METHOD_PARAMS[method]}
-    async with streamable_http_client(url) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            payload = _tool_payload(await session.call_tool("search_knowledge", arguments))
-            if payload.get("status") == "success":
-                cache = {}
-                for item in (payload.get("results") or [])[:limit]:
-                    if not isinstance(item, dict):
-                        continue
-                    full = await _fetch_full_document(session, item, cache)
-                    if full:
-                        item["_full_document"] = full  # private: never printed in Sources
+    async with Client(url) as client:  # mode="auto": negotiates the server's protocol era
+        payload = _tool_payload(await client.call_tool("search_knowledge", arguments))
+        if payload.get("status") == "success":
+            cache = {}
+            for item in (payload.get("results") or [])[:limit]:
+                if not isinstance(item, dict):
+                    continue
+                full = await _fetch_full_document(client, item, cache)
+                if full:
+                    item["_full_document"] = full  # private: never printed in Sources
     return payload
 
 
