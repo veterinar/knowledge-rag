@@ -173,10 +173,25 @@ async def _search(url: str, query: str, limit: int, method: str) -> dict:
     return payload
 
 
+# Generic Russian question/request wrapper tokens: they ask for material rather
+# than name the subject, so a block matching only these answers nothing. Fixed
+# and subject-free — no veterinary term appears here, and nothing reads a score.
+_SCAFFOLDING_TOKENS = frozenset({"что", "чем", "чём", "чего", "чему"})
+_SCAFFOLDING_PREFIXES = (
+    "как", "наш", "материал", "сказ", "говор", "рассказ", "расскаж",
+    "информац", "данн", "известн", "описан", "упомян", "упомин",
+)
+
+
 def _query_stems(query: str) -> list:
-    """Deterministic crude stems: lowercase word tokens >=3 chars, first 6 chars."""
+    """Deterministic crude stems: lowercase word tokens >=3 chars, first 6 chars.
+    Wrapper tokens above are dropped before stemming, so "Что в наших материалах
+    сказано об азотемии?" stems to its subject alone. A query that is nothing but
+    scaffolding yields no stems, and the caller then finds no evidence at all."""
     stems = []
     for token in re.findall(r"\w+", query.lower()):
+        if token in _SCAFFOLDING_TOKENS or token.startswith(_SCAFFOLDING_PREFIXES):
+            continue
         if len(token) < 3:
             continue
         stem = token[:6]
