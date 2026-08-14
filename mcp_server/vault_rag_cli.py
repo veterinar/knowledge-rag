@@ -1,21 +1,33 @@
-"""vault-rag — local terminal client for the knowledge-rag MCP server.
+"""vault-rag — local terminal Vault-RAG client for the knowledge-rag MCP server.
 
-Calls the already-running local MCP endpoint over streamable HTTP, invokes
-the ``search_knowledge`` tool and prints ranked veterinary excerpts with
-their source filenames. MCP is an internal transport only — the user sees
-plain Russian terminal output.
+Retrieves ranked veterinary excerpts from the already-running local MCP
+endpoint (``search_knowledge`` over streamable HTTP), then generates a
+grounded Russian answer through the local Hermes CLI (inference-only) and
+prints the answer followed by a compact numbered Sources section. MCP and
+Hermes are internal transports only — the user sees plain terminal output.
 """
 
 import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 DEFAULT_URL = "http://127.0.0.1:8179/mcp"  # local knowledge-rag endpoint (task order, 2026-08-14)
+
+DEFAULT_HERMES_BIN = "/Users/alis/.local/bin/hermes"  # task order, 2026-08-14
+DEFAULT_HERMES_PROVIDER = "vault-rag-local"
+DEFAULT_HERMES_MODEL = "qwen2.5-vl-7b-instruct"
+# The task order requires a bounded timeout; the exact figure is a default
+# sized for a local 7B model answering from a few kilobytes of context.
+HERMES_TIMEOUT_SECONDS = 300
+# Deterministic context caps (task order: bound the prompt size).
+MAX_FRAGMENT_CHARS = 1200
+MAX_CONTEXT_CHARS = 9000
 
 # CLI method -> search_knowledge arguments. The tool accepts only
 # auto|hybrid|fts5; per its docstring semantic/keyword are hybrid with
@@ -27,6 +39,19 @@ _METHOD_PARAMS = {
     "keyword": {"search_method": "hybrid", "hybrid_alpha": 0.0},
     "fts5": {"search_method": "fts5"},
 }
+
+_PROMPT_HEADER = (
+    "Ты — ассистент локальной ветеринарной базы знаний. Ответь на вопрос, "
+    "используя ТОЛЬКО приведённые ниже фрагменты.\n"
+    "Правила:\n"
+    "1. Каждое фактическое утверждение подтверждай ссылкой на фрагмент в виде [1], [2].\n"
+    "2. Ничего не выдумывай. Если фрагменты не содержат ответа или его части, "
+    "прямо напиши, что данных в базе недостаточно.\n"
+    "3. Разделяй, что именно говорят источники (доказательства), и не превращай это "
+    "в клинические назначения: это справка по базе знаний, а не рекомендация по лечению "
+    "конкретного животного.\n"
+    "4. Отвечай по-русски, кратко и по существу.\n"
+)
 
 
 def _limit(value: str) -> int:
@@ -64,22 +89,76 @@ async def _search(url: str, query: str, limit: int, method: str) -> dict:
     return payload
 
 
-def _render(payload: dict, method: str) -> None:
-    results = payload.get("results") or []
-    print(f"Запрос: {payload.get('query', '')}")
-    print(f"Метод: {method} · результатов: {len(results)}")
+def _fragment_label(item: dict) -> str:
+    return str(item.get("filename") or item.get("source") or "<файл не указан>")
+
+
+def _build_prompt(query: str, results: list) -> tuple:
+    """Build the bounded Russian prompt; return (prompt, fragments actually included)."""
+    used, blocks, total = [], [], 0
+    for item in results:
+        content = " ".join(str(item.get("content") or "").split())
+        if len(content) > MAX_FRAGMENT_CHARS:
+            content = content[:MAX_FRAGMENT_CHARS].rstrip() + "…"
+        block = f"[{len(used) + 1}] {_fragment_label(item)}: {content}"
+        if used and total + len(block) > MAX_CONTEXT_CHARS:
+            break  # deterministic bound: keep the highest-ranked fragments
+        used.append(item)
+        blocks.append(block)
+        total += len(block)
+    prompt = f"{_PROMPT_HEADER}\nВопрос: {query}\n\nФрагменты:\n" + "\n\n".join(blocks) + "\n"
+    return prompt, used
+
+
+def _generate_answer(prompt: str) -> str:
+    """Run the local Hermes CLI non-interactively and return the answer text."""
+    hermes_bin = os.environ.get("VAULT_RAG_HERMES_BIN") or DEFAULT_HERMES_BIN
+    provider = os.environ.get("VAULT_RAG_HERMES_PROVIDER") or DEFAULT_HERMES_PROVIDER
+    model = os.environ.get("VAULT_RAG_HERMES_MODEL") or DEFAULT_HERMES_MODEL
+    # chat -q -Q: non-interactive single query, banner/spinner suppressed,
+    # only the final response on stdout (session info goes to stderr).
+    # --reasoning/--ignore-rules/--source are honored on the chat path
+    # (hermes -z oneshot ignores all three — verified in hermes_cli 0.20.0).
+    argv = [
+        hermes_bin, "chat",
+        "-q", prompt,
+        "--quiet",
+        "--provider", provider,
+        "--model", model,
+        "--reasoning", "none",
+        "--ignore-rules",
+        "--source", "tool",
+    ]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=HERMES_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Hermes CLI не найден: {exc.filename or hermes_bin}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Hermes не ответил за {HERMES_TIMEOUT_SECONDS} с") from exc
+    if proc.returncode != 0:
+        detail = " ".join((proc.stderr or "").split())[-200:] or "нет сообщения об ошибке"
+        raise RuntimeError(f"Hermes завершился с кодом {proc.returncode}: {detail}")
+    answer = (proc.stdout or "").strip()
+    if not answer:
+        raise RuntimeError("Hermes вернул пустой ответ")
+    return answer
+
+
+def _render(answer: str, used: list, total_found: int) -> None:
+    print(answer)
     print()
-    for rank, item in enumerate(results, 1):
-        filename = item.get("filename") or item.get("source") or "<файл не указан>"
+    print("Источники:")
+    for rank, item in enumerate(used, 1):
         score = item.get("score")
         category = item.get("category") or "—"
-        via = item.get("search_method") or "?"
-        print(f"{rank}. {filename}")
-        print(f"   релевантность: {score} · категория: {category} · путь поиска: {via}")
-        content = str(item.get("content") or "").strip()
-        for line in content.splitlines():
-            print(f"   {line}")
-        print()
+        print(f"[{rank}] {_fragment_label(item)} · категория: {category} · релевантность: {score}")
+    if len(used) < total_found:
+        print(f"\nПримечание: в контекст модели вошли первые {len(used)} из {total_found} найденных фрагментов.")
 
 
 def main() -> int:
@@ -90,11 +169,17 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(
         prog="vault-rag",
-        description="Поиск по локальной ветеринарной базе знаний через работающий knowledge-rag MCP-сервер.",
-        epilog="Адрес сервера берётся из переменной окружения KNOWLEDGE_RAG_MCP_URL, иначе " + DEFAULT_URL,
+        description=(
+            "Готовый ответ по локальной ветеринарной базе знаний: поиск через работающий "
+            "knowledge-rag MCP-сервер, генерация — через локальный Hermes CLI."
+        ),
+        epilog=(
+            "Переменные окружения: KNOWLEDGE_RAG_MCP_URL (адрес MCP, иначе " + DEFAULT_URL + "), "
+            "VAULT_RAG_HERMES_BIN, VAULT_RAG_HERMES_PROVIDER, VAULT_RAG_HERMES_MODEL."
+        ),
     )
-    parser.add_argument("query", nargs="+", metavar="ЗАПРОС", help="текст запроса (можно несколько слов)")
-    parser.add_argument("--limit", type=_limit, default=5, help="число результатов, 1..10 (по умолчанию 5)")
+    parser.add_argument("query", nargs="+", metavar="ЗАПРОС", help="вопрос (можно несколько слов)")
+    parser.add_argument("--limit", type=_limit, default=5, help="число фрагментов, 1..10 (по умолчанию 5)")
     parser.add_argument(
         "--method",
         choices=sorted(_METHOD_PARAMS),
@@ -118,15 +203,27 @@ def main() -> int:
         return 2
 
     status = payload.get("status")
-    if status == "success" and payload.get("results"):
-        _render(payload, args.method)
-        return 0
     if status == "no_results":
         print(f"По запросу «{query}» ничего не найдено.", file=sys.stderr)
         return 1
-    message = payload.get("message") or payload.get("error") or f"статус ответа: {status!r}"
-    print(f"Сервер вернул ошибку: {message}", file=sys.stderr)
-    return 1
+    results = payload.get("results") or []
+    if status != "success" or not results:
+        message = payload.get("message") or payload.get("error") or f"статус ответа: {status!r}"
+        print(f"Сервер вернул ошибку: {message}", file=sys.stderr)
+        return 1
+
+    prompt, used = _build_prompt(query, results)
+    try:
+        answer = _generate_answer(prompt)
+    except KeyboardInterrupt:
+        print("Прервано пользователем.", file=sys.stderr)
+        return 130
+    except RuntimeError as exc:
+        print(f"Ошибка генерации ответа (Hermes): {exc}", file=sys.stderr)
+        return 3
+
+    _render(answer, used, len(results))
+    return 0
 
 
 if __name__ == "__main__":
