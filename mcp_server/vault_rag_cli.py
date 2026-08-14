@@ -22,6 +22,9 @@ DEFAULT_URL = "http://127.0.0.1:8179/mcp"  # local knowledge-rag endpoint (task 
 DEFAULT_HERMES_BIN = "/Users/alis/.local/bin/hermes"  # task order, 2026-08-14
 DEFAULT_HERMES_PROVIDER = "vault-rag-local"
 DEFAULT_HERMES_MODEL = "qwen2.5-vl-7b-instruct"
+# Isolated Hermes config root: the global HERMES_HOME carries unrelated MCP
+# servers that must not be launched from this CLI (task order, 2026-08-14).
+DEFAULT_HERMES_HOME = "/Users/alis/.local/share/vetclub-knowledge-rag/hermes-vault-rag"
 # The task order requires a bounded timeout; the exact figure is a default
 # sized for a local 7B model answering from a few kilobytes of context.
 HERMES_TIMEOUT_SECONDS = 300
@@ -115,6 +118,10 @@ def _generate_answer(prompt: str) -> str:
     hermes_bin = os.environ.get("VAULT_RAG_HERMES_BIN") or DEFAULT_HERMES_BIN
     provider = os.environ.get("VAULT_RAG_HERMES_PROVIDER") or DEFAULT_HERMES_PROVIDER
     model = os.environ.get("VAULT_RAG_HERMES_MODEL") or DEFAULT_HERMES_MODEL
+    hermes_home = os.environ.get("VAULT_RAG_HERMES_HOME") or DEFAULT_HERMES_HOME
+    # Never inherit the ambient HERMES_HOME: it points at the user's global
+    # Hermes config whose MCP servers would be launched on agent startup.
+    env = {**os.environ, "HERMES_HOME": hermes_home}
     # chat -q -Q: non-interactive single query, banner/spinner suppressed,
     # only the final response on stdout (session info goes to stderr).
     # --reasoning/--ignore-rules/--source are honored on the chat path
@@ -128,6 +135,10 @@ def _generate_answer(prompt: str) -> str:
         "--reasoning", "none",
         "--ignore-rules",
         "--source", "tool",
+        # context_engine is a valid built-in toolset that enables no external
+        # tools here; with --max-turns 1 the model answers in a single turn.
+        "--toolsets", "context_engine",
+        "--max-turns", "1",
     ]
     try:
         proc = subprocess.run(
@@ -135,6 +146,7 @@ def _generate_answer(prompt: str) -> str:
             capture_output=True,
             text=True,
             timeout=HERMES_TIMEOUT_SECONDS,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Hermes CLI не найден: {exc.filename or hermes_bin}") from exc
@@ -175,7 +187,7 @@ def main() -> int:
         ),
         epilog=(
             "Переменные окружения: KNOWLEDGE_RAG_MCP_URL (адрес MCP, иначе " + DEFAULT_URL + "), "
-            "VAULT_RAG_HERMES_BIN, VAULT_RAG_HERMES_PROVIDER, VAULT_RAG_HERMES_MODEL."
+            "VAULT_RAG_HERMES_BIN, VAULT_RAG_HERMES_PROVIDER, VAULT_RAG_HERMES_MODEL, VAULT_RAG_HERMES_HOME."
         ),
     )
     parser.add_argument("query", nargs="+", metavar="ЗАПРОС", help="вопрос (можно несколько слов)")
