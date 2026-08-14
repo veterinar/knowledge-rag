@@ -60,6 +60,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 # Local imports
+from . import __version__
 from .config import config
 from .fts5_index import Fts5LexicalIndex, Fts5NotReadyError, capture_chunk_rows, compute_rows_digest
 from .ingestion import Document, DocumentParser
@@ -3950,7 +3951,7 @@ class KnowledgeOrchestrator:
 
 mcp = MCPServer(
     "knowledge-rag",
-    version="4.6.0",
+    version=__version__,
 )
 
 _orchestrator: Optional[KnowledgeOrchestrator] = None

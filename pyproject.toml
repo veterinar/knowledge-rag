@@ -66,6 +66,7 @@ Changelog = "https://github.com/lyonzin/knowledge-rag/releases"
 [project.scripts]
 knowledge-rag = "mcp_server.server:main"
 knowledge-rag-guarded = "mcp_server.guarded:guarded_main"
+vault-rag = "mcp_server.vault_rag_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_server"]
