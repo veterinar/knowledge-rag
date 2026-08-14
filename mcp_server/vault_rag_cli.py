@@ -183,6 +183,27 @@ _SCAFFOLDING_PREFIXES = (
 )
 
 
+_RETRIEVAL_QUESTION_PREFIXES = (
+    "что в наших материалах сказано об ",
+    "что в наших материалах сказано о ",
+    "что в материалах сказано об ",
+    "что в материалах сказано о ",
+    "что сказано об ",
+    "что сказано о ",
+)
+
+
+def _retrieval_query(query: str) -> str:
+    """Strip a known leading question phrase while preserving its subject."""
+    stripped = query.lstrip()
+    folded = stripped.casefold()
+    for prefix in _RETRIEVAL_QUESTION_PREFIXES:
+        if folded.startswith(prefix):
+            subject = stripped[len(prefix):].strip().strip("?!.,;:")
+            return subject or query
+    return query
+
+
 def _query_stems(query: str) -> list:
     """Deterministic crude stems: lowercase word tokens >=3 chars, first 6 chars.
     Wrapper tokens above are dropped before stemming, so "Что в наших материалах
@@ -442,7 +463,7 @@ def main() -> int:
     url = os.environ.get("KNOWLEDGE_RAG_MCP_URL") or DEFAULT_URL
 
     try:
-        payload = asyncio.run(_search(url, query, args.limit, args.method))
+        payload = asyncio.run(_search(url, _retrieval_query(query), args.limit, args.method))
     except KeyboardInterrupt:
         print("Прервано пользователем.", file=sys.stderr)
         return 130
