@@ -44,9 +44,9 @@ MIN_UNIT_CHARS = 30
 MAX_UNIT_CHARS = 500
 MAX_UNITS = 12
 # The model must pick 1..MAX_SELECTED unit IDs; when its output is unusable,
-# the deterministic fallback picks the FALLBACK_SELECTED top-scored units.
+# the deterministic fallback prints the units that passed the relevance gate,
+# under the same bound — never a fixed number of bullets.
 MAX_SELECTED = 5
-FALLBACK_SELECTED = 3
 
 # CLI method -> search_knowledge arguments. The tool accepts only
 # auto|hybrid|fts5; per its docstring semantic/keyword are hybrid with
@@ -229,7 +229,9 @@ def _evidence_units(query: str, results: list) -> list:
     """Bounded, query-relevant natural-language evidence units derived from
     the fetched documents (search chunks when a document is unavailable).
     Each unit stays bound to its source rank and carries an opaque ID; the
-    printed answer is assembled only from these units."""
+    printed answer is assembled only from these units. Units that fail the
+    relevance gate below are never offered to the model, so neither its
+    selection nor the fallback can print them."""
     stems = _query_stems(query)
     scored, seen = [], set()
     for rank, item in enumerate(results, 1):
@@ -248,7 +250,17 @@ def _evidence_units(query: str, results: list) -> list:
                 continue
             seen.add(key)
             scored.append((_score_block(unit_text, stems), rank, position, unit_text))
-    relevant = [entry for entry in scored if entry[0] > (0, 0)] or scored
+    # Deterministic query-relative relevance gate (task order, 2026-08-14): a
+    # unit is eligible only while it covers more than half as many distinct
+    # query stems as the strongest unit found, so a block with weak incidental
+    # overlap cannot be printed beside substantially stronger evidence. The
+    # majority shape is the gate itself, not a measured threshold, and it reads
+    # only the query's own stems — no subject term is hard-coded. When nothing
+    # matches any stem the best coverage is 0, no unit is eligible, and the
+    # caller keeps its safe no-evidence answer instead of filling from
+    # unrelated blocks.
+    best_distinct = max((entry[0][0] for entry in scored), default=0)
+    relevant = [entry for entry in scored if 2 * entry[0][0] > best_distinct]
     relevant.sort(key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]))
     chosen, total = [], 0
     for entry in relevant:
@@ -284,18 +296,25 @@ def _parse_selection(raw: str, units: list):
         return None
     ids = payload["evidence_ids"]
     known = {unit.uid for unit in units}
-    if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_SELECTED
-            or len(set(ids)) != len(ids)
-            or not all(isinstance(uid, str) and uid in known for uid in ids)):
+    if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_SELECTED:
+        return None
+    # Element types are validated before the duplicate set is built: an
+    # unhashable element (a nested list or object) would otherwise raise
+    # instead of rejecting the output.
+    if not all(isinstance(uid, str) and uid in known for uid in ids):
+        return None
+    if len(set(ids)) != len(ids):
         return None
     return ids
 
 
 def _fallback_ids(units: list) -> list:
-    """Deterministic choice when the model output is unusable: the top-scored
-    units, cited in source order."""
+    """Deterministic choice when the model output is unusable: the strongest
+    units that passed the relevance gate, cited in source order. The count
+    follows eligibility — MAX_SELECTED only bounds it, and fewer eligible
+    units mean fewer bullets."""
     ranked = sorted(units, key=lambda u: (-u.score[0], -u.score[1], u.rank, u.position))
-    picked = sorted(ranked[:FALLBACK_SELECTED], key=lambda u: (u.rank, u.position))
+    picked = sorted(ranked[:MAX_SELECTED], key=lambda u: (u.rank, u.position))
     return [unit.uid for unit in picked]
 
 
