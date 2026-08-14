@@ -37,6 +37,12 @@ MAX_CONTEXT_CHARS = 16000
 # document so up to three windows fit the 16000-char context budget.
 DOC_WINDOW_CHARS = 5000
 WINDOW_STEP_CHARS = 1000  # deterministic scan stride for window selection
+# Grounding validation / Evidence Answer bounds (task order, 2026-08-14):
+# a quoted span shorter than this cannot anchor a factual claim; the
+# Evidence Answer stays terminal-sized while fitting a full matrix block.
+MIN_QUOTE_CHARS = 12
+EVIDENCE_SOURCE_CHARS = 2500
+EVIDENCE_TOTAL_CHARS = 8000
 
 # CLI method -> search_knowledge arguments. The tool accepts only
 # auto|hybrid|fts5; per its docstring semantic/keyword are hybrid with
@@ -53,8 +59,10 @@ _PROMPT_HEADER = (
     "Ты — ассистент локальной ветеринарной базы знаний. Ответь на вопрос, "
     "используя ТОЛЬКО приведённые ниже фрагменты.\n"
     "Жёсткие правила:\n"
-    "1. Каждый пункт с фактом завершай ссылкой [n] сразу после утверждения "
-    "(например: «… повышен [2]»). Утверждение без ссылки на фрагмент запрещено.\n"
+    "1. Каждый пункт с фактом строй только так: точная дословная цитата из "
+    "фрагмента в «кавычках» и сразу после неё ссылка [n] (например: "
+    "«мочевина повышена, креатинин без изменений» [2]). Пункт без дословной "
+    "цитаты со ссылкой запрещён; пересказ вместо цитаты запрещён.\n"
     "2. Направления показателей и отрицания переноси дословно из фрагментов: "
     "«повышен», «снижен», «в норме», «не повышен», «не изменяется» нельзя менять "
     "на противоположные или перефразировать с потерей отрицания.\n"
@@ -209,18 +217,128 @@ def _fragment_evidence(item: dict, stems: list) -> str:
 
 
 def _build_prompt(query: str, results: list) -> tuple:
-    """Build the bounded Russian prompt; return (prompt, fragments actually included)."""
+    """Build the bounded prompt; return (prompt, used fragments, per-[n] evidence)."""
     stems = _query_stems(query)
-    used, blocks, total = [], [], 0
+    used, blocks, evidences, total = [], [], [], 0
     for item in results:
-        block = f"[{len(used) + 1}] {_fragment_label(item)}: {_fragment_evidence(item, stems)}"
+        evidence = _fragment_evidence(item, stems)
+        block = f"[{len(used) + 1}] {_fragment_label(item)}: {evidence}"
         if used and total + len(block) > MAX_CONTEXT_CHARS:
             break  # deterministic bound: keep the highest-ranked fragments
         used.append(item)
         blocks.append(block)
+        evidences.append(evidence)
         total += len(block)
     prompt = f"{_PROMPT_HEADER}\nВопрос: {query}\n\nФрагменты:\n" + "\n\n".join(blocks) + "\n"
-    return prompt, used
+    return prompt, used, evidences
+
+
+def _normalize_span(span: str) -> str:
+    return " ".join(span.casefold().replace("ё", "е").split())
+
+
+_QUOTE_CITE_RES = (
+    re.compile(r"«([^«»]+)»\s*\[(\d+)\]"),
+    re.compile(r"[\"“]([^\"“”]+)[\"”]\s*\[(\d+)\]"),
+)
+_INSUFFICIENCY_MARKERS = ("недостаточно данных", "нет данных", "данных в базе недостаточно")
+
+
+def _line_quote_pairs(line: str) -> list:
+    pairs = []
+    for pattern in _QUOTE_CITE_RES:
+        pairs.extend(pattern.findall(line))
+    return pairs
+
+
+def _validate_answer(answer: str, evidences: list) -> bool:
+    """Accept only answers whose every factual line carries a verbatim, correctly
+    cited quote from the evidence actually shown to the model."""
+    normalized_evidences = [_normalize_span(ev) for ev in evidences]
+    verified_pairs = 0
+    for raw_line in answer.splitlines():
+        line = raw_line.strip().lstrip("-*•–—# ").strip()
+        if not line:
+            continue
+        lowered = line.casefold()
+        if any(marker in lowered for marker in _INSUFFICIENCY_MARKERS):
+            continue  # explicit insufficiency statement is always admissible
+        if line.endswith(":") and not any(ch.isdigit() for ch in line):
+            continue  # bare section header
+        line_ok = False
+        for quote, n_str in _line_quote_pairs(line):
+            span = _normalize_span(quote)
+            index = int(n_str) - 1
+            if (len(span) >= MIN_QUOTE_CHARS and 0 <= index < len(normalized_evidences)
+                    and span in normalized_evidences[index]):
+                line_ok = True
+                verified_pairs += 1
+                break
+        if not line_ok:
+            return False
+    return verified_pairs > 0
+
+
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if 0 < end < 2000:
+            return text[end + 4:]
+    return text
+
+
+def _score_block(block: str, stems: list) -> tuple:
+    lowered = block.casefold()
+    distinct, weighted = 0, 0
+    for stem in stems:
+        count = lowered.count(stem)
+        if count:
+            distinct += 1
+            weighted += len(stem) * count
+    return (distinct, weighted)
+
+
+def _best_blocks(full_text: str, stems: list, budget: int) -> list:
+    """Highest-scoring exact paragraphs/blocks, returned in document order."""
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", _strip_frontmatter(full_text)) if b.strip()]
+    scored = [(i, b, _score_block(b, stems)) for i, b in enumerate(blocks)]
+    scored = [entry for entry in scored if entry[2] > (0, 0)]
+    scored.sort(key=lambda entry: (-entry[2][0], -entry[2][1], entry[0]))
+    chosen, spent = [], 0
+    for index, block, _score in scored:
+        if spent + len(block) > budget and chosen:
+            continue
+        chosen.append((index, block[:budget]))
+        spent += len(block)
+        if spent >= budget:
+            break
+    return [block for _index, block in sorted(chosen)]
+
+
+def _evidence_answer(query: str, used: list) -> str:
+    """Deterministic quote-only fallback built from the fetched documents."""
+    stems = _query_stems(query)
+    lines = [
+        "Локальный синтез отклонён проверкой обоснованности: ответ модели не "
+        "подтверждён дословными цитатами из источников. Ниже — точные выдержки "
+        "из найденных документов без пересказа.",
+    ]
+    total = 0
+    for rank, item in enumerate(used, 1):
+        blocks = _best_blocks(str(item.get("_full_document") or ""), stems, EVIDENCE_SOURCE_CHARS)
+        if not blocks:
+            chunk = " ".join(str(item.get("content") or "").split())
+            blocks = [chunk[:EVIDENCE_SOURCE_CHARS]] if chunk else []
+        if not blocks:
+            continue
+        section = "\n\n".join(blocks)
+        if total + len(section) > EVIDENCE_TOTAL_CHARS and total:
+            break
+        total += len(section)
+        lines.append("")
+        lines.append(f"[{rank}] {_fragment_label(item)} — точные выдержки:")
+        lines.append(section)
+    return "\n".join(lines)
 
 
 def _generate_answer(prompt: str) -> str:
@@ -334,7 +452,7 @@ def main() -> int:
         print(f"Сервер вернул ошибку: {message}", file=sys.stderr)
         return 1
 
-    prompt, used = _build_prompt(query, results)
+    prompt, used, evidences = _build_prompt(query, results)
     try:
         answer = _generate_answer(prompt)
     except KeyboardInterrupt:
@@ -344,6 +462,9 @@ def main() -> int:
         print(f"Ошибка генерации ответа (Hermes): {exc}", file=sys.stderr)
         return 3
 
+    if not _validate_answer(answer, evidences):
+        # Never print an ungrounded generation; fall back to exact excerpts.
+        answer = _evidence_answer(query, used)
     _render(answer, used, len(results))
     return 0
 
