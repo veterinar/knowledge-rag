@@ -5,6 +5,8 @@ endpoint (``search_knowledge`` over streamable HTTP), then generates a
 grounded Russian answer through the local Hermes CLI (inference-only) and
 prints the answer followed by a compact numbered Sources section. MCP and
 Hermes are internal transports only — the user sees plain terminal output.
+Когда генерация не проходит дословную проверку цитат, вместо неё печатается
+детерминированный «Ответ по источникам» из точных блоков найденных документов.
 """
 
 import argparse
@@ -37,12 +39,13 @@ MAX_CONTEXT_CHARS = 16000
 # document so up to three windows fit the 16000-char context budget.
 DOC_WINDOW_CHARS = 5000
 WINDOW_STEP_CHARS = 1000  # deterministic scan stride for window selection
-# Grounding validation / Evidence Answer bounds (task order, 2026-08-14):
-# a quoted span shorter than this cannot anchor a factual claim; the
-# Evidence Answer stays terminal-sized while fitting a full matrix block.
+# Grounding validation bound (task order, 2026-08-14): a quoted span shorter
+# than this cannot anchor a factual claim.
 MIN_QUOTE_CHARS = 12
-EVIDENCE_SOURCE_CHARS = 2500
-EVIDENCE_TOTAL_CHARS = 8000
+# «Ответ по источникам» bound (task order, 2026-08-14: the fallback is a
+# concise cited answer, never an excerpt dump). Equal to MAX_FRAGMENT_CHARS so
+# one decisive block (the azotemia matrix that set that cap) still fits whole.
+EVIDENCE_TOTAL_CHARS = MAX_FRAGMENT_CHARS
 
 # CLI method -> search_knowledge arguments. The tool accepts only
 # auto|hybrid|fts5; per its docstring semantic/keyword are hybrid with
@@ -55,26 +58,37 @@ _METHOD_PARAMS = {
     "fts5": {"search_method": "fts5"},
 }
 
+# Output grammar (task order, 2026-08-14): the prompt and _validate_answer
+# describe the same machine-checkable format, so a drift between them is a
+# defect. Every non-empty answer line is built only of verbatim «quote» [n]
+# pairs joined by the connector phrases listed below; the sole citation-free
+# answer the grammar accepts is exactly one line carrying the insufficiency
+# sentence alone.
 _PROMPT_HEADER = (
     "Ты — ассистент локальной ветеринарной базы знаний. Ответь на вопрос, "
     "используя ТОЛЬКО приведённые ниже фрагменты.\n"
-    "Жёсткие правила:\n"
-    "1. Каждый пункт с фактом строй только так: точная дословная цитата из "
-    "фрагмента в «кавычках» и сразу после неё ссылка [n] (например: "
-    "«мочевина повышена, креатинин без изменений» [2]). Пункт без дословной "
-    "цитаты со ссылкой запрещён; пересказ вместо цитаты запрещён.\n"
-    "2. Направления показателей и отрицания переноси дословно из фрагментов: "
-    "«повышен», «снижен», «в норме», «не повышен», «не изменяется» нельзя менять "
-    "на противоположные или перефразировать с потерей отрицания.\n"
-    "3. Никогда не делай вывод, что показатель в норме, снижен или повышен, если "
-    "это прямо не написано во фрагментах. Показатель, о котором фрагменты молчат, "
-    "перечисли отдельно как «нет данных в базе».\n"
-    "4. Если фрагменты не отвечают на вопрос или отвечают лишь частично, прямо "
-    "напиши, что данных в базе недостаточно, и не дополняй ответ знаниями вне фрагментов.\n"
-    "5. Разделяй, что именно говорят источники (доказательства), и не превращай это "
-    "в клинические назначения: это справка по базе знаний, а не рекомендация по лечению "
-    "конкретного животного.\n"
-    "6. Отвечай по-русски, кратко, пунктами.\n"
+    "Формат ответа жёсткий, его проверяет программа:\n"
+    "1. Отвечай по-русски, коротким списком пунктов.\n"
+    "2. Пункт с фактом состоит ТОЛЬКО из дословных цитат из фрагментов в "
+    "«кавычках», каждая сразу со ссылкой [n] на номер своего фрагмента, и "
+    "связок «и», «а», «но», «а также», «при этом», «тогда как» со знаками "
+    "препинания. Ни одного другого слова вне «кавычек» в пункте с фактом "
+    "быть не должно: пересказ, выводы и пояснения своими словами запрещены.\n"
+    "   Пример пункта: — «мочевина повышена» [1], но «креатинин без "
+    "изменений» [2].\n"
+    "3. Цитата — законченная фраза или строка фрагмента, скопированная "
+    "дословно, без изменений и сокращений; направления и отрицания "
+    "(«повышен», «снижен», «в норме», «не повышен») могут стоять только "
+    "внутри цитат. Стрелки, тире и знаки (↑, ↓, →, =, >, <, /, \\, +, -) "
+    "вне «кавычек» запрещены.\n"
+    "4. Заголовков, меток и строк с двоеточием не пиши: любая строка без "
+    "«кавычек» со ссылкой [n] не пройдёт проверку.\n"
+    "5. Показатель, о котором фрагменты молчат, просто не упоминай: слова "
+    "вне «кавычек», кроме перечисленных связок, запрещены.\n"
+    "6. Если фрагменты не отвечают на вопрос, весь ответ — ровно одна "
+    "строка «Данных в базе недостаточно.» без каких-либо добавлений.\n"
+    "7. Это справка по базе знаний, а не рекомендация по лечению: не "
+    "добавляй назначений и доз, которых нет во фрагментах дословно.\n"
 )
 
 
@@ -241,7 +255,21 @@ _QUOTE_CITE_RES = (
     re.compile(r"«([^«»]+)»\s*\[(\d+)\]"),
     re.compile(r"[\"“]([^\"“”]+)[\"”]\s*\[(\d+)\]"),
 )
-_INSUFFICIENCY_MARKERS = ("недостаточно данных", "нет данных", "данных в базе недостаточно")
+# The only citation-free answer the grammar accepts (_PROMPT_HEADER rule 6):
+# exactly one non-empty line equal to this sentence verbatim, with no prefix,
+# suffix or further lines, so no factual text can ride along with it.
+_INSUFFICIENCY_SENTENCE = "Данных в базе недостаточно."
+# Connector phrases a factual line may carry outside «quote» [n] pairs — the
+# exact whole phrases advertised in _PROMPT_HEADER rule 2. Function words
+# only: none of them can assert an indicator, a direction or a value.
+_CONNECTOR_RE = re.compile(r"\b(?:а\s+также|при\s+этом|тогда\s+как|и|а|но)\b", re.IGNORECASE)
+# Anchored residue allowlist: besides connector phrases, only whitespace and
+# neutral punctuation (, . ; : and parentheses) may remain. Everything else —
+# bare words, digits, uncited quotes, bullets and arrow/operator/direction
+# symbols (↑ ↓ → = < > / \ + - – —) — fails the line. Leading list markers
+# are stripped before validation; none of these symbols may remain in the
+# residue itself.
+_RESIDUE_ALLOWED_RE = re.compile(r"^[\s,.;:()]*$")
 
 
 def _line_quote_pairs(line: str) -> list:
@@ -251,31 +279,51 @@ def _line_quote_pairs(line: str) -> list:
     return pairs
 
 
+def _strip_quote_pairs(line: str) -> str:
+    for pattern in _QUOTE_CITE_RES:
+        line = pattern.sub(" ", line)
+    return line
+
+
+def _residue_is_nonfactual(residue: str) -> bool:
+    """True when the text left after removing «quote» [n] pairs adds no fact:
+    only advertised connector phrases, whitespace and neutral punctuation
+    from the anchored allowlist may remain."""
+    residue = _CONNECTOR_RE.sub(" ", residue)
+    return _RESIDUE_ALLOWED_RE.fullmatch(residue) is not None
+
+
 def _validate_answer(answer: str, evidences: list) -> bool:
-    """Accept only answers whose every factual line carries a verbatim, correctly
-    cited quote from the evidence actually shown to the model."""
+    """Accept only answers matching the prompt's output grammar: every quote
+    on a factual line must verify verbatim against its cited evidence and the
+    rest of the line must pass the anchored connector allowlist. The sole
+    citation-free answer accepted is exactly one line carrying
+    _INSUFFICIENCY_SENTENCE alone; mixed with any other line it fails."""
+    content_lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
+    if content_lines == [_INSUFFICIENCY_SENTENCE]:
+        return True  # the exact anchored insufficiency answer, nothing else
     normalized_evidences = [_normalize_span(ev) for ev in evidences]
     verified_pairs = 0
-    for raw_line in answer.splitlines():
-        line = raw_line.strip().lstrip("-*•–—# ").strip()
+    for raw_line in content_lines:
+        line = raw_line.lstrip("-*•–—# ").strip()
+        line = re.sub(r"^\d+[.)]\s+", "", line).rstrip("*").strip()
         if not line:
             continue
-        lowered = line.casefold()
-        if any(marker in lowered for marker in _INSUFFICIENCY_MARKERS):
-            continue  # explicit insufficiency statement is always admissible
-        if line.endswith(":") and not any(ch.isdigit() for ch in line):
-            continue  # bare section header
-        line_ok = False
-        for quote, n_str in _line_quote_pairs(line):
+        pairs = _line_quote_pairs(line)
+        if not pairs:
+            # A citation-free line — heading, label, paraphrase, or the
+            # insufficiency sentence mixed into a quoted answer — fails closed.
+            return False
+        for quote, n_str in pairs:
             span = _normalize_span(quote)
             index = int(n_str) - 1
-            if (len(span) >= MIN_QUOTE_CHARS and 0 <= index < len(normalized_evidences)
+            if not (len(span) >= MIN_QUOTE_CHARS
+                    and 0 <= index < len(normalized_evidences)
                     and span in normalized_evidences[index]):
-                line_ok = True
-                verified_pairs += 1
-                break
-        if not line_ok:
-            return False
+                return False  # every pair must verify, not merely one of them
+        if not _residue_is_nonfactual(_strip_quote_pairs(line)):
+            return False  # a verified quote must not bless a factual tail
+        verified_pairs += len(pairs)
     return verified_pairs > 0
 
 
@@ -298,46 +346,44 @@ def _score_block(block: str, stems: list) -> tuple:
     return (distinct, weighted)
 
 
-def _best_blocks(full_text: str, stems: list, budget: int) -> list:
-    """Highest-scoring exact paragraphs/blocks, returned in document order."""
-    blocks = [b.strip() for b in re.split(r"\n\s*\n", _strip_frontmatter(full_text)) if b.strip()]
-    scored = [(i, b, _score_block(b, stems)) for i, b in enumerate(blocks)]
-    scored = [entry for entry in scored if entry[2] > (0, 0)]
-    scored.sort(key=lambda entry: (-entry[2][0], -entry[2][1], entry[0]))
-    chosen, spent = [], 0
-    for index, block, _score in scored:
-        if spent + len(block) > budget and chosen:
-            continue
-        chosen.append((index, block[:budget]))
-        spent += len(block)
-        if spent >= budget:
-            break
-    return [block for _index, block in sorted(chosen)]
-
-
 def _evidence_answer(query: str, used: list) -> str:
-    """Deterministic quote-only fallback built from the fetched documents."""
+    """Deterministic «Ответ по источникам»: the most query-relevant exact
+    source blocks with [n] citations. The rejected generation is never
+    printed, and no per-document dump is produced."""
     stems = _query_stems(query)
-    lines = [
-        "Локальный синтез отклонён проверкой обоснованности: ответ модели не "
-        "подтверждён дословными цитатами из источников. Ниже — точные выдержки "
-        "из найденных документов без пересказа.",
-    ]
-    total = 0
+    candidates = []
     for rank, item in enumerate(used, 1):
-        blocks = _best_blocks(str(item.get("_full_document") or ""), stems, EVIDENCE_SOURCE_CHARS)
-        if not blocks:
+        text = _strip_frontmatter(str(item.get("_full_document") or ""))
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+        for position, block in enumerate(blocks):
+            score = _score_block(block, stems)
+            if score > (0, 0):
+                candidates.append((score, rank, position, block))
+    if not candidates:
+        for rank, item in enumerate(used, 1):
             chunk = " ".join(str(item.get("content") or "").split())
-            blocks = [chunk[:EVIDENCE_SOURCE_CHARS]] if chunk else []
-        if not blocks:
+            if chunk:
+                candidates.append(((0, 0), rank, 0, chunk))
+                break
+    candidates.sort(key=lambda entry: (-entry[0][0], -entry[0][1], entry[1], entry[2]))
+    chosen, total = [], 0
+    for _score, rank, position, block in candidates:
+        block = block[:EVIDENCE_TOTAL_CHARS]
+        if chosen and total + len(block) > EVIDENCE_TOTAL_CHARS:
             continue
-        section = "\n\n".join(blocks)
-        if total + len(section) > EVIDENCE_TOTAL_CHARS and total:
+        chosen.append((rank, position, block))
+        total += len(block)
+        if total >= EVIDENCE_TOTAL_CHARS:
             break
-        total += len(section)
+    lines = [
+        "Ответ по источникам (локальная генерация не прошла проверку цитат; "
+        "ниже — точные выдержки из найденных документов):",
+    ]
+    if not chosen:
+        lines.append("Дословных блоков по запросу выделить не удалось — см. список источников ниже.")
+    for rank, _position, block in sorted(chosen):
         lines.append("")
-        lines.append(f"[{rank}] {_fragment_label(item)} — точные выдержки:")
-        lines.append(section)
+        lines.append(f"«{block}» [{rank}]")
     return "\n".join(lines)
 
 
