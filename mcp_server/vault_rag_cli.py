@@ -61,9 +61,10 @@ _METHOD_PARAMS = {
 # Output grammar (task order, 2026-08-14): the prompt and _validate_answer
 # describe the same machine-checkable format, so a drift between them is a
 # defect. Every non-empty answer line is built only of verbatim «quote» [n]
-# pairs joined by the connector phrases listed below; the sole citation-free
-# answer the grammar accepts is exactly one line carrying the insufficiency
-# sentence alone.
+# pairs joined by the connector phrases listed below; citation-free lines are
+# never accepted — generation runs only with non-empty retrieval results, so
+# an answer that cites nothing falls back to the deterministic «Ответ по
+# источникам» instead of being printed as abstention.
 _PROMPT_HEADER = (
     "Ты — ассистент локальной ветеринарной базы знаний. Ответь на вопрос, "
     "используя ТОЛЬКО приведённые ниже фрагменты.\n"
@@ -85,8 +86,9 @@ _PROMPT_HEADER = (
     "«кавычек» со ссылкой [n] не пройдёт проверку.\n"
     "5. Показатель, о котором фрагменты молчат, просто не упоминай: слова "
     "вне «кавычек», кроме перечисленных связок, запрещены.\n"
-    "6. Если фрагменты не отвечают на вопрос, весь ответ — ровно одна "
-    "строка «Данных в базе недостаточно.» без каких-либо добавлений.\n"
+    "6. Даже если фрагменты отвечают на вопрос лишь частично, приводи "
+    "только точные цитаты со ссылками по правилу 2; ничего не выдумывай и "
+    "не дописывай от себя.\n"
     "7. Это справка по базе знаний, а не рекомендация по лечению: не "
     "добавляй назначений и доз, которых нет во фрагментах дословно.\n"
 )
@@ -255,10 +257,6 @@ _QUOTE_CITE_RES = (
     re.compile(r"«([^«»]+)»\s*\[(\d+)\]"),
     re.compile(r"[\"“]([^\"“”]+)[\"”]\s*\[(\d+)\]"),
 )
-# The only citation-free answer the grammar accepts (_PROMPT_HEADER rule 6):
-# exactly one non-empty line equal to this sentence verbatim, with no prefix,
-# suffix or further lines, so no factual text can ride along with it.
-_INSUFFICIENCY_SENTENCE = "Данных в базе недостаточно."
 # Connector phrases a factual line may carry outside «quote» [n] pairs — the
 # exact whole phrases advertised in _PROMPT_HEADER rule 2. Function words
 # only: none of them can assert an indicator, a direction or a value.
@@ -296,12 +294,10 @@ def _residue_is_nonfactual(residue: str) -> bool:
 def _validate_answer(answer: str, evidences: list) -> bool:
     """Accept only answers matching the prompt's output grammar: every quote
     on a factual line must verify verbatim against its cited evidence and the
-    rest of the line must pass the anchored connector allowlist. The sole
-    citation-free answer accepted is exactly one line carrying
-    _INSUFFICIENCY_SENTENCE alone; mixed with any other line it fails."""
+    rest of the line must pass the anchored connector allowlist. Citation-free
+    lines always fail: generation runs only with non-empty retrieval results,
+    so model abstention falls through to the exact-source fallback."""
     content_lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
-    if content_lines == [_INSUFFICIENCY_SENTENCE]:
-        return True  # the exact anchored insufficiency answer, nothing else
     normalized_evidences = [_normalize_span(ev) for ev in evidences]
     verified_pairs = 0
     for raw_line in content_lines:
@@ -311,8 +307,8 @@ def _validate_answer(answer: str, evidences: list) -> bool:
             continue
         pairs = _line_quote_pairs(line)
         if not pairs:
-            # A citation-free line — heading, label, paraphrase, or the
-            # insufficiency sentence mixed into a quoted answer — fails closed.
+            # A citation-free line — heading, label, paraphrase, or an
+            # abstention sentence — fails closed.
             return False
         for quote, n_str in pairs:
             span = _normalize_span(quote)
