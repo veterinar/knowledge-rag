@@ -21,6 +21,7 @@ tests/test_batch_parallel.py and tests/test_search.py.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,9 @@ def _fresh_orchestrator(tmp_path: Path) -> KnowledgeOrchestrator:
     orch._metadata_file = tmp_path / "index_metadata.json"
     orch._indexed_docs = {}
     orch._reindex_progress = {"active": False}
+    # Mirrors production __init__: start_reindex_background admission is
+    # serialized by this lock (v4.8.3 runtime corrective, Package A).
+    orch._reindex_admission_lock = threading.Lock()
     return orch
 
 
