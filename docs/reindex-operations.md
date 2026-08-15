@@ -130,3 +130,119 @@ mcp> get_reindex_status()
 - Reindex started, hours later still `active: false`? Check `last_error` in status. If Python was killed, the collection may be half-populated — run `reindex_documents(resume=True)` if the operation was smart, or `reindex_documents(force=True, full_rebuild=True)` if it was nuclear.
 - Getting `resume=True is only valid for smart reindex` error? Drop `full_rebuild=True`. Nuclear rebuild does not support resume by design (see above).
 - Checkpoint keeps invalidating with "config_signature mismatch"? Something in `config.yaml` (or the effective merged config) changed embedding model / dim / chunk size / chunk overlap between runs. Either revert the config or accept that the next reindex will start fresh.
+
+---
+
+## Versioned Generations (Phase B) — `indexing.mode: "versioned"`
+
+**Read this before switching indexing.mode to "versioned".** Everything above
+describes the legacy in-place index. Versioned mode replaces *all* of it with
+immutable sealed generations; the smart/nuclear reindex machinery, the watcher,
+and the add/update/remove tools are **not used** in that mode.
+
+### What changes
+
+| Concern | legacy | versioned |
+| --- | --- | --- |
+| Index state | one mutable `data/` tree | sealed generations under `data/generations/<id>` + a `current` pointer |
+| Mutations | live via MCP tools / watcher | offline only: `knowledge-rag-generation build` |
+| Serving | reads + writes | **query-only**; the process pins ONE verified generation for its lifetime |
+| Reindex recovery | smart/nuclear rebuild | never; build a new generation instead |
+| Watcher | auto-reindex on change (`advanced.watch_for_changes`, `advanced.watch_debounce_seconds`) | **disabled** (no hot reload, no auto-index, no repair) |
+
+### Server startup (versioned)
+
+1. The server verifies the `current` pointer and the full receipt of the
+   generation it names — **fail-closed**: a missing, corrupt, or
+   compatibility-mismatched `current` aborts startup *before* preflight,
+   before any Chroma/SQLite handle opens, and **creates nothing**.
+2. On success it binds the sealed generation's directories (Chroma, corpus,
+   FTS5, metadata) and opens every artifact **read-only**.
+3. Every mutating MCP tool (`add_document`, `update_document`,
+   `remove_document`, `add_from_url`, `reindex_documents`) returns a stable
+   `offline_generation_required` error envelope (`restart_required: true`)
+   **before** touching the filesystem or network.
+4. If the pointer is later switched underneath a running server (build/
+   activate/rollback from another process), the server keeps serving its
+   pinned generation and surfaces `restart_required` — it never switches
+   open handles mid-flight.
+
+### Immutability boundary (honest scope)
+
+Sealed Chroma/FTS/corpus artifacts are immutable **at the application
+boundary**: the serving process opens them read-only, refuses every write
+path, and the receipt's digests are re-verified so any tampering is detected
+and fails closed. This is not an OS-level enforcement claim — a process that
+deliberately bypasses the application could still modify the bytes. The
+defense is detection (digest verification) plus refusal (read-only handles),
+not kernel-level write protection.
+
+### Operations
+
+```bash
+# Inspect the current generation (fail-closed verification)
+knowledge-rag-generation status
+
+# Build + activate a new generation from the live corpus.
+# Runs OFFLINE; never mutates sealed generations; reports restart_required.
+knowledge-rag-generation build
+
+# The build is transactional per generation:
+#   - corpus drift during the copy, indexing errors, FTS/Chroma parity
+#     failures, or receipt validation failures abort and clean ONLY the
+#     .building-<id> staging tree — `current` stays byte-identical;
+#   - a publish race (CAS conflict) preserves the sealed generation and
+#     prints the exact `activate` recovery command;
+#   - sealed generations are never deleted (no GC).
+
+# Switch to an already-published generation (validates it fully first;
+# atomic pointer swap; requires a server restart)
+knowledge-rag-generation activate <generation_id>
+
+# Roll back to a previously published generation (same semantics)
+knowledge-rag-generation rollback <generation_id>
+```
+
+### Rollback decision table
+
+| Situation | Command |
+| --- | --- |
+| Bad corpus content in the newest generation | `knowledge-rag-generation rollback <previous_id>` + restart |
+| New generation fails to build | nothing to roll back — `current` never moved |
+| Compatibility pins changed (new model) | build a NEW generation; activate only after verifying |
+| Running server shows `restart_required` | restart the server; it will pin whatever `current` names |
+
+### Compatibility pins
+
+A generation records the exact 10-field compatibility object (collection name,
+embedding model/dimension/prefixes, `model_artifact_sha256`,
+`runtime_version`, `pooling`, chunk size/overlap). A server whose effective
+pins differ cannot serve or activate that generation — this is what makes a
+model swap an explicit build-then-switch operation instead of a silent
+corruption vector. Set the pins under `models.embedding` in `config.yaml`
+(see `config.example.yaml`).
+
+### Dependency evidence (requirements.lock)
+
+Every generation build and every runtime drift recheck verifies the
+environment against `requirements.lock` — the ONE canonical production
+install input (pip-compile `--generate-hashes` output, shipped in the repo,
+the sdist, and the wheel's `mcp_server/data/`):
+
+- every active default `Requires-Dist` dependency of the installed
+  `knowledge-rag` distribution must be pinned in the lock;
+- every lock pin that is installed must match the lock version exactly
+  (optional marker-inactive pins need not be installed);
+- the installed `knowledge-rag` distribution version must equal
+  `mcp_server.__version__` (the self package is not part of the pip-compile
+  lock, so version parity is its identity);
+- the installed RECORD digest and the lock digest stay DISTINCT evidence —
+  one binds installed bytes, the other binds the resolved lock file.
+
+Docker, CI, and the release workflow all install the same way:
+`pip install --require-hashes -r requirements.lock`, then the wheel with
+`--no-deps`, then `pip check`. Runtime always imports the installed package
+bytes, never a source checkout shadow.
+
+The legacy `scripts/build_fts5_index.py` refuses to run in versioned mode and
+points at the generation CLI instead.

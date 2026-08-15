@@ -624,7 +624,7 @@ knowledge-rag is designed for teams that cannot let their documents leave the pe
 | **Supply chain security** | PyPI Trusted Publishing via OIDC (no long-lived tokens) |
 | **Vulnerability disclosure** | Private security advisory via [SECURITY.md](SECURITY.md) |
 | **Signed release attestations** | GitHub release attestations on every published version |
-| **Reproducible builds** | Locked `requirements.txt` with pinned versions |
+| **Reproducible installs** | Hash-locked `requirements.lock` (`--require-hashes`) — the canonical production install input for Docker, CI, and releases |
 | **Authenticated access** | Bearer token middleware on SSE / HTTP transports (constant-time compare, RFC 6750) |
 | **Rate limiting** | Sliding-window per-client RPM + burst (opt-in, zero-cost when disabled) |
 | **Audit-ready logging** | Opt-in structured JSON logs → ship to your SIEM |
@@ -684,6 +684,7 @@ knowledge-rag is designed for teams that cannot let their documents leave the pe
 
 ## 🗺️ Recent releases
 
+- **v4.9.0** (2026-08-15) — Release/runtime reproducibility: hash-locked `requirements.lock` as the canonical install input (Docker/CI/release), dependency-lock ↔ installed parity at generation build and runtime recheck, typed `advanced.watch_for_changes` / `watch_debounce_seconds`, all five presets (incl. multilingual) shipped in wheel/sdist
 - **v4.8.5** (2026-08-13) — Enterprise observability: `/health` endpoint + opt-in JSON structured logging
 - **v4.8.4** (2026-08-13) — Patch: security + durability + defensive fixes
 - **v4.8.3** (2026-08-10) — Critical hotfix: nuclear-rebuild + smart-reindex hardening on 50k+ chunk corpora

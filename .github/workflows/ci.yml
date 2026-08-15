@@ -26,58 +26,124 @@ jobs:
       - name: Ruff format check
         run: ruff format --check mcp_server/ tests/
 
-  test:
-    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+  lock-smoke:
+    name: Lock install smoke (${{ matrix.os }}, Python ${{ matrix.python-version }})
     needs: lint
     runs-on: ${{ matrix.os }}
-    # Pillar 4 (Versatility): 3 OS x 3 Python = 9 combos, all required.
-    # All cells were green for two consecutive Quality Gate cycles
-    # (Onda 3 + Onda 4) on macOS and Python 3.13 — promoted from
-    # experimental to required at v3.9.0.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13"]
-
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
+      # Platform-neutral: everything runs through the job interpreter via
+      # `python -m pip` / `python -m venv` + a Python-computed bin dir — no
+      # hard-coded /tmp or bin/Scripts paths, works identically on Windows.
+      # NO pytest here: this matrix proves the hash-locked runtime lock
+      # installs cleanly and the exact wheel imports on every supported
+      # OS/Python cell. The full suite runs exactly ONCE (full-test below),
+      # only on pull_request heads.
+      - name: Lock install + wheel build + import smoke
+        shell: python
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-rerunfailures hypothesis psutil numpy pyyaml
+          import os, subprocess, venv, pathlib
 
+          root = pathlib.Path(os.environ.get("GITHUB_WORKSPACE", "."))
+          smoke = root / ".smoke-venv"
+          builder = root / ".build-venv"
+
+          def py(venv_dir):
+              subdir = "Scripts" if os.name == "nt" else "bin"
+              exe = "python.exe" if os.name == "nt" else "python"
+              return str(venv_dir / subdir / exe)
+
+          def run(cmd, **kw):
+              print("+", " ".join(cmd), flush=True)
+              subprocess.check_call(cmd, **kw)
+
+          # 1. Runtime lock into an isolated venv (hash-pinned deps only).
+          venv.EnvBuilder(with_pip=True, clear=True).create(smoke)
+          run([py(smoke), "-m", "pip", "install", "--require-hashes", "-r", "requirements.lock"])
+          run([py(smoke), "-m", "pip", "check"])
+
+          # 2. Build the EXACT wheel with the hash-locked build toolchain,
+          #    --no-isolation (builder venv keeps the smoke venv pristine).
+          #    No floating pip upgrade: the build lock hash-pins pip itself.
+          venv.EnvBuilder(with_pip=True, clear=True).create(builder)
+          run([py(builder), "-m", "pip", "install", "--require-hashes", "-r", "build-requirements.lock"])
+          run([py(builder), "-m", "build", "--no-isolation", "--wheel", "--outdir", "dist/"])
+
+          # 3. Install the exact wheel --no-deps, pip check, import smoke.
+          wheels = sorted((root / "dist").glob("*.whl"))
+          assert wheels, "no wheel built"
+          run([py(smoke), "-m", "pip", "install", "--no-deps", str(wheels[-1])])
+          run([py(smoke), "-m", "pip", "check"])
+          run([py(smoke), "-c", "import mcp_server; print('import ok', mcp_server.__version__)"])
+          print("SMOKE_OK")
+          raise SystemExit(0)
+
+      - name: Preserve artifact identity
+        uses: actions/upload-artifact@v7
+        with:
+          name: lock-smoke-wheel-${{ matrix.os }}-${{ matrix.python-version }}
+          path: dist/
+          retention-days: 5
+          if-no-files-found: error
+
+  full-test:
+    name: Full test suite (PR head only, ubuntu, Python 3.12)
+    # ONE full pytest run per PR — never on push/master, never in the
+    # matrix, never in the release workflow. Runs after lock smoke.
+    # NOTE: gated on the EVENT being a pull_request only — github.sha on a
+    # PR is the synthetic MERGE commit, not the PR head, so comparing
+    # github.sha to the head SHA would silently skip real PRs. The exact
+    # head bytes come from the explicit ref checkout below.
+    needs: lock-smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact PR head bytes
+        uses: actions/checkout@v7
+        with:
+          # The EXACT PR-head commit, never the synthetic merge SHA. The
+          # suite must execute these bytes, not a GitHub-generated merge.
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install runtime lock, then hash-locked test tooling
+        # Runtime pins come from requirements.lock FIRST; test-only tools
+        # come from the hash-locked test-requirements.lock — also with
+        # --require-hashes. Any overlap between the two locks resolves to
+        # the same hash-pinned version or the install fails loudly; test
+        # tooling can never silently upgrade/downgrade a runtime pin and
+        # nothing resolves around requirements.lock. No floating pip
+        # upgrade: pip itself is hash-pinned inside both locks.
+        run: |
+          pip install --require-hashes -r requirements.lock
+          pip install --require-hashes -r test-requirements.lock
+          pip check
       - name: Run tests with coverage
-        # Force bash on Windows too — the default pwsh shell propagates ANY
-        # stderr write as a non-zero exit code through its $LASTEXITCODE
-        # handling in some configurations, even when pytest itself exited
-        # cleanly. Bash inherits pytest's actual return code.
+        # NO automatic reruns: a rerun is controller-authorized only after
+        # a confirmed infra-flake or byte change. Force bash — the default
+        # pwsh shell on Windows can propagate ANY stderr write as a
+        # non-zero exit code; bash inherits pytest's actual return code.
         shell: bash
         env:
           # Forbid any HuggingFace network call. Tests must mock TextEmbedding
-          # / TextCrossEncoder. A leaked real download (race condition spawning
-          # a daemon thread, missing mock, etc.) would otherwise hang on slow
-          # Windows runners and produce "ValueError: I/O operation on closed
-          # file" during interpreter shutdown. With OFFLINE=1, any leak fails
-          # fast and visibly.
+          # / TextCrossEncoder. A leaked real download would hang on slow
+          # runners and fail during interpreter shutdown; OFFLINE=1 makes any
+          # leak fail fast and visibly.
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-          # Disable HF Hub download progress bars (they spawn worker threads
-          # that race against pytest's interpreter shutdown).
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
-        # --reruns=1 retries flaky tests once (Pillar 2: Stability). When
-        # any test had to rerun, the job still passes but pytest annotates
-        # the rerun in the JUnit report — we surface that via a follow-up
-        # step in quality-gate.yml so flakes do not silently accumulate.
-        run: pytest tests/ -v --cov=mcp_server --cov-report=xml --cov-report=term-missing --reruns=1 --junit-xml=junit.xml
-
+        run: pytest tests/ -v --cov=mcp_server --cov-report=xml --cov-report=term-missing --junit-xml=junit.xml
       - name: Upload coverage
-        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v7
         with:
           file: coverage.xml

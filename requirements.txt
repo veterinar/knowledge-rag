@@ -1,6 +1,6 @@
 # Knowledge RAG System - Python Dependencies
 # ==========================================
-# Requires Python 3.11+ (3.11, 3.12, 3.13, 3.14 supported)
+# Requires Python 3.11+ (3.11, 3.12, 3.13 supported; 3.14 is NOT supported)
 
 # Vector Database (uses new PersistentClient API)
 chromadb>=1.4.0
@@ -9,8 +9,10 @@ chromadb>=1.4.0
 pymupdf>=1.23.0
 
 # Embeddings & Reranker (ONNX Runtime, in-process, no external server)
-# [reranking] extra installs cross-encoder dependencies (required for reranker)
-fastembed[reranking]>=0.4.0
+# NOTE: fastembed 0.8.0 has no [reranking] extra — TextCrossEncoder ships in
+# the base distribution. Keep the plain name so the declared graph matches
+# the installed production runtime (and requirements.lock resolves it).
+fastembed>=0.4.0
 
 # MCP Server Framework — Anthropic Tier 1 SDK (v2.x, speaks the MCP spec
 # 2026-07-28 natively). FastMCP was renamed to MCPServer and lives under
@@ -19,8 +21,14 @@ fastembed[reranking]>=0.4.0
 # transitive dep count and pushes idle RSS +20% vs the pre-migration baseline.
 mcp>=2.0.0,<3.0.0
 
-# BM25 for Hybrid Search (keyword + semantic)
-rank-bm25>=0.2.2
+# Numerics — direct dependency since v4.2.0 (argpartition top-k, vector ops);
+# was transitive via fastembed before that.
+numpy>=1.24.0
+
+# PEP 508/440 parsing (Requirement/Marker/Version) — load-bearing for the
+# strict requirements.lock parser and active-dependency-graph parity checks
+# in mcp_server/generations.py.
+packaging>=24.0
 
 # URL content fetching (add_from_url tool)
 requests>=2.33.0
@@ -48,6 +56,6 @@ watchdog>=4.0.0
 # 2. Default embedding model: BAAI/bge-small-en-v1.5 (384-dim)
 #    Cached in ~/.cache/fastembed/
 #
-# 3. Python 3.13+ is supported since v3.5.1
-#    (onnxruntime now ships wheels for 3.13 and 3.14)
+# 3. Python 3.13 is supported since v3.5.1; Python 3.14 is NOT supported
+#    as of v4.9.0 (requires-python is capped to <3.14).
 # ==========================================

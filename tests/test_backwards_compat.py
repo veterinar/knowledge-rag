@@ -209,3 +209,127 @@ def test_instance_lock_module_public_surface():
     actual = {name for name in dir(instance_lock) if not name.startswith("_")}
     missing = expected - actual
     assert not missing, f"Missing from instance_lock public surface: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Requirement 8 — additive result scoring schema + envelope compatibility
+# ---------------------------------------------------------------------------
+
+#: Additive keys every orchestrator search result MUST expose (on top of the
+#: legacy schema). ``score`` stays and must equal ``query_relative_score``.
+RESULT_SCORING_KEYS = ("raw_score", "query_relative_score", "score_source")
+
+#: Allowed values for ``score_source`` (which scorer produced the effective
+#: raw score for this result).
+SCORE_SOURCE_VALUES = {"reranker", "rrf", "fts5_bm25"}
+
+
+def test_search_knowledge_signature_byte_compatible():
+    """Requirement 8: public search_knowledge signature is unchanged — same
+    params, same order, same defaults."""
+    import inspect
+
+    from mcp_server.server import search_knowledge
+
+    sig = inspect.signature(search_knowledge)
+    assert [(p.name, p.default) for p in sig.parameters.values()] == [
+        ("query", inspect.Parameter.empty),
+        ("max_results", 5),
+        ("category", None),
+        ("hybrid_alpha", 0.3),
+        ("min_score", 0.0),
+        ("snippet_mode", True),
+        ("search_method", "auto"),
+    ]
+
+
+def _scoring_orchestrator(source: str, query_relative: float, raw: float, score_source: str):
+    """Minimal fake orchestrator returning one fully-shaped result."""
+    result = {
+        "content": "content",
+        "source": source,
+        "filename": "a.md",
+        "category": "general",
+        "chunk_index": 0,
+        "score": query_relative,  # production invariant: score == query_relative_score
+        "query_relative_score": query_relative,
+        "raw_score": raw,
+        "score_source": score_source,
+        "raw_rrf_score": None,
+        "reranker_score": None,
+        "semantic_rank": None,
+        "bm25_rank": None,
+        "search_method": "hybrid",
+        "keywords": [],
+        "routed_by": "none",
+    }
+    return type(
+        "_Orch",
+        (),
+        {
+            "query": staticmethod(lambda *a, **k: [result]),
+            "query_cache": type("_C", (), {"stats": staticmethod(lambda: {"hit_rate": "0%"})})(),
+        },
+    )()
+
+
+def test_search_result_scoring_schema_additive(monkeypatch):
+    """The three additive scoring keys survive the MCP envelope end-to-end,
+    score aliases query_relative_score, and score_source is a valid enum."""
+    import json
+
+    from mcp_server import server as srv
+
+    monkeypatch.setattr(srv, "get_orchestrator", lambda: _scoring_orchestrator("a.md", 0.75, 12.5, "rrf"))
+    payload = json.loads(srv.search_knowledge("test", snippet_mode=False))
+
+    assert payload["status"] == "success"
+    result = payload["results"][0]
+    for key in RESULT_SCORING_KEYS:
+        assert key in result, f"additive scoring key missing from result: {key}"
+    assert result["score"] == result["query_relative_score"]
+    assert result["score_source"] in SCORE_SOURCE_VALUES
+
+
+def test_search_envelope_filtered_counters_additive(monkeypatch):
+    """filtered_by_score (legacy) stays and filtered_by_query_relative_score
+    (new) is added — both present with the same value."""
+    import json
+
+    from mcp_server import server as srv
+
+    monkeypatch.setattr(srv, "get_orchestrator", lambda: _scoring_orchestrator("a.md", 0.75, 12.5, "rrf"))
+    payload = json.loads(srv.search_knowledge("test", snippet_mode=False))
+
+    assert "filtered_by_score" in payload
+    assert "filtered_by_query_relative_score" in payload
+    assert payload["filtered_by_score"] == payload["filtered_by_query_relative_score"] == 0
+
+
+def test_evaluate_retrieval_signature_unchanged():
+    """evaluate_retrieval keeps its name and single test_cases argument."""
+    import inspect
+
+    from mcp_server.server import evaluate_retrieval
+
+    sig = inspect.signature(evaluate_retrieval)
+    assert [(p.name, p.default) for p in sig.parameters.values()] == [
+        ("test_cases", inspect.Parameter.empty),
+    ]
+
+
+def test_evaluate_retrieval_offline_smoke_payload_additive(monkeypatch):
+    """The orchestrator-level offline smoke carries evaluation_mode plus the
+    preserved MRR/Recall/per_query surface."""
+    from mcp_server.server import KnowledgeOrchestrator
+
+    orch = object.__new__(KnowledgeOrchestrator)
+    orch.query = lambda query, **kwargs: [{"source": "/corpus/security/a.md", "content": "x"}]
+
+    out = orch.evaluate_retrieval([{"query": "suid", "expected_filepath": "security/a.md"}])
+
+    assert out["evaluation_mode"] == "offline_smoke"
+    assert out["mrr_at_5"] == 1.0
+    assert out["recall_at_5"] == 1.0
+    assert out["per_query"][0]["found_at_rank"] == 1
+    assert out["total_queries"] == 1

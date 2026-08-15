@@ -1,10 +1,11 @@
 """Configuration for Knowledge RAG System v4.0.0 — YAML-configurable"""
 
+import math
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -72,7 +73,7 @@ def _is_project_root(path):
 _venv_dir = _venv_project_dir()
 
 if os.environ.get("KNOWLEDGE_RAG_DIR"):
-    BASE_DIR = Path(os.environ["KNOWLEDGE_RAG_DIR"])
+    BASE_DIR: Path = Path(os.environ["KNOWLEDGE_RAG_DIR"])
 elif _venv_dir is not None and (_venv_dir / "config.yaml").exists():
     # Prefer venv parent if it has an actual config.yaml (editable installs, PyPI installs)
     BASE_DIR = _venv_dir
@@ -82,7 +83,7 @@ elif _is_project_root(Path.cwd()):
     BASE_DIR = Path.cwd()
 elif _is_project_root(_source_dir):
     BASE_DIR = _source_dir
-elif _is_project_root(_venv_dir):
+elif _venv_dir is not None and _is_project_root(_venv_dir):
     BASE_DIR = _venv_dir
 else:
     BASE_DIR = _venv_dir if _venv_dir is not None else Path.cwd()
@@ -161,6 +162,17 @@ def _get_nested(section: str, subsection: str, key: str, default):
         )
         return default
     return val
+
+
+def _advanced_float(key: str, default: float) -> float:
+    """Read ``advanced.<key>`` as float; YAML ints coerce, everything else falls back."""
+    section = _yaml.get("advanced", {})
+    if not isinstance(section, dict):
+        return default
+    val = section.get(key)
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return default
+    return float(val)
 
 
 def _get_top(key: str, default):
@@ -539,6 +551,21 @@ def _resolve_path(raw, default: Path) -> Path:
     return p
 
 
+def _resolve_artifact_dir(raw) -> Optional[Path]:
+    """Resolve an optional exact-artifact directory against BASE_DIR.
+
+    ``None`` stays ``None`` (unset); any relative value resolves against
+    the canonical config directory, never the process cwd, so a builder
+    launched from anywhere pins the same bytes.
+    """
+    if raw is None:
+        return None
+    p = Path(str(raw)).expanduser()
+    if not p.is_absolute():
+        p = BASE_DIR / p
+    return p
+
+
 @dataclass
 class Config:
     """Central configuration for the RAG system — loads from config.yaml when available."""
@@ -808,6 +835,76 @@ class Config:
         )
     )
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Advanced (v4.9.0): watcher control — typed fields replacing the former
+    # hardcoded DocumentWatcher debounce. Legacy mode honors both; versioned
+    # mode still forcibly disables the watcher (sealed corpus), and the
+    # KNOWLEDGE_RAG_WATCHER_DISABLED=1 env var remains the emergency override.
+    # ─────────────────────────────────────────────────────────────────────
+    watch_for_changes: bool = field(default_factory=lambda: _get("advanced", "watch_for_changes", True))
+    watch_debounce_seconds: float = field(default_factory=lambda: _advanced_float("watch_debounce_seconds", 10.0))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Versioned generations (Phase B)
+    # ─────────────────────────────────────────────────────────────────────
+    # indexing.mode: "legacy" (default — in-place mutable index, exact prior
+    # behavior) | "versioned" (immutable sealed generations + CAS `current`).
+    index_mode: str = field(default_factory=lambda: _get("indexing", "mode", "legacy"))
+
+    # Exact local model-artifact directory pinned into compatibility
+    # (versioned only). Never a model NAME and never the whole cache dir —
+    # compatibility must bind the exact bytes that embed the corpus.
+    # Relative values resolve against the canonical BASE_DIR (the config
+    # directory), NEVER the process cwd.
+    embedding_artifact_path: Optional[Path] = field(
+        default_factory=lambda: _resolve_artifact_dir(
+            _get("models", "embedding", {}).get("artifact_path")
+            if isinstance(_get("models", "embedding", {}), dict)
+            else None
+        )
+    )
+    embedding_runtime_version: str = field(
+        default_factory=lambda: (
+            _get("models", "embedding", {}).get("runtime_version", "")
+            if isinstance(_get("models", "embedding", {}), dict)
+            else ""
+        )
+    )
+    embedding_pooling: str = field(
+        default_factory=lambda: (
+            _get("models", "embedding", {}).get("pooling", "")
+            if isinstance(_get("models", "embedding", {}), dict)
+            else ""
+        )
+    )
+
+    # Versioned-only: exact LOCAL reranker artifact directory (never a model
+    # name, never the whole cache). In versioned serving the reranker either
+    # loads from this pinned directory or is disabled — there are NO
+    # first-use downloads. Empty/absent + enabled reranker in versioned mode
+    # disables reranking for the process (fail-safe, never fail-open).
+    # Relative values resolve against the canonical BASE_DIR (the config
+    # directory), NEVER the process cwd.
+    reranker_local_artifact: Optional[str] = field(
+        default_factory=lambda: (
+            str(_resolve_artifact_dir(_get("models", "reranker", {}).get("local_artifact")))
+            if (
+                isinstance(_get("models", "reranker", {}), dict)
+                and _get("models", "reranker", {}).get("local_artifact") is not None
+            )
+            else None
+        )
+    )
+
+    # Runtime-only (never YAML): frozen at process start, then mutated ONLY
+    # by bind_generation(). source_documents_dir / data_dir NEVER change.
+    source_documents_dir: Optional[Path] = None  # the operator's live corpus (initial documents_dir)
+    index_dir: Optional[Path] = None  # legacy: data_dir; versioned: the pinned generation dir
+    active_generation_id: Optional[str] = None
+    active_receipt_sha256: Optional[str] = None
+    active_generation_receipt: Optional[Dict[str, Any]] = None
+    generation_build: bool = False  # True only inside the offline builder process
+
     def __post_init__(self):
         """Validate config values and ensure directories exist."""
         self._validate_chunking()
@@ -816,9 +913,12 @@ class Config:
         self._validate_embedding_types()
         self._normalize_gpu_mode()
         self._validate_server_transport()
+        self._validate_advanced()
         self._validate_supported_formats()
         self._validate_lists_and_maps()
         self._validate_fts5()
+        self._validate_index_mode()
+        self._init_generation_runtime_fields()
         self._warn_missing_documents_dir()
         self._ensure_directories()
 
@@ -963,6 +1063,26 @@ class Config:
         if not isinstance(self.rate_limit_burst, int) or self.rate_limit_burst < 0:
             self.rate_limit_burst = 10
 
+    def _validate_advanced(self) -> None:
+        """v4.9.0 — type-check watcher fields; debounce must be finite and > 0."""
+        if not isinstance(self.watch_for_changes, bool):
+            print(f"[WARN] advanced.watch_for_changes={self.watch_for_changes!r} invalid, using True")
+            self.watch_for_changes = True
+        debounce = self.watch_debounce_seconds
+        if (
+            isinstance(debounce, bool)
+            or not isinstance(debounce, (int, float))
+            or not math.isfinite(debounce)
+            or debounce <= 0
+        ):
+            print(
+                f"[WARN] advanced.watch_debounce_seconds={debounce!r} invalid "
+                "(must be a finite positive number), using 10.0"
+            )
+            self.watch_debounce_seconds = 10.0
+        else:
+            self.watch_debounce_seconds = float(debounce)
+
     def _validate_supported_formats(self) -> None:
         """Ensure supported_formats is a non-empty list; fall back to canonical defaults."""
         if isinstance(self.supported_formats, list) and self.supported_formats:
@@ -1076,13 +1196,155 @@ class Config:
                 f"Verify the path in config.yaml if reindex returns 0 files."
             )
 
-    def _ensure_directories(self) -> None:
+    def _ensure_directories_legacy(self) -> None:
         """Create data/chroma/documents/models directories if missing."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
         self.documents_dir.mkdir(parents=True, exist_ok=True)
         self.models_cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _validate_index_mode(self) -> None:
+        """Validate ``indexing.mode`` plus the fail-closed versioned inputs.
 
-# Global config instance
+        Legacy is the default and imposes no new requirements. Versioned mode
+        requires the exact local embedding artifact directory plus its declared
+        runtime version and pooling so generations stay byte-compatible. The
+        artifact is validated, never created or modified.
+        """
+        raw = self.index_mode if isinstance(self.index_mode, str) else "legacy"
+        mode = raw.strip().lower() or "legacy"
+        if mode not in ("legacy", "versioned"):
+            raise ValueError(f"indexing.mode must be exactly 'legacy' or 'versioned'; got {raw!r}")
+        self.index_mode = mode
+        if mode != "versioned":
+            return
+        artifact = self.embedding_artifact_path
+        if not artifact or not str(artifact).strip():
+            raise ValueError(
+                "indexing.mode=versioned requires models.embedding.artifact_path "
+                "(exact local model artifact directory; fail-closed)"
+            )
+        artifact_path = Path(str(artifact).strip()).expanduser()
+        if artifact_path.is_symlink() or not artifact_path.is_dir():
+            raise ValueError(
+                "models.embedding.artifact_path must be an existing local "
+                f"artifact directory (symlinks rejected): {artifact_path}"
+            )
+        self.embedding_artifact_path = str(artifact_path)
+        if not str(self.embedding_runtime_version or "").strip():
+            raise ValueError("indexing.mode=versioned requires models.embedding.runtime_version")
+        if not str(self.embedding_pooling or "").strip():
+            raise ValueError("indexing.mode=versioned requires models.embedding.pooling")
+
+    def _init_generation_runtime_fields(self) -> None:
+        """Populate runtime-only generation fields. Performs no I/O."""
+        self.source_documents_dir = self.documents_dir
+        if self.index_mode == "versioned":
+            # Versioned mode creates NOTHING here. index_dir stays unbound
+            # until bind_generation() pins the sealed generation directory.
+            self.index_dir = None
+            return
+        self.index_dir = self.data_dir
+
+    def _ensure_directories(self) -> None:
+        """Versioned-aware directory setup.
+
+        Versioned mode creates no data_dir/chroma_dir/documents_dir (nor any
+        lock, pointer, or generations entry): the generation store owns the
+        on-disk layout and every read is fail-closed. Legacy mode keeps the
+        exact original behavior via ``_ensure_directories_legacy``.
+        """
+        mode = str(self.index_mode or "legacy").strip().lower()
+        if mode == "versioned":
+            return
+        self._ensure_directories_legacy()
+
+    def generation_compatibility(self) -> Dict[str, Any]:
+        """Deterministic 10-key compatibility object (builder and startup).
+
+        ``model_artifact_sha256`` is the canonical tree digest of the exact
+        local artifact directory — never a model name or cache-wide hash.
+        """
+        if self.index_mode != "versioned":
+            raise RuntimeError("generation_compatibility() requires indexing.mode=versioned")
+        from mcp_server.generations import digest_tree
+
+        artifact_path = Path(self.embedding_artifact_path).expanduser()
+        artifact_sha, _entries = digest_tree(artifact_path)
+        # Attribute names vary across config revisions — resolve defensively;
+        # the receipt validator rejects anything invalid downstream.
+        dimension = getattr(self, "embedding_dim", None)
+        if dimension is None:
+            dimension = getattr(self, "embedding_dimension", None)
+        collection = getattr(self, "collection_name", None) or getattr(self, "collection", None)
+        return {
+            "collection_name": collection,
+            "embedding_model": self.embedding_model,
+            "embedding_dimension": dimension,
+            "query_prefix": getattr(self, "query_prefix", ""),
+            "passage_prefix": getattr(self, "passage_prefix", ""),
+            "model_artifact_sha256": artifact_sha,
+            "runtime_version": self.embedding_runtime_version,
+            "pooling": self.embedding_pooling,
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+            # Reranker binding (P0 #9/A): enabled flag + logical model name +
+            # exact artifact digest. When the reranker is disabled this is
+            # the explicit disabled identity state (None model/digest); when
+            # enabled without a materialized artifact it is None-None and
+            # serving fails closed.
+            "reranker_enabled": bool(getattr(self, "reranker_enabled", False)),
+            "reranker_model": (
+                str(getattr(self, "reranker_model", "") or "") if getattr(self, "reranker_enabled", False) else None
+            ),
+            "reranker_artifact_sha256": self._reranker_artifact_sha256(),
+        }
+
+    def _reranker_artifact_sha256(self) -> Optional[str]:
+        """Exact tree digest of the configured reranker artifact, or None.
+
+        Called only in versioned mode. Digests the materialized local
+        artifact directory (symlink forests are rejected by digest_tree).
+        """
+        if self.index_mode != "versioned":
+            return None
+        if not getattr(self, "reranker_enabled", False):
+            return None
+        artifact = getattr(self, "reranker_local_artifact", None)
+        if not artifact:
+            return None
+        from mcp_server.generations import digest_tree
+
+        return digest_tree(Path(str(artifact)).expanduser())[0]
+
+    def bind_generation(self, current, *, building: bool = False) -> None:
+        """Bind this process to exactly one sealed (or in-build) generation.
+
+        Rewrites only the runtime binding fields — ``index_dir``,
+        ``chroma_dir``, ``documents_dir`` and the active identity snapshot.
+        ``data_dir`` (generation root) and ``source_documents_dir`` (original
+        live source tree) never change. Must run before any index handle opens.
+        """
+        if self.index_mode != "versioned":
+            raise RuntimeError("bind_generation() requires indexing.mode=versioned")
+        gen_dir = getattr(current, "generation_dir", None)
+        if gen_dir is None:
+            raise TypeError(
+                "bind_generation() expects the CurrentGeneration returned by "
+                "GenerationStore.require_current()/resolve_current()"
+            )
+        from mcp_server.generations import CHROMA_ARTIFACT as CHROMA_DIRNAME
+        from mcp_server.generations import CORPUS_ARTIFACT as CORPUS_DIRNAME
+
+        gen_dir = Path(gen_dir)
+        self.index_dir = gen_dir
+        self.chroma_dir = gen_dir / CHROMA_DIRNAME
+        self.documents_dir = gen_dir / CORPUS_DIRNAME
+        self.generation_build = bool(building)
+        self.active_generation_id = getattr(current, "generation_id", None)
+        self.active_receipt_sha256 = getattr(current, "receipt_sha256", None)
+        receipt = getattr(current, "receipt", None)
+        self.active_generation_receipt = receipt if isinstance(receipt, dict) else None
+
+
 config = Config()

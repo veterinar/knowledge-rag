@@ -80,6 +80,60 @@ def _yaml_collection_name(config_path: Path) -> "str | None":
     return str(name) if name else None
 
 
+def _yaml_index_mode(config_path: Path) -> "str | None":
+    import yaml
+
+    if not config_path.exists():
+        return None
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    mode = (loaded.get("indexing") or {}).get("mode")
+    return str(mode) if mode else None
+
+
+def _refuse_versioned_mode(data_dir: Path, cli_bound: bool) -> None:
+    """Versioned generations are sealed + immutable; this legacy rebuilder must not touch them."""
+    # Refuse a generation-store ROOT even when no config.yaml says "versioned":
+    # a ``current`` pointer or ``generations/`` tree means sealed artifacts.
+    if (data_dir / "current").exists() or (data_dir / "generations").is_dir():
+        raise SystemExit(
+            "[BUILD-FTS5] data_dir is a versioned generation store (current/generations present) — "
+            "the FTS index is a sealed generation artifact. "
+            "Use `knowledge-rag-generation build` to build a new immutable generation instead."
+        )
+    # Refuse being INSIDE a sealed generation: equal to or nested under
+    # ``<store>/generations/<id>``. Such a directory contains a real
+    # ``chroma_db/`` and would otherwise be opened and rebuilt in place.
+    # Walk the resolved ancestry: any node whose parent is a ``generations``
+    # directory is a generation id (or something nested beneath one).
+    _resolved = data_dir.resolve()
+    _node = _resolved
+    while True:
+        _parent = _node.parent
+        if _node != _parent and _parent.name == "generations" and _parent.is_dir():
+            raise SystemExit(
+                "[BUILD-FTS5] data_dir is inside a sealed versioned generation "
+                f"({_parent.parent / 'generations' / _node.name}) — never open or mutate a "
+                "sealed generation. Use `knowledge-rag-generation build` instead."
+            )
+        if _node == _parent:
+            break
+        _node = _parent
+    for candidate in (data_dir.parent / "config.yaml", data_dir / "config.yaml"):
+        if _yaml_index_mode(candidate) == "versioned":
+            raise SystemExit(
+                "[BUILD-FTS5] indexing.mode=versioned — the FTS index is a sealed generation artifact. "
+                "Use `knowledge-rag-generation build` to build a new immutable generation instead."
+            )
+    if not cli_bound:
+        from mcp_server.config import config
+
+        if config.index_mode == "versioned":
+            raise SystemExit(
+                "[BUILD-FTS5] indexing.mode=versioned — the FTS index is a sealed generation artifact. "
+                "Use `knowledge-rag-generation build` to build a new immutable generation instead."
+            )
+
+
 def _collection_name(data_dir: Path, client: Any) -> str:
     # D5-r5: --data-dir is the DATA directory. Canonical project config sits
     # beside it (data_dir.parent/config.yaml); a root-local config.yaml is
@@ -117,6 +171,7 @@ def _open_collection(data_dir: Path, cli_bound: bool) -> Any:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     data_dir = _resolve_data_dir(args.data_dir)
+    _refuse_versioned_mode(data_dir, cli_bound=args.data_dir is not None)
     print(f"[BUILD-FTS5] data_dir={data_dir} force={args.force}")
 
     # D5: --force never unlinks the prior credible DB/marker; the swap stays atomic.

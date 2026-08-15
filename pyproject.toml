@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "knowledge-rag"
-version = "4.8.5"
+version = "4.9.0"
 description = "Local RAG System for Claude Code — Hybrid search + Cross-encoder Reranking + 13 MCP Tools + 20 Format Parsers. Zero external servers."
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [
     {name = "Lyon.", email = "lyonzin@users.noreply.github.com"},
 ]
@@ -25,15 +25,17 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
     "chromadb>=1.4.0",
     "pymupdf>=1.23.0",
-    "fastembed[reranking]>=0.4.0",
+    "fastembed>=0.4.0",
     "mcp>=2.0.0,<3.0.0",
     "numpy>=1.24.0",
+    "packaging>=24.0",
     "requests>=2.33.0",
     "beautifulsoup4>=4.12.0",
     "python-docx>=1.0.0",
@@ -66,6 +68,7 @@ Changelog = "https://github.com/lyonzin/knowledge-rag/releases"
 [project.scripts]
 knowledge-rag = "mcp_server.server:main"
 knowledge-rag-guarded = "mcp_server.guarded:guarded_main"
+knowledge-rag-generation = "mcp_server.generation_cli:main"
 vault-rag = "mcp_server.vault_rag_cli:main"
 
 [tool.hatch.build.targets.wheel]
@@ -73,10 +76,12 @@ packages = ["mcp_server"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "config.example.yaml" = "mcp_server/data/config.example.yaml"
+"requirements.lock" = "mcp_server/data/requirements.lock"
 "presets/cybersecurity.yaml" = "mcp_server/data/cybersecurity.yaml"
 "presets/developer.yaml" = "mcp_server/data/developer.yaml"
 "presets/research.yaml" = "mcp_server/data/research.yaml"
 "presets/general.yaml" = "mcp_server/data/general.yaml"
+"presets/multilingual.yaml" = "mcp_server/data/multilingual.yaml"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -88,6 +93,11 @@ include = [
     "LICENSE",
     "pyproject.toml",
     "requirements.txt",
+    "requirements.lock",
+    "build-requirements.in",
+    "build-requirements.lock",
+    "test-requirements.in",
+    "test-requirements.lock",
 ]
 exclude = [
     "data/",

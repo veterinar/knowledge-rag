@@ -8,52 +8,67 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Pre-release Tests
+  verify-versions:
+    name: Verify tag == package versions
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install package + test deps
-        # Same install list as ci.yml — collect-only loads every test
-        # module including those that depend on hypothesis / psutil / numpy
-        # / pyyaml. Without these the run errors out during collection.
-        shell: bash
-        env:
-          HF_HUB_OFFLINE: "1"
-          TRANSFORMERS_OFFLINE: "1"
-          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      - name: Assert tag matches pyproject, mcp_server and npm versions
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-rerunfailures hypothesis psutil numpy pyyaml
-          pytest tests/ -v
+          TAG="${GITHUB_REF_NAME#v}"
+          PY="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          PKG="$(python3 -c 'import re; print(re.search(r"__version__ = \"(.+?)\"", open("mcp_server/__init__.py").read()).group(1))')"
+          NPM="$(node -p 'require("./npm/package.json").version')"
+          echo "tag=${TAG} pyproject=${PY} mcp_server=${PKG} npm=${NPM}"
+          test "${TAG}" = "${PY}" && test "${TAG}" = "${PKG}" && test "${TAG}" = "${NPM}"
 
   build:
-    name: Build Distribution
-    needs: test
+    name: Build Distribution (reproducible)
+    needs: verify-versions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install build
-      - run: python -m build
+      # Build toolchain comes from the hash-locked build lock ONLY — no
+      # floating `build`/`pip-tools` installs — and the wheel/sdist are
+      # built with --no-isolation so hatchling is exactly the locked one.
+      # pip itself is hash-pinned inside the build lock (no upgrade).
+      - run: pip install --require-hashes -r build-requirements.lock
+      - run: python -m build --no-isolation
+      - name: Release verification receipt
+        # Release-side evidence — deliberately DISTINCT from a generation
+        # receipt (which records installed RECORD + runtime identities and
+        # never a wheel SHA). This receipt records the built artifact
+        # identity bound to the EXACT GITHUB_SHA Git tree (read via
+        # read-only git plumbing, never mutable worktree bytes): wheel SHA,
+        # sorted archive manifest with per-entry hashes, actual build tool
+        # versions, runtime/build lock digests, the parsed force-include
+        # mapping with per-entry tree/wheel SHA parity, embedded-lock ==
+        # tree-lock equality, and a full wheel-vs-tree package-file drift
+        # comparison.
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p release-evidence
+          python scripts/release_receipt.py dist release-evidence/release-verification.json
       - uses: actions/upload-artifact@v7
         with:
           name: python-dist
           path: dist/
           retention-days: 5
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-evidence
+          path: release-evidence/
+          retention-days: 90
 
   publish-pypi:
     name: Publish to PyPI
-    needs: build
+    # Publication waits for the exact-wheel verification, not merely the
+    # build: a wheel that fails clean-venv install is never published.
+    needs: [build, verify-wheel]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -65,9 +80,54 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  verify-wheel:
+    name: Verify exact wheel in clean venv
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-dist
+          path: dist/
+      # The release does NOT rerun the full suite (CI already ran it on the
+      # PR head). This verifies the EXACT published wheel: runtime lock +
+      # wheel --no-deps + pip check + import/init smoke.
+      - name: Clean venv install of the exact wheel
+        shell: python
+        run: |
+          import os, pathlib, subprocess, venv
+
+          root = pathlib.Path(os.environ.get("GITHUB_WORKSPACE", "."))
+          vdir = root / ".release-verify-venv"
+
+          def py(venv_dir):
+              subdir = "Scripts" if os.name == "nt" else "bin"
+              exe = "python.exe" if os.name == "nt" else "python"
+              return str(venv_dir / subdir / exe)
+
+          def run(cmd):
+              print("+", " ".join(cmd), flush=True)
+              subprocess.check_call(cmd, cwd=str(root))
+
+          venv.EnvBuilder(with_pip=True, clear=True).create(vdir)
+          run([py(vdir), "-m", "pip", "install", "--require-hashes", "-r", "requirements.lock"])
+          wheels = sorted((root / "dist").glob("*.whl"))
+          # EXACTLY ONE wheel — never first-vs-last selection: two wheels in
+          # the artifact is an ambiguity that must fail, not be resolved.
+          assert len(wheels) == 1, f"expected exactly one wheel, found {len(wheels)}: {[w.name for w in wheels]}"
+          run([py(vdir), "-m", "pip", "install", "--no-deps", str(wheels[0])])
+          run([py(vdir), "-m", "pip", "check"])
+          run([py(vdir), "-c", "import mcp_server, importlib.metadata as im; assert im.version('knowledge-rag') == mcp_server.__version__; print('self-version parity ok')"])
+          run([py(vdir), "-c", "from mcp_server import Config; print('init smoke ok')"])
+          raise SystemExit(0)
+
   publish-npm:
     name: Publish to NPM
-    needs: publish-pypi
+    needs: [publish-pypi, verify-wheel]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -100,14 +160,27 @@ jobs:
           NPM_CONFIG_PROVENANCE: "false"
 
   publish-docker:
-    name: Push Docker Image
-    needs: test
+    name: Push Docker Image (exact wheel)
+    # Docker publication also waits for the exact-wheel verification.
+    needs: [build, verify-wheel]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
+      # The image must be built from the EXACT wheel the release verified —
+      # download the python-dist artifact into dist/ before docker build.
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-dist
+          path: dist/
+      # The deployment receipt needs the wheel SHA from the release
+      # verification receipt produced by the build job.
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-evidence
+          path: release-evidence/
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -117,12 +190,13 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ghcr.io/lyonzin/knowledge-rag
+          images: ghcr.io/${{ github.repository_owner }}/knowledge-rag
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
       - uses: docker/build-push-action@v7
+        id: docker_push
         with:
           context: .
           push: true
@@ -130,6 +204,60 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Deployment receipt (image digest + exact wheel SHA)
+        # DEPLOYMENT receipt — deliberately DISTINCT from both the release
+        # verification receipt and any runtime installed-RECORD evidence.
+        # Binds the pushed image digest to the exact wheel SHA the release
+        # verified and the commit SHA. Fails if any value is missing.
+        shell: python
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.docker_push.outputs.digest }}
+        run: |
+          import hashlib, json, os, pathlib, sys
+
+          root = pathlib.Path(os.environ.get("GITHUB_WORKSPACE", "."))
+          sha = os.environ.get("GITHUB_SHA", "")
+          digest = os.environ.get("IMAGE_DIGEST", "")
+          receipt_path = root / "release-evidence" / "release-verification.json"
+
+          assert sha, "GITHUB_SHA missing — cannot bind deployment receipt"
+          assert digest, "docker push digest missing — cannot bind deployment receipt"
+          assert receipt_path.is_file(), "release-verification.json not downloaded"
+
+          verification = json.loads(receipt_path.read_text(encoding="utf-8"))
+          wheel_sha = verification.get("wheel_sha256", "")
+          wheel_name = verification.get("wheel", "")
+          assert wheel_sha, "release verification receipt lacks wheel_sha256"
+          assert wheel_name, "release verification receipt lacks wheel name"
+
+          # Cross-check: the wheel actually present in dist/ must be the
+          # one the verification receipt hashed.
+          wheels = sorted((root / "dist").glob("*.whl"))
+          assert len(wheels) == 1, f"expected exactly one wheel, found {len(wheels)}"
+          h = hashlib.sha256()
+          with open(wheels[0], "rb") as fh:
+              for chunk in iter(lambda: fh.read(1 << 16), b""):
+                  h.update(chunk)
+          assert h.hexdigest() == wheel_sha, "dist wheel SHA != verification receipt wheel_sha256"
+          assert wheels[0].name == wheel_name, "dist wheel name != verification receipt wheel"
+
+          receipt = {
+              "receipt_type": "docker-deployment",
+              "github_sha": sha,
+              "image_digest": digest,
+              "wheel": wheel_name,
+              "wheel_sha256": wheel_sha,
+          }
+          out = root / "deployment-receipt.json"
+          out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, indent=2))
+          sys.exit(0)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deployment-receipt
+          path: deployment-receipt.json
+          retention-days: 90
 
   # ── Optional post-publish step ──────────────────────────────────────────
   #

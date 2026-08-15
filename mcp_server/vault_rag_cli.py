@@ -477,8 +477,12 @@ def main() -> int:
         return 1
     results = payload.get("results") or []
     if status != "success" or not results:
-        message = payload.get("message") or payload.get("error") or f"статус ответа: {status!r}"
-        print(f"Сервер вернул ошибку: {message}", file=sys.stderr)
+        # Stable machine-readable error code FIRST, then the server's safe
+        # message — scripts can grep the code while users still get detail.
+        error = str(payload.get("error") or f"статус ответа: {status!r}")
+        message = str(payload.get("message") or "").strip()
+        detail = f"{error}: {message}" if message else error
+        print(f"Сервер вернул ошибку: {detail}", file=sys.stderr)
         return 1
 
     units = _evidence_units(query, results)

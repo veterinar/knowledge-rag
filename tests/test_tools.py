@@ -298,3 +298,234 @@ class TestEvaluateRetrieval:
 
         r = json.loads(evaluate_retrieval("[]"))
         assert r["status"] == "error"
+
+    def test_case_missing_expected_filepath_error(self, mock_orch):
+        """Requirement 8: a case without expected_filepath is a validation error."""
+        from mcp_server.server import evaluate_retrieval
+
+        r = json.loads(evaluate_retrieval(json.dumps([{"query": "suid exploit"}])))
+        assert r["status"] == "error"
+        assert "expected_filepath" in r["message"]
+
+    def test_case_empty_query_error(self, mock_orch):
+        """Requirement 8: a case with an empty query is a validation error."""
+        from mcp_server.server import evaluate_retrieval
+
+        r = json.loads(evaluate_retrieval(json.dumps([{"query": "  ", "expected_filepath": "a.md"}])))
+        assert r["status"] == "error"
+
+    def test_non_dict_case_error(self, mock_orch):
+        """Requirement 8: a non-object entry is a validation error."""
+        from mcp_server.server import evaluate_retrieval
+
+        r = json.loads(evaluate_retrieval(json.dumps(["just-a-string"])))
+        assert r["status"] == "error"
+
+    def test_valid_cases_offline_smoke_success(self, mock_orch):
+        """Valid cases run the offline smoke and surface evaluation_mode."""
+        from mcp_server.server import evaluate_retrieval
+
+        mock_orch.evaluate_retrieval.return_value = {
+            "evaluation_mode": "offline_smoke",
+            "total_queries": 1,
+            "mrr_at_5": 1.0,
+            "recall_at_5": 1.0,
+            "per_query": [{"query": "q", "expected": "security/a.md", "found_at_rank": 1}],
+        }
+        r = json.loads(evaluate_retrieval(json.dumps([{"query": "q", "expected_filepath": "security/a.md"}])))
+        assert r["status"] == "success"
+        assert r["evaluation_mode"] == "offline_smoke"
+        assert r["mrr_at_5"] == 1.0
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            {"query": 123, "expected_filepath": "a.md"},        # numeric query
+            {"query": None, "expected_filepath": "a.md"},      # null query
+            {"query": "q", "expected_filepath": 12.5},         # numeric expected
+            {"query": "q", "expected_filepath": ["a.md"]},     # list expected
+        ],
+        ids=["query-number", "query-null", "expected-number", "expected-list"],
+    )
+    def test_non_string_values_rejected_before_orchestrator(self, mock_orch, case):
+        """Actual non-string query/expected_filepath values (no str()
+        coercion) are a structured validation error, and the orchestrator
+        is NEVER reached."""
+        from mcp_server.server import evaluate_retrieval
+
+        r = json.loads(evaluate_retrieval(json.dumps([case])))
+        assert r["status"] == "error"
+        assert "query" in r["message"] or "expected_filepath" in r["message"]
+        mock_orch.evaluate_retrieval.assert_not_called()
+
+    def test_direct_orchestrator_empty_cases_raise_valueerror_before_query(self):
+        """Direct orchestrator call with [] raises ValueError BEFORE any
+        query runs (zero-query success is forbidden). No model/DB needed."""
+        from mcp_server.server import KnowledgeOrchestrator
+
+        orch = object.__new__(KnowledgeOrchestrator)
+        orch.query = MagicMock()
+
+        with pytest.raises(ValueError):
+            KnowledgeOrchestrator.evaluate_retrieval(orch, [])
+        orch.query.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Requirement 8 — min_score filters on query_relative_score (legacy fallback)
+# ---------------------------------------------------------------------------
+
+
+class TestMinScoreQueryRelative:
+    def test_min_score_uses_query_relative_not_legacy_score(self, mock_orch):
+        """When a result carries both keys and they disagree (contrived legacy
+        score), the filter must honor query_relative_score."""
+        from mcp_server.server import search_knowledge
+
+        mock_orch.query.return_value = [
+            {
+                "content": "high-rel",
+                "source": "a.md",
+                "filename": "a.md",
+                "category": "general",
+                "chunk_index": 0,
+                "score": 0.99,  # contrived legacy score — must be IGNORED
+                "query_relative_score": 0.9,
+                "raw_score": 12.5,
+                "score_source": "rrf",
+                "raw_rrf_score": 0.02,
+                "reranker_score": None,
+                "semantic_rank": 1,
+                "bm25_rank": 1,
+                "search_method": "hybrid",
+                "keywords": [],
+                "routed_by": "none",
+            },
+            {
+                "content": "low-rel",
+                "source": "b.md",
+                "filename": "b.md",
+                "category": "general",
+                "chunk_index": 0,
+                "score": 0.5,  # legacy score ABOVE threshold...
+                "query_relative_score": 0.1,  # ...but relative score BELOW
+                "raw_score": 1.0,
+                "score_source": "rrf",
+                "raw_rrf_score": 0.001,
+                "reranker_score": None,
+                "semantic_rank": None,
+                "bm25_rank": 5,
+                "search_method": "keyword",
+                "keywords": [],
+                "routed_by": "none",
+            },
+        ]
+        r = json.loads(search_knowledge("test", min_score=0.5, snippet_mode=False))
+
+        assert r["result_count"] == 1
+        assert r["filtered_by_score"] == 1
+        assert r["filtered_by_query_relative_score"] == 1
+        assert r["results"][0]["content"] == "high-rel"
+
+    def test_min_score_falls_back_to_legacy_score_when_key_absent(self, mock_orch):
+        """Legacy results lacking query_relative_score still filter on score."""
+        from mcp_server.server import search_knowledge
+
+        mock_orch.query.return_value = [
+            {
+                "content": "kept",
+                "source": "a.md",
+                "filename": "a.md",
+                "category": "general",
+                "chunk_index": 0,
+                "score": 0.9,  # legacy-only result, no query_relative_score key
+                "raw_rrf_score": 0.02,
+                "reranker_score": None,
+                "semantic_rank": 1,
+                "bm25_rank": 1,
+                "search_method": "hybrid",
+                "keywords": [],
+                "routed_by": "none",
+            },
+            {
+                "content": "dropped",
+                "source": "b.md",
+                "filename": "b.md",
+                "category": "general",
+                "chunk_index": 0,
+                "score": 0.1,
+                "raw_rrf_score": 0.001,
+                "reranker_score": None,
+                "semantic_rank": None,
+                "bm25_rank": 5,
+                "search_method": "keyword",
+                "keywords": [],
+                "routed_by": "none",
+            },
+        ]
+        r = json.loads(search_knowledge("test", min_score=0.5, snippet_mode=False))
+
+        assert r["result_count"] == 1
+        assert r["filtered_by_score"] == 1
+        assert r["filtered_by_query_relative_score"] == 1
+        assert r["results"][0]["content"] == "kept"
+
+    def test_query_relative_score_zero_filters_out_high_legacy_score(self, mock_orch):
+        """A zero query_relative_score must be dropped even if score says 1.0."""
+        from mcp_server.server import search_knowledge
+
+        mock_orch.query.return_value = [
+            {
+                "content": "conflicting",
+                "source": "a.md",
+                "filename": "a.md",
+                "category": "general",
+                "chunk_index": 0,
+                "score": 1.0,
+                "query_relative_score": 0.0,
+                "raw_score": 3.0,
+                "score_source": "reranker",
+                "raw_rrf_score": 0.02,
+                "reranker_score": 3.0,
+                "semantic_rank": 1,
+                "bm25_rank": 1,
+                "search_method": "hybrid",
+                "keywords": [],
+                "routed_by": "none",
+            },
+        ]
+        r = json.loads(search_knowledge("test", min_score=0.5, snippet_mode=False))
+
+        assert r["result_count"] == 0
+        assert r["filtered_by_score"] == 1
+        assert r["filtered_by_query_relative_score"] == 1
+
+    def test_filtered_by_query_relative_score_alias_matches_legacy_field(self, mock_orch):
+        """Both envelope counters report the same number in every filter regime."""
+        from mcp_server.server import search_knowledge
+
+        mock_orch.query.return_value = [
+            {
+                "content": "edge",
+                "source": "a.md",
+                "filename": "a.md",
+                "category": "general",
+                "chunk_index": 0,
+                "score": 0.5,
+                "query_relative_score": 0.5,  # exactly at threshold → kept
+                "raw_score": 5.0,
+                "score_source": "rrf",
+                "raw_rrf_score": 0.02,
+                "reranker_score": None,
+                "semantic_rank": 1,
+                "bm25_rank": 1,
+                "search_method": "hybrid",
+                "keywords": [],
+                "routed_by": "none",
+            },
+        ]
+        r = json.loads(search_knowledge("test", min_score=0.5, snippet_mode=False))
+
+        assert r["result_count"] == 1, "threshold comparison must be inclusive (>=)"
+        assert r["filtered_by_score"] == 0
+        assert r["filtered_by_query_relative_score"] == 0

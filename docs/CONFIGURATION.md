@@ -281,6 +281,30 @@ Each group is interpreted symmetrically, so every term expands to the rest of th
 
 This keeps backward compatibility while allowing concise synonym groups.
 
+### Advanced (v4.9.0)
+
+Watcher control lives under `advanced` in `config.yaml`:
+
+```yaml
+advanced:
+  # Auto-reindex when documents change (legacy mode only). Default true.
+  watch_for_changes: true
+  # Silence window (seconds) file events accumulate in before ONE reindex
+  # fires. Must be a finite positive number; invalid values fall back to
+  # 10.0 with a WARN. Default 10.0.
+  watch_debounce_seconds: 10.0
+```
+
+Notes:
+
+- **Versioned mode forcibly disables the watcher** regardless of these
+  values (sealed corpus — mutations happen only through
+  `knowledge-rag-generation build`).
+- `KNOWLEDGE_RAG_WATCHER_DISABLED=1` remains the emergency override and
+  wins over the config flag in legacy mode.
+- Setting `watch_for_changes: false` simply disables auto-reindex; the
+  `reindex_documents` tool keeps working.
+
 ### Hybrid Search Tuning
 
 | hybrid_alpha | Behavior | Best For |

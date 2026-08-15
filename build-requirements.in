@@ -1,0 +1,11 @@
+# Build-only dependency input (v4.9.0).
+#
+# The controller generates the hash-locked build-requirements.lock from this
+# file with the exact pinned uv (0.12.5). Build jobs install that lock with
+# --require-hashes and run `python -m build --no-isolation` so the build
+# backend is byte-reproducible — no floating `build`/`pip-tools` installs.
+# pip itself is pinned here so builder venvs end with an exact hash-pinned
+# pip (no `pip install --upgrade pip` anywhere in the build path).
+build
+hatchling
+pip
