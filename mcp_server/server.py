@@ -30,8 +30,10 @@ import math
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
@@ -1458,6 +1460,13 @@ DRIFT_REASON_POINTER_INVALID = "restart_required_pointer_invalid"
 DRIFT_REASON_ENVIRONMENT_CHANGED = "restart_required_environment_changed"
 DRIFT_REASON_BACKEND_DRIFT = "restart_required_backend_drift"
 
+# ChromaDB 1.5.x has no read-only PersistentClient: opening an otherwise
+# sealed database performs SQLite writes. Versioned serving therefore keeps
+# the published artifact untouched and opens only this process-local copy.
+# The TemporaryDirectory object must stay alive for the process lifetime.
+_versioned_chroma_runtime_holder: Optional[tempfile.TemporaryDirectory] = None
+_versioned_chroma_runtime_path: Optional[Path] = None
+
 _INDEX_NOT_READY_CODES = frozenset(
     {
         DRIFT_REASON_POINTER_CHANGED,
@@ -1488,6 +1497,69 @@ class _IndexStaleError(RuntimeError):
         import json as _json
 
         return _json.dumps(self.safe_payload(), sort_keys=True)
+
+
+def _cleanup_versioned_chroma_runtime_copy() -> None:
+    """Remove the process-local writable Chroma copy, if one exists."""
+    global _versioned_chroma_runtime_holder, _versioned_chroma_runtime_path
+    holder = _versioned_chroma_runtime_holder
+    _versioned_chroma_runtime_holder = None
+    _versioned_chroma_runtime_path = None
+    if holder is not None:
+        holder.cleanup()
+
+
+def _prepare_versioned_chroma_runtime_copy(current: Any) -> Path:
+    """Clone the sealed Chroma artifact into isolated process-local storage.
+
+    Chroma's PersistentClient requires a writable SQLite store even for
+    queries. The published generation remains the controlling identity; this
+    copy is accepted only when its pre-open tree digest and entry count exactly
+    match the receipt, and it is discarded at process exit.
+    """
+    global _versioned_chroma_runtime_holder, _versioned_chroma_runtime_path
+    from . import generations as gens
+
+    _cleanup_versioned_chroma_runtime_copy()
+    receipt = current.receipt or {}
+    artifact = (receipt.get("artifacts") or {}).get(gens.CHROMA_ARTIFACT) or {}
+    expected_sha = artifact.get("sha256")
+    expected_count = artifact.get("count")
+    source = current.generation_dir / gens.CHROMA_ARTIFACT
+    source_sha, source_count = gens.digest_tree(source)
+    if source_sha != expected_sha or source_count != expected_count:
+        raise GenerationError("sealed Chroma artifact no longer matches its receipt")
+
+    temp_parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    if not temp_parent.is_dir():
+        raise GenerationError("runtime temporary directory is unavailable")
+    holder: Optional[tempfile.TemporaryDirectory] = None
+    try:
+        holder = tempfile.TemporaryDirectory(
+            prefix=f"knowledge-rag-{current.generation_id}-",
+            dir=str(temp_parent),
+        )
+        target = Path(holder.name) / gens.CHROMA_ARTIFACT
+        shutil.copytree(source, target, symlinks=True)
+        copied_sha, copied_count = gens.digest_tree(target)
+        if copied_sha != expected_sha or copied_count != expected_count:
+            raise GenerationError("runtime Chroma copy does not match the sealed artifact")
+    except GenerationError:
+        if holder is not None:
+            holder.cleanup()
+        raise
+    except Exception as exc:
+        if holder is not None:
+            holder.cleanup()
+        raise GenerationError("runtime Chroma copy could not be prepared") from exc
+    except BaseException:
+        if holder is not None:
+            holder.cleanup()
+        raise
+    assert holder is not None
+    _versioned_chroma_runtime_holder = holder
+    _versioned_chroma_runtime_path = target
+    return target
 
 
 class RerankerUnavailableError(RuntimeError):
@@ -1607,28 +1679,44 @@ def _pin_versioned_generation() -> Any:
         print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
         return None
     if env_fail is not None:
-        object.__setattr__(config, "_pin_failure", env_fail.safe_payload())
+        object.__setattr__(
+            config,
+            "_pin_failure",
+            {"reason": env_fail.reason, "detail": env_fail.detail},
+        )
         print(f"[GENERATION] NOT pinned — degraded stats-only mode ({env_fail.reason})")
         return None
-    # Backend row universes must still match the receipt bytes.
+    # Chroma needs a writable SQLite store even for reads. Verify a fresh,
+    # receipt-identical process-local copy; never open the sealed artifact.
     try:
+        runtime_chroma = _prepare_versioned_chroma_runtime_copy(current)
         backend_fail = _verify_pinned_backends(current)
-    except GenerationError as exc:
-        reason = getattr(exc, "reason_code", None) or DRIFT_REASON_POINTER_INVALID
+    except Exception as exc:
+        _cleanup_versioned_chroma_runtime_copy()
+        reason = getattr(exc, "reason_code", None) or DRIFT_REASON_BACKEND_DRIFT
         object.__setattr__(config, "_pin_failure", {"reason": reason, "detail": {}})
         print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
         return None
     if backend_fail is not None:
-        object.__setattr__(config, "_pin_failure", backend_fail.safe_payload())
+        _cleanup_versioned_chroma_runtime_copy()
+        object.__setattr__(
+            config,
+            "_pin_failure",
+            {"reason": backend_fail.reason, "detail": backend_fail.detail},
+        )
         print(f"[GENERATION] NOT pinned — degraded stats-only mode ({backend_fail.reason})")
         return None
     config.bind_generation(current)
+    # Runtime-only override: corpus/FTS/receipt remain sealed; only Chroma is
+    # served from the disposable copy verified immediately above.
+    config.chroma_dir = runtime_chroma
     # Snapshot the pinned environment identity for per-access rechecks —
     # failure to store the snapshot is itself a drift condition (never
     # silently skipped: the recheck would be quietly disabled).
     try:
         object.__setattr__(config, "_pinned_environment_digests", _retrieval_environment_digests())
     except GenerationError as exc:
+        _cleanup_versioned_chroma_runtime_copy()
         reason = getattr(exc, "reason_code", None) or DRIFT_REASON_ENVIRONMENT_CHANGED
         object.__setattr__(config, "_pin_failure", {"reason": reason, "detail": {}})
         print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
@@ -1753,8 +1841,9 @@ def _verify_pinned_backends(current: Any) -> Optional[_IndexStaleError]:
             _digest_mismatch_detail("fts5_self_parity", fts_ev.get("row_digest"), fts_ev.get("verified_digest")),
         )
 
-    # Chroma: read-only persistent client, no mutation surface. BOTH the
-    # complete and the common row universes are recomputed from sealed bytes.
+    # Chroma: BOTH row universes are recomputed from the receipt-identical,
+    # process-local runtime copy. PersistentClient cannot open the sealed
+    # SQLite tree under a physical write deny, even for query-only serving.
     # The locally opened client is closed IMMEDIATELY after the row
     # universes are captured — before any digest_tree call or mismatch
     # return — so no second client reference stays alive while the
@@ -1764,7 +1853,13 @@ def _verify_pinned_backends(current: Any) -> Optional[_IndexStaleError]:
     client = None
     close_failed = False
     try:
-        client = chromadb.PersistentClient(path=str(current.generation_dir / gens.CHROMA_ARTIFACT))
+        chroma_path = _versioned_chroma_runtime_path
+        if chroma_path is None or not chroma_path.is_dir():
+            return _IndexStaleError(
+                DRIFT_REASON_BACKEND_DRIFT,
+                _digest_mismatch_detail("chroma_runtime_copy", expected_full_digest, None),
+            )
+        client = chromadb.PersistentClient(path=str(chroma_path))
         collection = client.get_collection(name=str(chroma_ev.get("collection_name")))
         common_rows = capture_chunk_rows(collection)
         full_rows = capture_full_chunk_rows(collection)
@@ -2143,24 +2238,16 @@ class KnowledgeOrchestrator:
         self.embed_fn = FastEmbedEmbeddings()
 
         if _versioned_read_only():
-            # Sealed generation: attach the EXISTING collection strictly.
-            # BOUNDED RESIDUAL (documented, not redesigned here): ChromaDB's
-            # PersistentClient has NO supported read-only open mode — it
-            # holds the sqlite tree open read-WRITE at the filesystem level.
-            # This package therefore enforces the immutability boundary at
-            # the APPLICATION level only: no mutating call path reaches the
-            # collection, no WAL pragma (it would rewrite the sealed sqlite
-            # file), no get_or_create (nothing may be materialized), no
-            # recovery delete/recreate, no dimension migration, no initial
-            # indexing. PHYSICAL write denial (OS-level immutable mount /
-            # read-only filesystem) is a DEPLOYMENT boundary, verified by
-            # the separately authorized sandboxed rollout E2E — do NOT
-            # claim PersistentClient itself is read-only or that the sealed
-            # bytes are physically immutable from this process.
+            # Attach the EXISTING collection strictly from the disposable,
+            # receipt-verified runtime copy prepared during generation pin.
+            # The published generation is never opened by PersistentClient,
+            # so deployment may physically deny writes to every sealed
+            # artifact while allowing Chroma's operational SQLite writes only
+            # below the isolated runtime TMPDIR.
             self.chroma_client = chromadb.PersistentClient(path=str(config.chroma_dir))
             self.collection = self.chroma_client.get_collection(name=config.collection_name)
             print(
-                f"[GENERATION] serving sealed chroma_db: {config.chroma_dir} "
+                f"[GENERATION] serving verified runtime chroma copy "
                 f"(collection {config.collection_name}, {self.collection.count()} chunks)"
             )
         else:

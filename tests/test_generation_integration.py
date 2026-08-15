@@ -393,6 +393,7 @@ def clear_pin_failure(cfg) -> None:
     # undo expects the attribute to exist; deleting it here would break
     # that undo contract. None is functionally "absent" to every consumer.
     object.__setattr__(cfg, "_pin_failure", None)
+    srv._cleanup_versioned_chroma_runtime_copy()
 
 
 def synthetic_pin_seams(monkeypatch):
@@ -519,7 +520,10 @@ class TestValidPinBindsSealedGeneration:
         assert current.generation_id == "gen-a"
         gen_dir = (tmp_path / "generations" / "gen-a").resolve()
         assert cfg.index_dir == gen_dir
-        assert cfg.chroma_dir == gen_dir / gens.CHROMA_ARTIFACT
+        assert cfg.chroma_dir == srv._versioned_chroma_runtime_path
+        assert cfg.chroma_dir != gen_dir / gens.CHROMA_ARTIFACT
+        assert gen_dir not in cfg.chroma_dir.parents
+        assert gens.digest_tree(cfg.chroma_dir) == gens.digest_tree(gen_dir / gens.CHROMA_ARTIFACT)
         assert cfg.documents_dir == gen_dir / gens.CORPUS_ARTIFACT
         assert cfg.active_generation_id == "gen-a"
         assert current.receipt_sha256 and cfg.active_receipt_sha256 == current.receipt_sha256
@@ -1187,7 +1191,7 @@ class TestActiveGraphParity:
     def test_graph_walks_root_core_leaf(self):
         requires_of, version_of = self._env(
             self._root_requires(),
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0", "leaf": "0.2.0"},
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0", "leaf": "0.2.0"},
         )
         graph = gens.active_dependency_graph(
             "knowledge-rag", environment=LINUX_ENV, version_of=version_of, requires_of=requires_of
@@ -1203,9 +1207,9 @@ class TestActiveGraphParity:
         lock = _write_lock(tmp_path, self._full_lock())
         requires_of, version_of = self._env(
             self._root_requires(),
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0"},  # leaf MISSING
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0"},  # leaf MISSING
         )
-        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.0")
+        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.1")
         with pytest.raises(gens.DependencyUnverifiableError, match="leaf.*not installed"):
             gens.verify_runtime_dependency_parity(
                 [lock], environment=LINUX_ENV, version_of=version_of, requires_of=requires_of
@@ -1215,9 +1219,9 @@ class TestActiveGraphParity:
         lock = _write_lock(tmp_path, self._full_lock())
         requires_of, version_of = self._env(
             self._root_requires(),
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0", "leaf": "0.9.9"},  # drift
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0", "leaf": "0.9.9"},  # drift
         )
-        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.0")
+        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.1")
         with pytest.raises(gens.DependencyUnverifiableError, match="runtime drift"):
             gens.verify_runtime_dependency_parity(
                 [lock], environment=LINUX_ENV, version_of=version_of, requires_of=requires_of
@@ -1227,11 +1231,11 @@ class TestActiveGraphParity:
         lock = _write_lock(tmp_path, self._full_lock())
         requires_of, version_of = self._env(
             self._root_requires(),
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0", "leaf": "0.2.0"},
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0", "leaf": "0.2.0"},
             # winonly + gpuextra deliberately NOT installed — their pins are
             # inactive on Linux/"" so absence passes.
         )
-        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.0")
+        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.1")
         result = gens.verify_runtime_dependency_parity(
             [lock], environment=LINUX_ENV, version_of=version_of, requires_of=requires_of
         )
@@ -1246,9 +1250,9 @@ class TestActiveGraphParity:
         )
         requires_of, version_of = self._env(
             self._root_requires(),
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0", "leaf": "0.2.0"},
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0", "leaf": "0.2.0"},
         )
-        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.0")
+        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.1")
         with pytest.raises(gens.DependencyUnverifiableError, match="corelib.*no ACTIVE exact lock pin"):
             gens.verify_runtime_dependency_parity(
                 [lock], environment=LINUX_ENV, version_of=version_of, requires_of=requires_of
@@ -1264,16 +1268,16 @@ class TestActiveGraphParity:
         )
         requires_of, version_of = self._env(
             self._root_requires(),
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0", "leaf": "0.2.0"},
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0", "leaf": "0.2.0"},
         )
-        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.0")
+        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.1")
         # Absent orphan pin: passes.
         gens.verify_runtime_dependency_parity(
             [lock], environment=LINUX_ENV, version_of=version_of, requires_of=requires_of
         )
         # Same orphan INSTALLED at a different version: runtime drift.
         versions_drift = dict(
-            {"knowledge-rag": "4.9.0", "corelib": "2.1.0", "leaf": "0.2.0"},
+            {"knowledge-rag": "4.9.1", "corelib": "2.1.0", "leaf": "0.2.0"},
             orphanlib="2.5.0",
         )
         requires_of2, version_of2 = self._env(self._root_requires(), versions_drift)
@@ -1304,7 +1308,7 @@ class TestActiveGraphParity:
             "core": ["leaf>=0.1.0; extra == 'feature'"],
             "leaf": [],
         }
-        versions = {"knowledge-rag": "4.9.0", "core": "2.1.0", "leaf": "0.2.0"}
+        versions = {"knowledge-rag": "4.9.1", "core": "2.1.0", "leaf": "0.2.0"}
 
         def requires_of(name):
             return [packaging.requirements.Requirement(r) for r in requires_map[name]]
@@ -1333,14 +1337,14 @@ class TestActiveGraphParity:
         def requires_of(name):
             return [packaging.requirements.Requirement(r) for r in requires_map[name]]
 
-        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.0")
+        monkeypatch.setattr(gens.importlib.metadata, "version", lambda name: "4.9.1")
 
         # Missing mandatory transitive leaf -> fail.
         with pytest.raises(gens.DependencyUnverifiableError, match="leaf.*not installed"):
             gens.verify_runtime_dependency_parity(
                 [lock],
                 environment=LINUX_ENV,
-                version_of=lambda name: {"knowledge-rag": "4.9.0", "core": "2.1.0"}.get(name),
+                version_of=lambda name: {"knowledge-rag": "4.9.1", "core": "2.1.0"}.get(name),
                 requires_of=requires_of,
             )
 
@@ -1349,7 +1353,7 @@ class TestActiveGraphParity:
             gens.verify_runtime_dependency_parity(
                 [lock],
                 environment=LINUX_ENV,
-                version_of=lambda name: {"knowledge-rag": "4.9.0", "core": "2.1.0", "leaf": "0.9.9"}.get(name),
+                version_of=lambda name: {"knowledge-rag": "4.9.1", "core": "2.1.0", "leaf": "0.9.9"}.get(name),
                 requires_of=requires_of,
             )
 
@@ -1561,7 +1565,7 @@ class TestPackageManifestEvidence:
         assert py_match is not None and pkg_match is not None
         py = py_match.group(1)
         pkg = pkg_match.group(1)
-        assert py == pkg == npm["version"] == "4.9.0"
+        assert py == pkg == npm["version"] == "4.9.1"
 
     def test_package_data_byte_identical_to_sources(self):
         # Source/editable package-data canonical: every bundled file under
@@ -1713,6 +1717,7 @@ class TestExplicitChromaClose:
         import mcp_server.server as srv
 
         opened: list = []
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_path", tmp_path)
 
         class _FakeClient:
             def __init__(self):
@@ -1778,6 +1783,8 @@ class TestExplicitChromaClose:
     def test_verify_pinned_backends_close_failure_fails_closed(self, monkeypatch, tmp_path: Path):
         import mcp_server.server as srv
 
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_path", tmp_path)
+
         class _FailingCloseClient:
             def get_collection(self, name):
                 class _Col:
@@ -1809,6 +1816,51 @@ class TestExplicitChromaClose:
         assert result.reason == srv.DRIFT_REASON_BACKEND_DRIFT
         # Sanitized detail: no exception text leaks.
         assert "release failed" not in json.dumps(result.detail)
+
+    def test_runtime_chroma_copy_preserves_sealed_tree(self, monkeypatch, tmp_path: Path):
+        import mcp_server.generations as gens
+        import mcp_server.server as srv
+
+        generation_dir = tmp_path / "generation"
+        sealed = generation_dir / gens.CHROMA_ARTIFACT
+        sealed.mkdir(parents=True)
+        (sealed / "chroma.sqlite3").write_bytes(b"sealed-db")
+        (sealed / "segment.bin").write_bytes(b"sealed-segment")
+        sealed_sha, sealed_count = gens.digest_tree(sealed)
+
+        runtime_tmp = tmp_path / "runtime-tmp"
+        runtime_tmp.mkdir()
+        monkeypatch.setenv("TMPDIR", str(runtime_tmp))
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_holder", None)
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_path", None)
+
+        class _Cur:
+            generation_id = "gen-runtime-copy"
+            receipt = {
+                "artifacts": {
+                    gens.CHROMA_ARTIFACT: {
+                        "sha256": sealed_sha,
+                        "count": sealed_count,
+                    }
+                }
+            }
+
+            @property
+            def generation_dir(self):
+                return generation_dir
+
+        try:
+            runtime_copy = srv._prepare_versioned_chroma_runtime_copy(_Cur())
+            assert runtime_copy != sealed
+            assert gens.digest_tree(runtime_copy) == (sealed_sha, sealed_count)
+
+            # Chroma may mutate its disposable SQLite copy; the published
+            # generation remains byte-identical and is still the identity.
+            (runtime_copy / "chroma.sqlite3").write_bytes(b"runtime-write")
+            assert (sealed / "chroma.sqlite3").read_bytes() == b"sealed-db"
+            assert gens.digest_tree(sealed) == (sealed_sha, sealed_count)
+        finally:
+            srv._cleanup_versioned_chroma_runtime_copy()
 
 
 class TestChromaScratchCopyEvidence:
