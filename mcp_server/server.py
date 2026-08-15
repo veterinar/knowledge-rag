@@ -2245,7 +2245,10 @@ class KnowledgeOrchestrator:
             # artifact while allowing Chroma's operational SQLite writes only
             # below the isolated runtime TMPDIR.
             self.chroma_client = chromadb.PersistentClient(path=str(config.chroma_dir))
-            self.collection = self.chroma_client.get_collection(name=config.collection_name)
+            self.collection = self.chroma_client.get_collection(
+                name=config.collection_name,
+                embedding_function=self.embed_fn,
+            )
             print(
                 f"[GENERATION] serving verified runtime chroma copy "
                 f"(collection {config.collection_name}, {self.collection.count()} chunks)"

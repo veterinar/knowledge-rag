@@ -1660,6 +1660,34 @@ class TestDefaultLockDiscovery:
         assert candidates == [tmp_path / "repo" / "mcp_server" / "data" / "requirements.lock"]
 
 
+class TestVersionedChromaAttach:
+    def test_serving_collection_uses_the_pinned_embedding_function(self, monkeypatch, versioned_config):
+        """A versioned text query must use FastEmbed, never Chroma's default model."""
+        seen: dict = {}
+        embed_fn = object()
+
+        class _StopAfterAttach(RuntimeError):
+            pass
+
+        class _FakeClient:
+            def get_collection(self, name, embedding_function=None):
+                seen["name"] = name
+                seen["embedding_function"] = embedding_function
+                raise _StopAfterAttach
+
+        monkeypatch.setattr(srv, "DocumentParser", lambda: object())
+        monkeypatch.setattr(srv, "FastEmbedEmbeddings", lambda: embed_fn)
+        monkeypatch.setattr(srv.chromadb, "PersistentClient", lambda path: _FakeClient())
+
+        with pytest.raises(_StopAfterAttach):
+            srv.KnowledgeOrchestrator()
+
+        assert seen == {
+            "name": versioned_config.collection_name,
+            "embedding_function": embed_fn,
+        }
+
+
 class TestExplicitChromaClose:
     """Chroma 1.5.9 PersistentClient has a real public close() — the
     orchestrator and every verification path must call it explicitly."""
