@@ -1376,7 +1376,8 @@ def _dependency_lock_candidates() -> List[Path]:
     if repo_root_lock.is_file():
         return [repo_root_lock]
     try:
-        import importlib.resources as _resources  # nosemgrep: project requires Python >=3.11
+        # importlib.resources is part of the supported Python >=3.11 baseline.
+        import importlib.resources as _resources  # nosemgrep
 
         resource = _resources.files("mcp_server").joinpath(f"data/{DEPENDENCY_LOCK_FILENAME}")
         if resource.is_file():

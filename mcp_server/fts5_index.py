@@ -844,8 +844,8 @@ class Fts5LexicalIndex:
     def _populate_staging(self, staging: str, rows: Sequence[ChunkRow], source_digest: str, total: int) -> str:
         staging_sql = _quote_sql_identifier(staging)
         with self._fts5_lock:  # stage in short lock-held batches; counts alone never suffice (§9)
-            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-            self._conn.execute(f"DROP TABLE IF EXISTS {staging_sql}")
+            # Identifier is internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"DROP TABLE IF EXISTS {staging_sql}")  # nosemgrep
             self._conn.execute(_FTS5_SCHEMA.replace("fts5_documents", staging_sql, 1))
             self._conn.commit()
         ordered = sorted(
@@ -859,8 +859,8 @@ class Fts5LexicalIndex:
                 )
                 self._conn.commit()
         with self._fts5_lock:
-            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-            read_back = self._conn.execute(
+            # Identifier is internal and validated by _quote_sql_identifier.
+            read_back = self._conn.execute(  # nosemgrep
                 f"SELECT chunk_id, content, filename, category FROM {staging_sql}"
             ).fetchall()
         verified_digest, verified_count = compute_rows_digest(read_back)
@@ -890,10 +890,9 @@ class Fts5LexicalIndex:
             self._drop_table_quiet(backup)  # P1-A: a stale crash backup must never collide
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-                self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {backup_sql}")
-                # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-                self._conn.execute(f"ALTER TABLE {staging_sql} RENAME TO fts5_documents")
+                # Identifiers are internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {backup_sql}")  # nosemgrep
+                self._conn.execute(f"ALTER TABLE {staging_sql} RENAME TO fts5_documents")  # nosemgrep
                 self._commit_live()
             except sqlite3.DatabaseError as exc:
                 with suppress(sqlite3.DatabaseError):
@@ -936,10 +935,9 @@ class Fts5LexicalIndex:
         backup_sql = _quote_sql_identifier(backup)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-            self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {staging_sql}")
-            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-            self._conn.execute(f"ALTER TABLE {backup_sql} RENAME TO fts5_documents")
+            # Identifiers are internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {staging_sql}")  # nosemgrep
+            self._conn.execute(f"ALTER TABLE {backup_sql} RENAME TO fts5_documents")  # nosemgrep
             self._commit_live()
             self._drop_table_quiet(staging)
             return True
@@ -1053,6 +1051,6 @@ class Fts5LexicalIndex:
         table_sql = _quote_sql_identifier(table)
         with suppress(sqlite3.DatabaseError), self._fts5_lock:
             if self._conn is not None:
-                # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
-                self._conn.execute(f"DROP TABLE IF EXISTS {table_sql}")
+                # Identifier is internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"DROP TABLE IF EXISTS {table_sql}")  # nosemgrep
                 self._conn.commit()
