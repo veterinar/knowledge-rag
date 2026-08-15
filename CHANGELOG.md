@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Unreleased
 
+### v4.9.1 (2026-08-15) — Physically read-only versioned serving
+
+- **fix(runtime)** — ChromaDB's writable `PersistentClient` now opens only a receipt-verified, process-local temporary copy. The published generation remains physically write-denied and content-bound; FTS stays on its sealed SQLite `mode=ro` artifact.
+- **fix(diagnostics)** — versioned startup preserves the safe backend/environment mismatch detail inside the stable `get_index_stats` envelope.
+
 ### v4.9.0 (2026-08-15) — Release/runtime reproducibility: canonical `requirements.lock` installs + dependency parity
 
 **`requirements.lock` (pip-compile `--generate-hashes`) is now the canonical production install input.** Docker, CI, and the release workflow all install identically: `pip install --require-hashes -r requirements.lock`, then the package wheel with `--no-deps`, then `pip check`. The runtime always imports installed package bytes — the Docker image no longer copies the source tree over `/app`.
@@ -428,4 +433,3 @@ Zero breaking change: usuários que atualizarem SEM tocar em `config.yaml` conti
 - **v1.0.1**: Auto-cleanup orphan folders, removed hardcoded paths
 - **v1.0.0**: Initial release
 </details>
-

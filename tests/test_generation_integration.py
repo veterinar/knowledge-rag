@@ -1561,7 +1561,7 @@ class TestPackageManifestEvidence:
         assert py_match is not None and pkg_match is not None
         py = py_match.group(1)
         pkg = pkg_match.group(1)
-        assert py == pkg == npm["version"] == "4.9.0"
+        assert py == pkg == npm["version"] == "4.9.1"
 
     def test_package_data_byte_identical_to_sources(self):
         # Source/editable package-data canonical: every bundled file under
@@ -1713,6 +1713,7 @@ class TestExplicitChromaClose:
         import mcp_server.server as srv
 
         opened: list = []
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_path", tmp_path)
 
         class _FakeClient:
             def __init__(self):
@@ -1778,6 +1779,8 @@ class TestExplicitChromaClose:
     def test_verify_pinned_backends_close_failure_fails_closed(self, monkeypatch, tmp_path: Path):
         import mcp_server.server as srv
 
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_path", tmp_path)
+
         class _FailingCloseClient:
             def get_collection(self, name):
                 class _Col:
@@ -1809,6 +1812,51 @@ class TestExplicitChromaClose:
         assert result.reason == srv.DRIFT_REASON_BACKEND_DRIFT
         # Sanitized detail: no exception text leaks.
         assert "release failed" not in json.dumps(result.detail)
+
+    def test_runtime_chroma_copy_preserves_sealed_tree(self, monkeypatch, tmp_path: Path):
+        import mcp_server.generations as gens
+        import mcp_server.server as srv
+
+        generation_dir = tmp_path / "generation"
+        sealed = generation_dir / gens.CHROMA_ARTIFACT
+        sealed.mkdir(parents=True)
+        (sealed / "chroma.sqlite3").write_bytes(b"sealed-db")
+        (sealed / "segment.bin").write_bytes(b"sealed-segment")
+        sealed_sha, sealed_count = gens.digest_tree(sealed)
+
+        runtime_tmp = tmp_path / "runtime-tmp"
+        runtime_tmp.mkdir()
+        monkeypatch.setenv("TMPDIR", str(runtime_tmp))
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_holder", None)
+        monkeypatch.setattr(srv, "_versioned_chroma_runtime_path", None)
+
+        class _Cur:
+            generation_id = "gen-runtime-copy"
+            receipt = {
+                "artifacts": {
+                    gens.CHROMA_ARTIFACT: {
+                        "sha256": sealed_sha,
+                        "count": sealed_count,
+                    }
+                }
+            }
+
+            @property
+            def generation_dir(self):
+                return generation_dir
+
+        try:
+            runtime_copy = srv._prepare_versioned_chroma_runtime_copy(_Cur())
+            assert runtime_copy != sealed
+            assert gens.digest_tree(runtime_copy) == (sealed_sha, sealed_count)
+
+            # Chroma may mutate its disposable SQLite copy; the published
+            # generation remains byte-identical and is still the identity.
+            (runtime_copy / "chroma.sqlite3").write_bytes(b"runtime-write")
+            assert (sealed / "chroma.sqlite3").read_bytes() == b"sealed-db"
+            assert gens.digest_tree(sealed) == (sealed_sha, sealed_count)
+        finally:
+            srv._cleanup_versioned_chroma_runtime_copy()
 
 
 class TestChromaScratchCopyEvidence:

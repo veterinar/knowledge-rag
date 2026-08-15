@@ -684,6 +684,7 @@ knowledge-rag is designed for teams that cannot let their documents leave the pe
 
 ## 🗺️ Recent releases
 
+- **v4.9.1** (2026-08-15) — Versioned serving opens Chroma only from a receipt-verified process-local copy, preserving the physically write-denied published generation; safe startup drift detail is retained.
 - **v4.9.0** (2026-08-15) — Release/runtime reproducibility: hash-locked `requirements.lock` as the canonical install input (Docker/CI/release), dependency-lock ↔ installed parity at generation build and runtime recheck, typed `advanced.watch_for_changes` / `watch_debounce_seconds`, all five presets (incl. multilingual) shipped in wheel/sdist
 - **v4.8.5** (2026-08-13) — Enterprise observability: `/health` endpoint + opt-in JSON structured logging
 - **v4.8.4** (2026-08-13) — Patch: security + durability + defensive fixes
