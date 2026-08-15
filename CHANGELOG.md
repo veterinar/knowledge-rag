@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Unreleased
 
+- **fix(retrieval)** — versioned Chroma serving now attaches the pinned FastEmbed embedding function, preventing semantic text queries from falling back to Chroma's default model/cache under no-egress runtime policy.
+
 ### v4.9.1 (2026-08-15) — Physically read-only versioned serving
 
 - **fix(runtime)** — ChromaDB's writable `PersistentClient` now opens only a receipt-verified, process-local temporary copy. The published generation remains physically write-denied and content-bound; FTS stays on its sealed SQLite `mode=ro` artifact.
