@@ -65,6 +65,8 @@ def _load_fts5() -> Any:
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("_fts5_index_rootbound", _ROOT / "mcp_server" / "fts5_index.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load mcp_server/fts5_index.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -142,12 +144,17 @@ def _collection_name(data_dir: Path, client: Any) -> str:
     parent_name = _yaml_collection_name(data_dir.parent / "config.yaml")
     local_name = _yaml_collection_name(data_dir / "config.yaml")
     if parent_name and local_name and parent_name != local_name:
-        raise SystemExit(f"[BUILD-FTS5] ambiguous collection_name: project={parent_name!r} vs root-local={local_name!r}")
-    if parent_name or local_name:
-        return parent_name or local_name
+        raise SystemExit(
+            f"[BUILD-FTS5] ambiguous collection_name: project={parent_name!r} vs root-local={local_name!r}"
+        )
+    selected = parent_name or local_name
+    if selected is not None:
+        return selected
     existing = [str(getattr(col, "name", col)) for col in client.list_collections()]
     if len(existing) != 1:
-        raise SystemExit(f"[BUILD-FTS5] cannot resolve collection: no configured name and {len(existing)} existing collections {existing!r}")
+        raise SystemExit(
+            f"[BUILD-FTS5] cannot resolve collection: no configured name and {len(existing)} existing collections {existing!r}"
+        )
     return existing[0]
 
 
@@ -184,7 +191,9 @@ def main(argv: list[str] | None = None) -> int:
         result = index.rebuild_content_bound(rows)  # shared primitive — no positional/zip path
     finally:
         index.close()
-    print(f"[BUILD-FTS5] complete: {result['docs_indexed']} docs source={result['source_rows_sha256'][:12]} verified={result['verified_fts_rows_sha256'][:12]}")
+    print(
+        f"[BUILD-FTS5] complete: {result['docs_indexed']} docs source={result['source_rows_sha256'][:12]} verified={result['verified_fts_rows_sha256'][:12]}"
+    )
 
     elapsed = time.time() - start
     print(f"[BUILD-FTS5] elapsed_seconds={elapsed:.1f}")

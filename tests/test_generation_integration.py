@@ -1096,7 +1096,7 @@ class TestStrictLockContinuations:
         [
             "-r other.lock",
             "--requirement other.lock",
-            "-rother.lock",            # compact: no space, no '='
+            "-rother.lock",  # compact: no space, no '='
             "--requirement=other.lock",  # compact: '=' form
         ],
         ids=["r-space", "requirement-space", "r-compact", "requirement-equals"],
@@ -1751,7 +1751,13 @@ class TestExplicitChromaClose:
                         "hydrated_id_count": 1,
                         "backend_generation_id": "z",
                     },
-                    "fts5": {"row_digest": "d", "row_count": 1, "source_digest": "d", "verified_digest": "d", "backend_generation_id": "w"},
+                    "fts5": {
+                        "row_digest": "d",
+                        "row_count": 1,
+                        "source_digest": "d",
+                        "verified_digest": "d",
+                        "backend_generation_id": "w",
+                    },
                 }
             }
 
@@ -1933,6 +1939,4 @@ class TestSidecarSuffixCoverage:
         from mcp_server.generations import _SQLITE_SIDECAR_SUFFIXES
 
         sweep_detected = any(name.endswith(suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES)
-        assert sweep_detected, (
-            f"sidecar sweep must reject {name!r}; canonical suffixes = {_SQLITE_SIDECAR_SUFFIXES}"
-        )
+        assert sweep_detected, f"sidecar sweep must reject {name!r}; canonical suffixes = {_SQLITE_SIDECAR_SUFFIXES}"

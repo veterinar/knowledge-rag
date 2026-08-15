@@ -347,10 +347,10 @@ def _chroma_evidence_from_staging(staging: Path) -> Dict[str, Any]:
         shutil.copytree(db_dir, scratch_db)
         copy_digest, _copy_count = digest_tree(scratch_db)
         if copy_digest != original_digest:
-            raise SystemExit("[GENERATION] chroma scratch copy is not byte-identical to the staged tree — refusing to seal")
-        client = chromadb.PersistentClient(
-            path=str(scratch_db), settings=chromadb.Settings(anonymized_telemetry=False)
-        )
+            raise SystemExit(
+                "[GENERATION] chroma scratch copy is not byte-identical to the staged tree — refusing to seal"
+            )
+        client = chromadb.PersistentClient(path=str(scratch_db), settings=chromadb.Settings(anonymized_telemetry=False))
         try:
             collection = client.get_collection(config.collection_name)
             full_rows = capture_full_chunk_rows(collection)

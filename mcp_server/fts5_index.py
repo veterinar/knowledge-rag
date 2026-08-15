@@ -81,6 +81,16 @@ class Fts5MigrationError(RuntimeError):
     """Raised when the initial FTS5 rebuild fails. See marker file for cause."""
 
 
+_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    """Quote one internally generated SQLite identifier after strict validation."""
+    if _SQL_IDENTIFIER.fullmatch(identifier) is None:
+        raise Fts5MigrationError("unsafe internal SQLite identifier")
+    return f'"{identifier}"'
+
+
 class Fts5MigrationState:
     """Atomic JSON marker for the FTS5 rebuild lifecycle (PRD OQ-5, Q3).
 
@@ -832,9 +842,11 @@ class Fts5LexicalIndex:
         return self._finalize_rebuild(gen, staging, prior, source_digest, verified_digest, total, started_at)
 
     def _populate_staging(self, staging: str, rows: Sequence[ChunkRow], source_digest: str, total: int) -> str:
+        staging_sql = _quote_sql_identifier(staging)
         with self._fts5_lock:  # stage in short lock-held batches; counts alone never suffice (§9)
-            self._conn.execute(f'DROP TABLE IF EXISTS "{staging}"')
-            self._conn.execute(_FTS5_SCHEMA.replace("fts5_documents", f'"{staging}"', 1))
+            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"DROP TABLE IF EXISTS {staging_sql}")
+            self._conn.execute(_FTS5_SCHEMA.replace("fts5_documents", staging_sql, 1))
             self._conn.commit()
         ordered = sorted(
             (tuple(str(value or "") for value in row) for row in rows), key=lambda row: row[0].encode("utf-8")
@@ -842,12 +854,15 @@ class Fts5LexicalIndex:
         for start in range(0, len(ordered), 100):
             with self._fts5_lock:
                 self._conn.executemany(
-                    f'INSERT INTO "{staging}" (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)',
+                    f"INSERT INTO {staging_sql} (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)",
                     ordered[start : start + 100],
                 )
                 self._conn.commit()
         with self._fts5_lock:
-            read_back = self._conn.execute(f'SELECT chunk_id, content, filename, category FROM "{staging}"').fetchall()
+            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+            read_back = self._conn.execute(
+                f"SELECT chunk_id, content, filename, category FROM {staging_sql}"
+            ).fetchall()
         verified_digest, verified_count = compute_rows_digest(read_back)
         if verified_digest != source_digest or verified_count != total:
             raise Fts5MigrationError(
@@ -866,6 +881,8 @@ class Fts5LexicalIndex:
         started_at: str,
     ) -> dict:
         backup = f"fts5_documents_backup_g{gen}"
+        staging_sql = _quote_sql_identifier(staging)
+        backup_sql = _quote_sql_identifier(backup)
         with self._fts5_lock:  # guarded final transition (T6-T8); a stale generation only cleans its staging
             if self._generation != gen or self._conn is None:
                 self._drop_table_quiet(staging)
@@ -873,8 +890,10 @@ class Fts5LexicalIndex:
             self._drop_table_quiet(backup)  # P1-A: a stale crash backup must never collide
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                self._conn.execute(f'ALTER TABLE fts5_documents RENAME TO "{backup}"')
-                self._conn.execute(f'ALTER TABLE "{staging}" RENAME TO fts5_documents')
+                # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {backup_sql}")
+                # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"ALTER TABLE {staging_sql} RENAME TO fts5_documents")
                 self._commit_live()
             except sqlite3.DatabaseError as exc:
                 with suppress(sqlite3.DatabaseError):
@@ -913,10 +932,14 @@ class Fts5LexicalIndex:
             return self._reverse_swap_locked(staging, backup)
 
     def _reverse_swap_locked(self, staging: str, backup: str) -> bool:
+        staging_sql = _quote_sql_identifier(staging)
+        backup_sql = _quote_sql_identifier(backup)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            self._conn.execute(f'ALTER TABLE fts5_documents RENAME TO "{staging}"')
-            self._conn.execute(f'ALTER TABLE "{backup}" RENAME TO fts5_documents')
+            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {staging_sql}")
+            # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"ALTER TABLE {backup_sql} RENAME TO fts5_documents")
             self._commit_live()
             self._drop_table_quiet(staging)
             return True
@@ -1027,7 +1050,9 @@ class Fts5LexicalIndex:
         self._mutation_epoch += 1
 
     def _drop_table_quiet(self, table: str) -> None:  # owner-only staging cleanup (T10)
+        table_sql = _quote_sql_identifier(table)
         with suppress(sqlite3.DatabaseError), self._fts5_lock:
             if self._conn is not None:
-                self._conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                # nosemgrep: identifiers are internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"DROP TABLE IF EXISTS {table_sql}")
                 self._conn.commit()

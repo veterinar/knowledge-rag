@@ -86,9 +86,7 @@ def test_success_with_results_is_the_only_generation_path(monkeypatch):
 
     monkeypatch.setattr(cli, "_search", _fake_search)
     # Provide a deterministic generator stub (selection JSON).
-    monkeypatch.setattr(
-        cli, "_generate_answer", lambda prompt: '{"evidence_ids": ["u0"]}'
-    )
+    monkeypatch.setattr(cli, "_generate_answer", lambda prompt: '{"evidence_ids": ["u0"]}')
     monkeypatch.setattr(sys, "argv", ["vault-rag", "что такое АЧС"])
     out, err = io.StringIO(), io.StringIO()
     # Same controlled-terminal capture as _run_main: cli.main() resets

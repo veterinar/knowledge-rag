@@ -61,9 +61,21 @@ def test_b03_fts5_snapshot_capture_maps_by_returned_id() -> None:
 # --- Marker v2 rejection (Package B): replaces the unversioned-ready assert ---
 
 
-@pytest.mark.parametrize("case", ["legacy_v1", "malformed", "missing_digest", "count_mismatch", "digest_mismatch",
-                                  "fake_hex_equal", "live_content_corrupt", "live_id_corrupt",
-                                  "bool_generation", "zero_generation"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "legacy_v1",
+        "malformed",
+        "missing_digest",
+        "count_mismatch",
+        "digest_mismatch",
+        "fake_hex_equal",
+        "live_content_corrupt",
+        "live_id_corrupt",
+        "bool_generation",
+        "zero_generation",
+    ],
+)
 def test_marker_v2_rejection_blocks_serving_readiness(tmp_path: Any, case: str) -> None:
     """Non-credible markers and live-byte corruption stay non-ready on reopen (P1-5)."""
     from mcp_server.fts5_index import Fts5LexicalIndex
@@ -82,13 +94,15 @@ def test_marker_v2_rejection_blocks_serving_readiness(tmp_path: Any, case: str) 
     elif case == "malformed":
         marker_path.write_text("{not json", encoding="utf-8")
     else:
-        payloads = {"legacy_v1": {"status": "complete", "docs_total": 9, "docs_indexed": 9},
-                    "missing_digest": {**credible, "verified_fts_rows_sha256": None},
-                    "count_mismatch": {**credible, "docs_total": 14, "docs_indexed": 14},
-                    "digest_mismatch": {**credible, "verified_fts_rows_sha256": "0" * 64},
-                    "fake_hex_equal": {**credible, "source_rows_sha256": "z" * 64, "verified_fts_rows_sha256": "z" * 64},
-                    "bool_generation": {**credible, "generation": True},
-                    "zero_generation": {**credible, "generation": 0}}
+        payloads = {
+            "legacy_v1": {"status": "complete", "docs_total": 9, "docs_indexed": 9},
+            "missing_digest": {**credible, "verified_fts_rows_sha256": None},
+            "count_mismatch": {**credible, "docs_total": 14, "docs_indexed": 14},
+            "digest_mismatch": {**credible, "verified_fts_rows_sha256": "0" * 64},
+            "fake_hex_equal": {**credible, "source_rows_sha256": "z" * 64, "verified_fts_rows_sha256": "z" * 64},
+            "bool_generation": {**credible, "generation": True},
+            "zero_generation": {**credible, "generation": 0},
+        }
         marker_path.write_text(json.dumps(payloads[case]), encoding="utf-8")
     reopened = Fts5LexicalIndex(db_path=tmp_path / "fts5.db", state_path=marker_path)
     try:
@@ -247,9 +261,11 @@ def test_b02_fts5_constructor_handles_only_and_main_dispatches_once(tmp_path, mo
         orch.fts5_index.close()
 
     order: list = []
-    fake = SimpleNamespace(collection=SimpleNamespace(count=lambda: 1 if corpus == "populated" else 0),
-                           _check_dimension_mismatch=lambda: (order.append("primary_decision"), False)[1],
-                           _dispatch_fts5_startup_rebuild=lambda: order.append("fts5_dispatch"))
+    fake = SimpleNamespace(
+        collection=SimpleNamespace(count=lambda: 1 if corpus == "populated" else 0),
+        _check_dimension_mismatch=lambda: (order.append("primary_decision"), False)[1],
+        _dispatch_fts5_startup_rebuild=lambda: order.append("fts5_dispatch"),
+    )
     fake.index_all = lambda: (order.append("initial_index"), {"indexed": 0, "chunks_added": 0})[1]
     monkeypatch.setattr(instance_lock, "single_instance_lock", nullcontext)
     monkeypatch.setattr(preflight, "run_preflight", lambda: None)
@@ -351,8 +367,12 @@ def test_p1a_fts5_crash_between_swap_and_publication_recovers_on_reopen(tmp_path
     KnowledgeOrchestrator._fts5_rebuild_worker(_worker_shell(index, _fake_collection(rows_d)))
     assert index.is_ready() is True and index.search_if_ready("DTOK 1"), "stale backup must not wedge retries (P1-A)"
     with index._fts5_lock:  # noqa: SLF001 — no stale generation artifacts remain after recovery
-        leftovers = [r[0] for r in index._conn.execute(  # noqa: SLF001
-            "SELECT name FROM sqlite_master WHERE name LIKE 'fts5_documents_backup%' OR name LIKE 'fts5_documents_staging%'").fetchall()]
+        leftovers = [
+            r[0]
+            for r in index._conn.execute(  # noqa: SLF001
+                "SELECT name FROM sqlite_master WHERE name LIKE 'fts5_documents_backup%' OR name LIKE 'fts5_documents_staging%'"
+            ).fetchall()
+        ]
     assert leftovers == [], leftovers
     index.close()
 
@@ -471,11 +491,12 @@ def test_final_v483_package_b_rollout_lifecycle(tmp_path, monkeypatch):
     (F3) queued material successor start-failure gets one bounded retry;
     (F4) legacy shim delegates to the authoritative path, resume_from is
     compatibility-only and docs_total mismatch fails closed."""
+    from test_fts5_migration import _fake_collection, _gen_rows, _make_index, _worker_shell
+
     import mcp_server.fts5_index as fts5_module
     from mcp_server import server as srv
     from mcp_server.fts5_index import Fts5LexicalIndex
     from mcp_server.server import KnowledgeOrchestrator
-    from test_fts5_migration import _fake_collection, _gen_rows, _make_index, _worker_shell
 
     monkeypatch.setattr(srv.config, "fts5_enabled", True)
     index = _make_index(tmp_path)
@@ -486,8 +507,9 @@ def test_final_v483_package_b_rollout_lifecycle(tmp_path, monkeypatch):
     orch._fts5_startup_dispatch_done = False
     dispatched: list = []
     real_start_worker = KnowledgeOrchestrator._start_fts5_rebuild_worker
-    monkeypatch.setattr(KnowledgeOrchestrator, "_start_fts5_rebuild_worker",
-                        lambda self, material=False: dispatched.append(material))
+    monkeypatch.setattr(
+        KnowledgeOrchestrator, "_start_fts5_rebuild_worker", lambda self, material=False: dispatched.append(material)
+    )
     KnowledgeOrchestrator._dispatch_fts5_startup_rebuild(orch)
     KnowledgeOrchestrator._dispatch_fts5_startup_rebuild(orch)
     assert dispatched == [False], "startup dispatch must be truly one-shot (F6)"
@@ -503,8 +525,9 @@ def test_final_v483_package_b_rollout_lifecycle(tmp_path, monkeypatch):
     real_vp = Fts5LexicalIndex.verify_and_publish
 
     def probing_vp(self, source_digest, total, generation, started_at=None):
-        prober = threading.Thread(target=lambda: probe.setdefault("hit", self.search_if_ready("CVE-2021-0001")),
-                                  daemon=True)
+        prober = threading.Thread(
+            target=lambda: probe.setdefault("hit", self.search_if_ready("CVE-2021-0001")), daemon=True
+        )
         prober.start()
         prober.join(timeout=2.0)
         probe["blocked"] = prober.is_alive()
@@ -525,8 +548,9 @@ def test_final_v483_package_b_rollout_lifecycle(tmp_path, monkeypatch):
     index.state.write = failing_write
     outcome = index.rebuild_content_bound(rows, generation=index._generation)  # noqa: SLF001
     del index.state.write
-    assert outcome["status"] == "failed" and index.state.read() == prior_marker and index.is_ready() is True, \
+    assert outcome["status"] == "failed" and index.state.read() == prior_marker and index.is_ready() is True, (
         "initial-marker failure must preserve the prior credible marker and readiness (F2)"
+    )
 
     # (F5) publisher live-read failure fails the candidate generation closed
     real_live = Fts5LexicalIndex._live_digest
@@ -537,8 +561,9 @@ def test_final_v483_package_b_rollout_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(Fts5LexicalIndex, "_live_digest", broken_live)
     KnowledgeOrchestrator._fts5_rebuild_worker(_worker_shell(index, _fake_collection(rows)))
     monkeypatch.setattr(Fts5LexicalIndex, "_live_digest", real_live)
-    assert index.is_ready() is False and index.state.read()["status"] == "failed", \
+    assert index.is_ready() is False and index.state.read()["status"] == "failed", (
         "publisher live-read failure must leave the generation failed/non-ready (F5)"
+    )
 
     # (F3) queued material successor whose first Thread.start fails retries once
     hold, release_capture = threading.Event(), threading.Event()
@@ -576,10 +601,12 @@ def test_final_v483_package_b_rollout_lifecycle(tmp_path, monkeypatch):
     # (F4) legacy shim: authoritative path, resume_from compat-only, docs_total fail-closed
     thread = index.start_migration_background(lambda: iter(rows), 6, resume_from=4)
     thread.join(timeout=15.0)
-    assert not thread.is_alive() and index.count() == 6 and index.is_ready() is True, \
+    assert not thread.is_alive() and index.count() == 6 and index.is_ready() is True, (
         "shim delegates to the content-bound path; resume_from is never a cursor (F4)"
+    )
     thread = index.start_migration_background(lambda: iter(rows), 99)
     thread.join(timeout=15.0)
-    assert index.is_ready() is False and index.state.read()["status"] == "failed", \
+    assert index.is_ready() is False and index.state.read()["status"] == "failed", (
         "docs_total mismatch must fail closed (F4)"
+    )
     index.close()

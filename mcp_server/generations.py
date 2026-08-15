@@ -1376,7 +1376,7 @@ def _dependency_lock_candidates() -> List[Path]:
     if repo_root_lock.is_file():
         return [repo_root_lock]
     try:
-        import importlib.resources as _resources
+        import importlib.resources as _resources  # nosemgrep: project requires Python >=3.11
 
         resource = _resources.files("mcp_server").joinpath(f"data/{DEPENDENCY_LOCK_FILENAME}")
         if resource.is_file():
@@ -1589,9 +1589,7 @@ def active_dependency_graph(
             # edge is active when its marker holds for ANY activated extra
             # (or for extra="" when the distribution has none activated).
             if req.marker is not None:
-                active = any(
-                    req.marker.evaluate({**marker_env, "extra": extra}) for extra in ({""} | node_extras)
-                )
+                active = any(req.marker.evaluate({**marker_env, "extra": extra}) for extra in ({""} | node_extras))
                 if not active:
                     continue  # inactive edge (extra/platform gated) — not in graph
             graph.setdefault(node, []).append(

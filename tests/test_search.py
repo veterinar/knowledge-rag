@@ -1385,9 +1385,7 @@ class TestExpectedPathBoundary:
         from mcp_server.server import _expected_path_matches
 
         # UNC (either separator) is ABSOLUTE: exact normalized equality only.
-        assert _expected_path_matches(
-            "//server/share/corpus/a.md", "\\\\server\\share\\corpus\\a.md"
-        )
+        assert _expected_path_matches("//server/share/corpus/a.md", "\\\\server\\share\\corpus\\a.md")
         assert not _expected_path_matches("//server/share/a.md", "//server/share/sub/a.md")
         assert not _expected_path_matches("//server/share/a.md", "//other/share/a.md")
 
@@ -1543,7 +1541,6 @@ class TestFtsNoScoreRerankerPreservesNative:
         for r in results:
             assert r["score_source"] == "fts5_bm25"
             assert r["reranker_score"] is None
-
 
     @pytest.mark.parametrize("invalid_value", [float("nan"), float("inf")], ids=["nan", "inf"])
     def test_nonfinite_reranker_scores_are_a_no_op(self, monkeypatch, invalid_value):

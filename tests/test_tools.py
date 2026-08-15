@@ -340,10 +340,10 @@ class TestEvaluateRetrieval:
     @pytest.mark.parametrize(
         "case",
         [
-            {"query": 123, "expected_filepath": "a.md"},        # numeric query
-            {"query": None, "expected_filepath": "a.md"},      # null query
-            {"query": "q", "expected_filepath": 12.5},         # numeric expected
-            {"query": "q", "expected_filepath": ["a.md"]},     # list expected
+            {"query": 123, "expected_filepath": "a.md"},  # numeric query
+            {"query": None, "expected_filepath": "a.md"},  # null query
+            {"query": "q", "expected_filepath": 12.5},  # numeric expected
+            {"query": "q", "expected_filepath": ["a.md"]},  # list expected
         ],
         ids=["query-number", "query-null", "expected-number", "expected-list"],
     )

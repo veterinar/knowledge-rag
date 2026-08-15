@@ -6015,12 +6015,7 @@ def evaluate_retrieval(test_cases: str) -> str:
             )
         query = tc.get("query")
         expected = tc.get("expected_filepath")
-        if (
-            not isinstance(query, str)
-            or not query.strip()
-            or not isinstance(expected, str)
-            or not expected.strip()
-        ):
+        if not isinstance(query, str) or not query.strip() or not isinstance(expected, str) or not expected.strip():
             return json.dumps(
                 {
                     "status": "error",

@@ -922,9 +922,7 @@ class TestLockContract:
     def test_test_tooling_is_hash_locked_without_automatic_reruns(self):
         test_in = _read("test-requirements.in")
         substantive = [
-            line.strip()
-            for line in test_in.splitlines()
-            if line.strip() and not line.strip().startswith("#")
+            line.strip() for line in test_in.splitlines() if line.strip() and not line.strip().startswith("#")
         ]
         for tool in ("pytest", "pytest-cov", "hypothesis", "psutil"):
             assert any(line == tool or line.startswith(tool) for line in substantive), (

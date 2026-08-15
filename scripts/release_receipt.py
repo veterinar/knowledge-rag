@@ -69,7 +69,7 @@ def tool_version(dist_name: str) -> str:
         return "not-installed"
 
 
-def _git(args: list[str]) -> subprocess.CompletedProcess:
+def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run read-only git plumbing in ROOT; raise on failure."""
     proc = subprocess.run(
         ["git", *args],
@@ -79,9 +79,7 @@ def _git(args: list[str]) -> subprocess.CompletedProcess:
         check=False,
     )
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git {' '.join(args)} failed (exit {proc.returncode}): {proc.stderr.strip()}"
-        )
+        raise RuntimeError(f"git {' '.join(args)} failed (exit {proc.returncode}): {proc.stderr.strip()}")
     return proc
 
 
@@ -97,11 +95,7 @@ def git_tree_bytes(commit: str, path: str) -> bytes:
 def git_tree_paths_under(commit: str, prefix: str) -> set[str]:
     """All tracked paths under ``prefix`` in ``commit``'s tree."""
     proc = _git(["ls-tree", "-r", "--name-only", commit, "--", prefix])
-    return {
-        line.strip()
-        for line in proc.stdout.splitlines()
-        if line.strip()
-    }
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
 
 
 def main() -> int:
@@ -122,8 +116,7 @@ def main() -> int:
     wheels = sorted(dist_dir.glob("*.whl"))
     if len(wheels) != 1:
         print(
-            f"expected EXACTLY ONE wheel in {dist_dir}, found {len(wheels)}: "
-            f"{[w.name for w in wheels]}",
+            f"expected EXACTLY ONE wheel in {dist_dir}, found {len(wheels)}: {[w.name for w in wheels]}",
             file=sys.stderr,
         )
         return 1
@@ -172,9 +165,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        mapping.append(
-            {"source": src_rel, "wheel": dest_rel, "tree_sha256": src_sha, "wheel_sha256": wheel_sha}
-        )
+        mapping.append({"source": src_rel, "wheel": dest_rel, "tree_sha256": src_sha, "wheel_sha256": wheel_sha})
 
     # ── embedded runtime lock must equal the TREE lock EXACTLY ──────────
     embedded_lock = "mcp_server/data/requirements.lock"
@@ -215,7 +206,7 @@ def main() -> int:
         and not p.startswith("mcp_server/data/")
     }
     force_dests = {dest.replace("\\", "/") for dest in force_include.values()}
-    expected = {f"mcp_server/{p[len('mcp_server/'):]}" for p in tree_pkg_files}
+    expected = {f"mcp_server/{p[len('mcp_server/') :]}" for p in tree_pkg_files}
     missing = sorted(expected - wheel_pkg_files - {d for d in force_dests if d.startswith(package_prefix)})
     extra = sorted(wheel_pkg_files - expected - force_dests)
     if missing or extra:
