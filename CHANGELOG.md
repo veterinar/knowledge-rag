@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Unreleased
 
+### v4.9.0 (2026-08-15) — Release/runtime reproducibility: canonical `requirements.lock` installs + dependency parity
+
+**`requirements.lock` (pip-compile `--generate-hashes`) is now the canonical production install input.** Docker, CI, and the release workflow all install identically: `pip install --require-hashes -r requirements.lock`, then the package wheel with `--no-deps`, then `pip check`. The runtime always imports installed package bytes — the Docker image no longer copies the source tree over `/app`.
+
+**Added:**
+
+- **feat(repro)** — dependency parity enforcement in `mcp_server.generations`: `lock_pin_map` (canonical normalized name → exact version + sha256 hashes; malformed lines and normalized duplicates fail closed), `require_self_version_parity` (installed `knowledge-rag` version must equal `mcp_server.__version__` — the self package is not in the pip-compile lock), and `verify_runtime_dependency_parity` (every active default `Requires-Dist` dependency pinned; every installed lock pin at the exact locked version; optional marker-inactive pins exempt). Enforced at generation build (`generation_identity`) and at the runtime drift recheck (`_retrieval_environment_digests`). Installed RECORD digest and lock digest remain distinct evidence.
+- **feat(config)** — typed `advanced.watch_for_changes` (default `true`) and `advanced.watch_debounce_seconds` (default `10.0`, must be finite positive; invalid values fall back with a WARN). The watcher construction in `server.py` uses them instead of the hardcoded `debounce_seconds=10.0`. Versioned mode still forcibly disables the watcher; `KNOWLEDGE_RAG_WATCHER_DISABLED=1` remains the emergency override.
+- **ci(release)** — release workflow: new `verify-versions` job asserting tag == `pyproject.toml` == `mcp_server/__init__.py` == `npm/package.json`; clean-runtime pre-release tests (fresh venv, lock + wheel `--no-deps` + `pip check` + self-version parity import); release verification receipt recording wheel SHA-256, sorted archive manifest, embedded-lock presence + lock digest, and build profile — kept deliberately distinct from generation receipts, which never record a wheel SHA.
+- **deps** — `requirements.txt` aligned with project metadata: unused `rank-bm25` removed (dead since the v4.2.0 inverted-index BM25), direct `numpy` retained. `requirements.lock` is untouched and authoritative.
+
+**Packaging:** wheel now force-includes all five presets (multilingual.yaml added) alongside `config.example.yaml` and `requirements.lock` under `mcp_server/data/`; the sdist already carried `presets/` + `requirements.lock`. Focused manifest assertions live in the consolidated evidence tests. No `MANIFEST.in` added — hatch config is authoritative.
+
+**Note:** enabling FTS5 by default remains **deferred pending evidence** — no performance gate was run for this release; `search.lexical_fast_path.enabled` stays `false`.
+
+**No breaking changes.** Watcher defaults reproduce the prior hardcoded behavior exactly (`true` / `10.0`).
+
 ### v4.8.5 (2026-08-13) — Enterprise observability: `/health` probes + JSON structured logging (opt-in)
 
 **Recommended for anyone deploying HTTP/SSE transport behind load balancers, container orchestrators, or centralised logging pipelines.** Two additive features, both zero-cost when unused: an HTTP `/health` and `/healthz` endpoint served in front of the MCP dispatcher (no auth required, always responds), and opt-in JSON structured logging ready for ELK / Loki / Datadog / CloudWatch Logs ingestion.

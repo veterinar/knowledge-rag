@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -78,6 +79,16 @@ class Fts5CorruptError(RuntimeError):
 
 class Fts5MigrationError(RuntimeError):
     """Raised when the initial FTS5 rebuild fails. See marker file for cause."""
+
+
+_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    """Quote one internally generated SQLite identifier after strict validation."""
+    if _SQL_IDENTIFIER.fullmatch(identifier) is None:
+        raise Fts5MigrationError("unsafe internal SQLite identifier")
+    return f'"{identifier}"'
 
 
 class Fts5MigrationState:
@@ -156,7 +167,9 @@ def _is_uint(value: Any, minimum: int = 0) -> bool:  # strict schema ints: bool 
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
 
-def compute_rows_digest(rows: Iterable[ChunkRow]) -> Tuple[str, int]:  # canonical digest: str(value or "") UTF-8 fields, raw-byte sort, dup-reject
+def compute_rows_digest(
+    rows: Iterable[ChunkRow],
+) -> Tuple[str, int]:  # canonical digest: str(value or "") UTF-8 fields, raw-byte sort, dup-reject
     encoded, seen = [], set()
     for row in rows:
         fields = tuple(str(value or "").encode("utf-8") for value in row)
@@ -172,7 +185,146 @@ def compute_rows_digest(rows: Iterable[ChunkRow]) -> Tuple[str, int]:  # canonic
     return digest.hexdigest(), len(encoded)
 
 
-def capture_chunk_rows(collection: Any, batch_size: int = 500) -> List[ChunkRow]:  # exact id listing + explicit-ID hydration mapped by returned id (B03/D4)
+# Chroma COMPLETE row universe: id + document + packed embedding bytes +
+# normalized full retrieval metadata. Domain-separated from the common
+# (id, document, filename, category) universe the FTS parity uses.
+_CHROMA_FULL_ROWS_DOMAIN = b"knowledge-rag.chroma.full-rows.v1\x00"
+FullChunkRow = Tuple[str, str, bytes, str]  # (chunk_id, document, packed_embeddings, normalized_metadata_json)
+
+
+def _pack_embedding(value: Any) -> bytes:
+    """Deterministic big-endian IEEE-754 packing of one embedding vector.
+
+    Non-finite floats (NaN/inf) are rejected: they are not canonicalizable
+    across stores and would silently corrupt the full-row digest.
+    """
+    if value is None:
+        return b""
+    packed = bytearray()
+    for component in value:
+        if isinstance(component, (int, float)) and not isinstance(component, bool):
+            as_float = float(component)
+            if math.isnan(as_float) or math.isinf(as_float):
+                raise Fts5MigrationError("non-finite embedding component (NaN/inf) is not canonicalizable")
+            packed += struct.pack(">d", as_float)
+        else:
+            token = str(component).encode("utf-8")
+            packed += struct.pack(">Q", len(token)) + token
+    return bytes(packed)
+
+
+# JSON-compatible canonical metadata value types. Types OUTSIDE this set fail
+# closed: stringifying them (the old behavior) made 1, "1", True and "True"
+# collide in the canonical form, silently masking real drift.
+_METADATA_VALUE_TYPES = (str, int, float, bool, type(None), list, dict)
+
+
+def _canonical_metadata_value(value: Any) -> Any:
+    """Type-preserving canonical form of one metadata value.
+
+    Nested dicts keep deterministic key order (sorted); nested lists keep
+    element order (order is behavioral); unsupported types raise — never a
+    lossy stringification.
+    """
+    if isinstance(value, dict):
+        return {str(k): _canonical_metadata_value(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, list):
+        return [_canonical_metadata_value(v) for v in value]
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        raise Fts5MigrationError("non-finite metadata value (NaN/inf) is not canonicalizable")
+    if isinstance(value, _METADATA_VALUE_TYPES):
+        return value
+    raise Fts5MigrationError(
+        f"unsupported metadata value type {type(value).__name__!r} — refusing lossy canonicalization"
+    )
+
+
+def normalize_retrieval_metadata(metadata: Any) -> str:
+    """Canonical key-sorted, TYPE-PRESERVING JSON of the full metadata mapping.
+
+    Values keep their JSON types (str/int/float/bool/None/list/dict); dicts
+    are key-sorted, lists keep order. Unsupported or non-finite values raise
+    ``Fts5MigrationError`` (fail closed) instead of colliding silently.
+    """
+    if not isinstance(metadata, dict):
+        metadata = {}
+    canonical = {str(k): _canonical_metadata_value(v) for k, v in sorted(metadata.items(), key=lambda kv: str(kv[0]))}
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def capture_full_chunk_rows(collection: Any, batch_size: int = 500) -> List[FullChunkRow]:
+    """Complete Chroma row universe: ids, documents, embeddings, full metadata.
+
+    Same exact-id listing discipline as :func:`capture_chunk_rows` — the
+    listing count must equal ``collection.count()`` and be duplicate-free —
+    but hydrates embeddings and FULL metadata so the canonical digest covers
+    everything retrieval-significant Chroma stores.
+    """
+    ids = [str(chunk_id) for chunk_id in (collection.get(include=[]) or {}).get("ids") or []]
+    if len(ids) != int(collection.count()) or len(set(ids)) != len(ids):
+        raise Fts5MigrationError("full-row id listing count/duplicate mismatch")
+    ids.sort(key=lambda chunk_id: chunk_id.encode("utf-8"))
+    rows: List[FullChunkRow] = []
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start : start + batch_size]
+        fetched = collection.get(ids=list(batch), include=["documents", "metadatas", "embeddings"])
+        fetched = fetched if fetched is not None else {}
+        # NEVER truth-test ndarray-backed values (``or []`` mis-evaluates a
+        # 2-D array and can raise): branch on None explicitly and coerce
+        # length via len(), which works for lists AND arrays.
+        raw_ids = fetched.get("ids")
+        raw_docs = fetched.get("documents")
+        raw_metas = fetched.get("metadatas")
+        raw_embs = fetched.get("embeddings")
+        if raw_ids is None or raw_docs is None or raw_metas is None or raw_embs is None:
+            raise Fts5MigrationError("full-row hydration missing a required field")
+        got_ids = [str(rid) for rid in raw_ids]
+        docs, metas, embs = raw_docs, raw_metas, raw_embs
+        position_by_id = {rid: i for i, rid in enumerate(got_ids)}
+        if not (len(got_ids) == len(docs) == len(metas) == len(embs) == len(position_by_id)) or not set(
+            got_ids
+        ).issubset(batch):
+            raise Fts5MigrationError("full-row response cardinality/identity mismatch")
+        for chunk_id in batch:
+            i = position_by_id.get(chunk_id)
+            if i is None:
+                raise Fts5MigrationError(f"full-row read missing chunk_id {chunk_id!r}")
+            rows.append(
+                (
+                    str(chunk_id or ""),
+                    str(docs[i] or ""),
+                    _pack_embedding(embs[i]),
+                    normalize_retrieval_metadata(metas[i]),
+                )
+            )
+    return rows
+
+
+def compute_full_rows_digest(rows: Iterable[FullChunkRow]) -> Tuple[str, int]:
+    """Canonical digest over the COMPLETE Chroma row universe (dup-reject)."""
+    encoded, seen = [], set()
+    for row in rows:
+        fields = (
+            str(row[0] or "").encode("utf-8"),
+            str(row[1] or "").encode("utf-8"),
+            row[2] if isinstance(row[2], (bytes, bytearray)) else _pack_embedding(row[2]),
+            str(row[3] or "").encode("utf-8"),
+        )
+        if fields[0] in seen:
+            raise Fts5MigrationError(f"duplicate chunk_id in full row set: {fields[0]!r}")
+        seen.add(fields[0])
+        encoded.append(fields)
+    encoded.sort(key=lambda fields: fields[0])
+    digest = hashlib.sha256(_CHROMA_FULL_ROWS_DOMAIN + struct.pack(">Q", len(encoded)))
+    for fields in encoded:
+        for field in fields:
+            digest.update(struct.pack(">Q", len(field)) + field)
+    return digest.hexdigest(), len(encoded)
+
+
+def capture_chunk_rows(
+    collection: Any, batch_size: int = 500
+) -> List[ChunkRow]:  # exact id listing + explicit-ID hydration mapped by returned id (B03/D4)
     ids = [str(chunk_id) for chunk_id in (collection.get(include=[]) or {}).get("ids") or []]
     if len(ids) != int(collection.count()) or len(set(ids)) != len(ids):
         raise Fts5MigrationError("snapshot id listing count/duplicate mismatch")
@@ -190,35 +342,106 @@ def capture_chunk_rows(collection: Any, batch_size: int = 500) -> List[ChunkRow]
             i = position_by_id.get(chunk_id)
             if i is None:
                 raise Fts5MigrationError(f"snapshot read missing chunk_id {chunk_id!r}")
-            rows.append((str(chunk_id or ""), str(docs[i] or ""),
-                         str((metas[i] or {}).get("filename") or ""), str((metas[i] or {}).get("category") or "")))
+            rows.append(
+                (
+                    str(chunk_id or ""),
+                    str(docs[i] or ""),
+                    str((metas[i] or {}).get("filename") or ""),
+                    str((metas[i] or {}).get("category") or ""),
+                )
+            )
     return rows
 
 
-def is_credible_v2_marker(payload: Optional[dict], live_row_count: int) -> bool:  # complete schema-v2 marker: strict int generation/counts, matching 64-hex digests
+def is_credible_v2_marker(
+    payload: Optional[dict], live_row_count: int
+) -> bool:  # complete schema-v2 marker: strict int generation/counts, matching 64-hex digests
     if not isinstance(payload, dict):
         return False
     source = payload.get("source_rows_sha256")
-    return (payload.get("schema_version") == MARKER_SCHEMA_VERSION and payload.get("status") == "complete"
-            and _is_uint(payload.get("generation"), 1) and isinstance(source, str)
-            and bool(_HEX64.fullmatch(source)) and source == payload.get("verified_fts_rows_sha256")
-            and _is_uint(payload.get("docs_total")) and _is_uint(payload.get("docs_indexed"))
-            and payload.get("docs_total") == payload.get("docs_indexed") == live_row_count)
+    return (
+        payload.get("schema_version") == MARKER_SCHEMA_VERSION
+        and payload.get("status") == "complete"
+        and _is_uint(payload.get("generation"), 1)
+        and isinstance(source, str)
+        and bool(_HEX64.fullmatch(source))
+        and source == payload.get("verified_fts_rows_sha256")
+        and _is_uint(payload.get("docs_total"))
+        and _is_uint(payload.get("docs_indexed"))
+        and payload.get("docs_total") == payload.get("docs_indexed") == live_row_count
+    )
+
+
+def read_sealed_fts_row_universe(db_path: Path) -> Tuple[str, int]:
+    """Independent read-only recomputation of a sealed FTS5 artifact.
+
+    Opens the database through a SEPARATE read-only SQLite URI connection
+    (never a writer, never WAL) and recomputes the canonical row digest and
+    row count from the ``fts5_documents`` table. Used by the builder (P1-3:
+    sealed-artifact parity check after the write handle is closed) and by
+    serving verification — it shares zero state with any live handle.
+
+    Raises ``Fts5CorruptError`` when the file is missing, unopenable, lacks
+    the table, or contains duplicate chunk_ids.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        raise Fts5CorruptError(f"sealed FTS5 index missing: {path}")
+    uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, check_same_thread=False, timeout=5.0, uri=True)
+    except sqlite3.DatabaseError as exc:
+        raise Fts5CorruptError(f"sealed FTS5 index unopenable: {path}: {exc}") from exc
+    try:
+        try:
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='fts5_documents'"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise Fts5CorruptError(f"sealed FTS5 index unreadable: {path}: {exc}") from exc
+        if table is None:
+            raise Fts5CorruptError(f"sealed FTS5 index lacks the fts5_documents table: {path}")
+        rows: List[ChunkRow] = []
+        last_rowid = 0
+        while True:
+            page = conn.execute(
+                "SELECT rowid, chunk_id, content, filename, category FROM fts5_documents "
+                "WHERE rowid > ? ORDER BY rowid LIMIT 400",
+                (last_rowid,),
+            ).fetchall()
+            if not page:
+                break
+            last_rowid = page[-1][0]
+            rows.extend(tuple(row[1:]) for row in page)
+        try:
+            digest, count = compute_rows_digest(rows)
+        except Fts5MigrationError as exc:
+            raise Fts5CorruptError(f"sealed FTS5 index has duplicate chunk_ids: {path}: {exc}") from exc
+        return digest, count
+    finally:
+        conn.close()
 
 
 class Fts5LexicalIndex:
     """SQLite FTS5 wrapper — search, CRUD sync, and the Package-B content-bound
     generation rebuild (schema-v2 markers; the positional resume path is retired)."""
 
-    def __init__(self, db_path: Path, state_path: Path) -> None:
+    def __init__(self, db_path: Path, state_path: Path, *, read_only: bool = False) -> None:
         self._db_path = Path(db_path)
         self._state_path = Path(state_path)
+        # Phase B (spec C): read_only=True admits a SEALED artifact for serving.
+        self._read_only = bool(read_only)
         # Q2 (TechSpec): dedicated RLock, independent of BM25 build lock.
         self._fts5_lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         self._ready: bool = False
         self._generation = 1  # in-place generation coordination (reset never swaps objects)
-        self._invalidated, self._active_rebuild_gen, self._rollback_snapshot, self._mutation_epoch = False, None, None, 0
+        self._invalidated, self._active_rebuild_gen, self._rollback_snapshot, self._mutation_epoch = (
+            False,
+            None,
+            None,
+            0,
+        )
         self._connect_and_configure()
         self._migration_state = Fts5MigrationState(self._state_path)
         payload = self._migration_state.read()
@@ -254,14 +477,29 @@ class Fts5LexicalIndex:
         with self._fts5_lock:  # flag only; promotion solely via verified rebuild/publication/restore (P1-1/P1-2)
             return self._ready
 
-    def _live_digest(self) -> Optional[Tuple[str, int, int]]:  # (digest, distinct, epoch); short lock holds (Locks §4/P1-B)
+    def _require_writable(self, op: str) -> None:
+        """Refuse every mutation path on a read-only (sealed) artifact.
+
+        The read-only SQLite URI already makes on-disk mutation impossible at
+        the connection level; this guard makes the refusal explicit and
+        immediate for every writer, marker writer, and rebuild entry point.
+        """
+        if self._read_only:
+            raise Fts5MigrationError(f"FTS5 index is open read-only (sealed generation); {op} is forbidden")
+
+    def _live_digest(
+        self,
+    ) -> Optional[Tuple[str, int, int]]:  # (digest, distinct, epoch); short lock holds (Locks §4/P1-B)
         rows, last_rowid, epoch = [], 0, None
         while True:
             with self._fts5_lock:
                 if self._conn is None or epoch not in (None, self._mutation_epoch):
                     return None  # live mutated between pages (P1-B)
                 epoch = self._mutation_epoch
-                page = self._conn.execute("SELECT rowid, chunk_id, content, filename, category FROM fts5_documents WHERE rowid > ? ORDER BY rowid LIMIT 400", (last_rowid,)).fetchall()
+                page = self._conn.execute(
+                    "SELECT rowid, chunk_id, content, filename, category FROM fts5_documents WHERE rowid > ? ORDER BY rowid LIMIT 400",
+                    (last_rowid,),
+                ).fetchall()
             if not page:
                 try:
                     digest, distinct = compute_rows_digest(rows)
@@ -277,7 +515,11 @@ class Fts5LexicalIndex:
         live = self._live_digest()
         return live is not None and live[:2] == (payload["verified_fts_rows_sha256"], payload["docs_total"])
 
-    def verify_and_publish(self, source_digest: str, total: int, generation: int, started_at: Optional[str] = None) -> bool:  # BC-04 exact publisher: live count/distinct/digest must equal the source identity under the current generation
+    def verify_and_publish(
+        self, source_digest: str, total: int, generation: int, started_at: Optional[str] = None
+    ) -> (
+        bool
+    ):  # BC-04 exact publisher: live count/distinct/digest must equal the source identity under the current generation
         try:
             live = self._live_digest()  # paged short lock holds — searches stay responsive (Locks §4)
         except Exception as exc:  # F5: read failure fails the candidate generation closed
@@ -286,11 +528,17 @@ class Fts5LexicalIndex:
         if live is None or live[:2] != (source_digest, total):
             return False
         with self._fts5_lock:
-            if (self._generation != generation or self._conn is None or self.count() != total
-                    or self._mutation_epoch != live[2]):  # P1-B: reject any mutation since the scan
+            if (
+                self._generation != generation
+                or self._conn is None
+                or self.count() != total
+                or self._mutation_epoch != live[2]
+            ):  # P1-B: reject any mutation since the scan
                 return False
             now = datetime.now(timezone.utc).isoformat()
-            if not self._write_v2_marker(generation, "complete", total, total, source_digest, source_digest, started_at or now, now, None):
+            if not self._write_v2_marker(
+                generation, "complete", total, total, source_digest, source_digest, started_at or now, now, None
+            ):
                 return False
             self._ready = True
             self._invalidated = False
@@ -302,16 +550,32 @@ class Fts5LexicalIndex:
             return self.search(query, top_k=top_k) if self._ready else None
 
     def invalidate_generation(self) -> int:
+        self._require_writable("invalidate_generation")
         with self._fts5_lock:  # retire the generation (reset); a blocked worker's late writes go stale
-            self._rollback_snapshot = prior if is_credible_v2_marker((prior := self._migration_state.read()), self.count()) else None
+            self._rollback_snapshot = (
+                prior if is_credible_v2_marker((prior := self._migration_state.read()), self.count()) else None
+            )
             self._generation += 1
             self._ready = False
             self._invalidated = True
-            with suppress(Exception):  # D2 durable; restart stays fail-closed via source compare even if this write fails
-                self._write_v2_marker(self._generation, "invalidated", 0, 0, None, None, datetime.now(timezone.utc).isoformat(), None, None)
+            with suppress(
+                Exception
+            ):  # D2 durable; restart stays fail-closed via source compare even if this write fails
+                self._write_v2_marker(
+                    self._generation,
+                    "invalidated",
+                    0,
+                    0,
+                    None,
+                    None,
+                    datetime.now(timezone.utc).isoformat(),
+                    None,
+                    None,
+                )
             return self._generation
 
     def begin_rebuild(self) -> Optional[int]:
+        self._require_writable("begin_rebuild")
         with self._fts5_lock:  # single-flight admission: None while this generation has a worker
             if self._active_rebuild_gen == self._generation:
                 return None
@@ -327,6 +591,26 @@ class Fts5LexicalIndex:
         """Open the SQLite connection and apply ADR-001 PRAGMAs + schema."""
         try:
             in_memory = str(self._db_path) == ":memory:"
+            if self._read_only:
+                # Sealed-artifact admission (spec C): open the EXISTING database
+                # via a SQLite URI with mode=ro. No mkdir, no WAL pragma, no
+                # schema or probe creation, no commit — the connection cannot
+                # mutate the file, and every writer is refused besides.
+                if in_memory:
+                    raise Fts5CorruptError("read_only=True cannot be used with an in-memory database")
+                if not self._db_path.is_file():
+                    raise Fts5CorruptError(f"FTS5 index missing for read-only open: {self._db_path}")
+                uri = self._db_path.resolve().as_uri() + "?mode=ro"
+                self._conn = sqlite3.connect(
+                    uri,
+                    check_same_thread=False,
+                    timeout=5.0,
+                    uri=True,
+                )
+                cur = self._conn.cursor()
+                cur.execute("PRAGMA busy_timeout=5000")  # connection-local; writes nothing
+                cur.close()
+                return
             if not in_memory:
                 self._db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(
@@ -404,6 +688,83 @@ class Fts5LexicalIndex:
                 finally:
                     self._conn = None
 
+    def admit_existing(self, expected_digest: str, total: int) -> None:
+        """Admit a SEALED FTS5 artifact for read-only serving (spec C).
+
+        Fail-closed validation that writes NOTHING: the ``fts5_documents``
+        table exists; the persisted schema-v2 state marker is credible and
+        ``complete`` with source == verified == ``expected_digest`` and
+        docs_total == ``total`` == live row count; and the canonical live row
+        digest recomputed from the database equals ``expected_digest``. Only
+        then is the in-memory ready flag promoted — sealed bytes are never
+        touched, and no sidecar or marker is created.
+        """
+        if self._conn is None:
+            raise Fts5CorruptError("FTS5 connection is closed")
+        with self._fts5_lock:
+            table = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='fts5_documents'"
+            ).fetchone()
+            if table is None:
+                raise Fts5CorruptError(f"sealed FTS5 index lacks the fts5_documents table: {self._db_path}")
+            payload = self._migration_state.read()
+            if not is_credible_v2_marker(payload, self.count()):
+                raise Fts5CorruptError(
+                    f"sealed FTS5 state marker is not a credible complete schema-v2 marker: {self._state_path}"
+                )
+            if (
+                payload["source_rows_sha256"] != expected_digest
+                or payload["verified_fts_rows_sha256"] != expected_digest
+            ):
+                raise Fts5CorruptError(
+                    "sealed FTS5 digests do not match the generation receipt: marker "
+                    f"{str(payload['source_rows_sha256'])[:12]}... != expected {expected_digest[:12]}..."
+                )
+            if payload["docs_total"] != int(total):
+                raise Fts5CorruptError(
+                    f"sealed FTS5 row count does not match the generation receipt: marker {payload['docs_total']} != expected {total}"
+                )
+        live = self._live_digest()  # paged read, short lock holds
+        if live is None or live[0] != expected_digest or live[1] != int(total):
+            got = "unavailable" if live is None else f"{live[0][:12]}.../{live[1]}"
+            raise Fts5CorruptError(
+                f"sealed FTS5 live row universe does not match the generation receipt: {got} != {expected_digest[:12]}.../{total}"
+            )
+        with self._fts5_lock:
+            self._ready = True  # in-memory promotion only
+
+    def seal_for_publication(self) -> None:
+        """Builder-side sealing (spec C): quiesce WAL, drop to DELETE journal, close.
+
+        After this returns the database is a standalone regular file with NO
+        ``-wal``/``-shm``/``-journal`` sidecars — the generation store's
+        exact-entry sealing rejects them. If a sidecar still exists the seal
+        FAILS loudly; sidecars are never silently deleted. The caller must
+        have already durably written the schema-v2 ``complete`` state marker
+        (``rebuild_content_bound`` does this via ``verify_and_publish``).
+        """
+        self._require_writable("seal_for_publication")
+        if self._conn is None:
+            raise Fts5MigrationError("FTS5 connection is closed")
+        with self._fts5_lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.execute("PRAGMA journal_mode=DELETE")
+                self._conn.commit()
+            except sqlite3.DatabaseError as exc:
+                raise Fts5MigrationError(f"FTS5 seal checkpoint failed: {exc}") from exc
+            finally:
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    finally:
+                        self._conn = None
+        leftovers = [suffix for suffix in ("-wal", "-shm", "-journal") if Path(str(self._db_path) + suffix).exists()]
+        if leftovers:
+            raise Fts5MigrationError(
+                f"FTS5 seal failed: sqlite sidecars still present (they are never deleted): {leftovers}"
+            )
+
     # -----------------------------------------------------------------
     # CRUD sync (Task 05, ADR-008). SQL nativo incremental — diverge do
     # BM25 full-rebuild pattern porque FTS5 tem INSERT/DELETE O(1) e o
@@ -414,6 +775,7 @@ class Fts5LexicalIndex:
 
     def add_document(self, chunk_id: str, content: str, filename: str, category: str) -> None:
         """Insert one chunk row via ``INSERT`` (ADR-008)."""
+        self._require_writable("add_document")
         if self._conn is None:
             raise Fts5CorruptError("FTS5 connection is closed")
         with self._fts5_lock:
@@ -425,6 +787,7 @@ class Fts5LexicalIndex:
 
     def remove_document(self, chunk_id: str) -> None:
         """Delete every row matching ``chunk_id`` (ADR-008)."""
+        self._require_writable("remove_document")
         if self._conn is None:
             raise Fts5CorruptError("FTS5 connection is closed")
         with self._fts5_lock:
@@ -436,6 +799,7 @@ class Fts5LexicalIndex:
 
     def update_document(self, chunk_id: str, content: str, filename: str, category: str) -> None:
         """DELETE + INSERT atomico — FTS5 nao tem UPDATE efficient em virtual table."""
+        self._require_writable("update_document")
         if self._conn is None:
             raise Fts5CorruptError("FTS5 connection is closed")
         with self._fts5_lock:
@@ -446,7 +810,10 @@ class Fts5LexicalIndex:
             )
             self._commit_live()
 
-    def rebuild_content_bound(self, rows: Sequence[ChunkRow], *, generation: Optional[int] = None) -> dict:  # digest -> stage -> read-back -> guarded swap -> publish (T1-T9)
+    def rebuild_content_bound(
+        self, rows: Sequence[ChunkRow], *, generation: Optional[int] = None
+    ) -> dict:  # digest -> stage -> read-back -> guarded swap -> publish (T1-T9)
+        self._require_writable("rebuild_content_bound")
         if self._conn is None:
             raise Fts5MigrationError("FTS5 connection is closed")
         with self._fts5_lock:
@@ -475,25 +842,47 @@ class Fts5LexicalIndex:
         return self._finalize_rebuild(gen, staging, prior, source_digest, verified_digest, total, started_at)
 
     def _populate_staging(self, staging: str, rows: Sequence[ChunkRow], source_digest: str, total: int) -> str:
+        staging_sql = _quote_sql_identifier(staging)
         with self._fts5_lock:  # stage in short lock-held batches; counts alone never suffice (§9)
-            self._conn.execute(f'DROP TABLE IF EXISTS "{staging}"')
-            self._conn.execute(_FTS5_SCHEMA.replace("fts5_documents", f'"{staging}"', 1))
+            # Identifier is internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"DROP TABLE IF EXISTS {staging_sql}")  # nosemgrep
+            self._conn.execute(_FTS5_SCHEMA.replace("fts5_documents", staging_sql, 1))
             self._conn.commit()
-        ordered = sorted((tuple(str(value or "") for value in row) for row in rows), key=lambda row: row[0].encode("utf-8"))  # canonical order (D4)
+        ordered = sorted(
+            (tuple(str(value or "") for value in row) for row in rows), key=lambda row: row[0].encode("utf-8")
+        )  # canonical order (D4)
         for start in range(0, len(ordered), 100):
             with self._fts5_lock:
-                self._conn.executemany(f'INSERT INTO "{staging}" (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)', ordered[start : start + 100])
+                self._conn.executemany(
+                    f"INSERT INTO {staging_sql} (chunk_id, content, filename, category) VALUES (?, ?, ?, ?)",
+                    ordered[start : start + 100],
+                )
                 self._conn.commit()
         with self._fts5_lock:
-            read_back = self._conn.execute(f'SELECT chunk_id, content, filename, category FROM "{staging}"').fetchall()
+            # Identifier is internal and validated by _quote_sql_identifier.
+            read_back = self._conn.execute(  # nosemgrep
+                f"SELECT chunk_id, content, filename, category FROM {staging_sql}"
+            ).fetchall()
         verified_digest, verified_count = compute_rows_digest(read_back)
         if verified_digest != source_digest or verified_count != total:
-            raise Fts5MigrationError(f"staging verification failed: rows {verified_count}/{total}, digest {verified_digest[:12]} != source {source_digest[:12]}")
+            raise Fts5MigrationError(
+                f"staging verification failed: rows {verified_count}/{total}, digest {verified_digest[:12]} != source {source_digest[:12]}"
+            )
         return verified_digest
 
-    def _finalize_rebuild(self, gen: int, staging: str, prior: Optional[dict], source_digest: str,
-                          verified_digest: str, total: int, started_at: str) -> dict:
+    def _finalize_rebuild(
+        self,
+        gen: int,
+        staging: str,
+        prior: Optional[dict],
+        source_digest: str,
+        verified_digest: str,
+        total: int,
+        started_at: str,
+    ) -> dict:
         backup = f"fts5_documents_backup_g{gen}"
+        staging_sql = _quote_sql_identifier(staging)
+        backup_sql = _quote_sql_identifier(backup)
         with self._fts5_lock:  # guarded final transition (T6-T8); a stale generation only cleans its staging
             if self._generation != gen or self._conn is None:
                 self._drop_table_quiet(staging)
@@ -501,8 +890,9 @@ class Fts5LexicalIndex:
             self._drop_table_quiet(backup)  # P1-A: a stale crash backup must never collide
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                self._conn.execute(f'ALTER TABLE fts5_documents RENAME TO "{backup}"')
-                self._conn.execute(f'ALTER TABLE "{staging}" RENAME TO fts5_documents')
+                # Identifiers are internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {backup_sql}")  # nosemgrep
+                self._conn.execute(f"ALTER TABLE {staging_sql} RENAME TO fts5_documents")  # nosemgrep
                 self._commit_live()
             except sqlite3.DatabaseError as exc:
                 with suppress(sqlite3.DatabaseError):
@@ -528,18 +918,26 @@ class Fts5LexicalIndex:
                 self.publish_rebuild_failure(gen, rejected)
             raise rejected
         self._drop_table_quiet(backup)
-        return {"status": "complete", "generation": gen, "docs_indexed": total,
-                "source_rows_sha256": source_digest, "verified_fts_rows_sha256": verified_digest}
+        return {
+            "status": "complete",
+            "generation": gen,
+            "docs_indexed": total,
+            "source_rows_sha256": source_digest,
+            "verified_fts_rows_sha256": verified_digest,
+        }
 
     def _reverse_swap(self, staging: str, backup: str) -> bool:  # atomic prior-table restore, reports outcome (D3)
         with self._fts5_lock:
             return self._reverse_swap_locked(staging, backup)
 
     def _reverse_swap_locked(self, staging: str, backup: str) -> bool:
+        staging_sql = _quote_sql_identifier(staging)
+        backup_sql = _quote_sql_identifier(backup)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            self._conn.execute(f'ALTER TABLE fts5_documents RENAME TO "{staging}"')
-            self._conn.execute(f'ALTER TABLE "{backup}" RENAME TO fts5_documents')
+            # Identifiers are internal and validated by _quote_sql_identifier.
+            self._conn.execute(f"ALTER TABLE fts5_documents RENAME TO {staging_sql}")  # nosemgrep
+            self._conn.execute(f"ALTER TABLE {backup_sql} RENAME TO fts5_documents")  # nosemgrep
             self._commit_live()
             self._drop_table_quiet(staging)
             return True
@@ -548,7 +946,9 @@ class Fts5LexicalIndex:
                 self._conn.rollback()
             return False
 
-    def _restore_prior_or_fail(self, prior: Optional[dict], gen: int, exc: BaseException, current_source: Optional[str]) -> None:
+    def _restore_prior_or_fail(
+        self, prior: Optional[dict], gen: int, exc: BaseException, current_source: Optional[str]
+    ) -> None:
         if self._live_matches(prior) and prior.get("source_rows_sha256") == current_source:  # D3/P1-2
             with self._fts5_lock:
                 restored = self._generation == gen  # F1: generation-guarded restore
@@ -561,26 +961,67 @@ class Fts5LexicalIndex:
         self.publish_rebuild_failure(gen, exc)
 
     def publish_rebuild_failure(self, generation: int, exc: BaseException) -> None:
+        if self._read_only:  # sealed artifacts are never marked, even on failure
+            return
         with self._fts5_lock:  # generation-guarded failed/non-ready publication; stale handlers dropped (T9/B10)
             if self._generation != generation:
                 return
             self._ready = False
-            with suppress(Exception):  # P1-10: sanitized error (class only); a failing writer cannot resurrect readiness
-                self._write_v2_marker(generation, "failed", 0, 0, None, None, datetime.now(timezone.utc).isoformat(), None, exc.__class__.__name__)
+            with suppress(
+                Exception
+            ):  # P1-10: sanitized error (class only); a failing writer cannot resurrect readiness
+                self._write_v2_marker(
+                    generation,
+                    "failed",
+                    0,
+                    0,
+                    None,
+                    None,
+                    datetime.now(timezone.utc).isoformat(),
+                    None,
+                    exc.__class__.__name__,
+                )
 
-    def _write_v2_marker(self, generation: int, status: str, docs_total: int, docs_indexed: int, source_digest: Optional[str],
-                         verified_digest: Optional[str], started_at: Optional[str], completed_at: Optional[str], error: Optional[str]) -> bool:
+    def _write_v2_marker(
+        self,
+        generation: int,
+        status: str,
+        docs_total: int,
+        docs_indexed: int,
+        source_digest: Optional[str],
+        verified_digest: Optional[str],
+        started_at: Optional[str],
+        completed_at: Optional[str],
+        error: Optional[str],
+    ) -> bool:
+        if self._read_only:  # sealed artifacts are never marked
+            return False
         with self._fts5_lock:  # P1-2: shared marker writes are generation-checked under the lock
             if self._generation != int(generation):
                 return False
-            self._migration_state.write({
-                "schema_version": MARKER_SCHEMA_VERSION, "generation": int(generation), "status": status,
-                "docs_total": int(docs_total), "docs_indexed": int(docs_indexed), "started_at": started_at,
-                "source_rows_sha256": source_digest, "verified_fts_rows_sha256": verified_digest,
-                "completed_at": completed_at, "error": error})
+            self._migration_state.write(
+                {
+                    "schema_version": MARKER_SCHEMA_VERSION,
+                    "generation": int(generation),
+                    "status": status,
+                    "docs_total": int(docs_total),
+                    "docs_indexed": int(docs_indexed),
+                    "started_at": started_at,
+                    "source_rows_sha256": source_digest,
+                    "verified_fts_rows_sha256": verified_digest,
+                    "completed_at": completed_at,
+                    "error": error,
+                }
+            )
             return True
 
-    def start_migration_background(self, chunk_iter_factory: Any, docs_total: int, *, resume_from: int = 0, on_progress: Any = None) -> threading.Thread:  # legacy API shim: content-bound rebuild-from-zero; resume_from is call-compat only, never a cursor
+    def start_migration_background(
+        self, chunk_iter_factory: Any, docs_total: int, *, resume_from: int = 0, on_progress: Any = None
+    ) -> (
+        threading.Thread
+    ):  # legacy API shim: content-bound rebuild-from-zero; resume_from is call-compat only, never a cursor
+        self._require_writable("start_migration_background")
+
         def _runner() -> None:
             generation = self.begin_rebuild()
             if generation is None:
@@ -597,6 +1038,7 @@ class Fts5LexicalIndex:
                 print(f"[FTS5] migration failed: {exc.__class__.__name__}")
             finally:
                 self.end_rebuild(generation)
+
         thread = threading.Thread(target=_runner, name="fts5-migration", daemon=True)
         thread.start()
         return thread
@@ -606,7 +1048,9 @@ class Fts5LexicalIndex:
         self._mutation_epoch += 1
 
     def _drop_table_quiet(self, table: str) -> None:  # owner-only staging cleanup (T10)
+        table_sql = _quote_sql_identifier(table)
         with suppress(sqlite3.DatabaseError), self._fts5_lock:
             if self._conn is not None:
-                self._conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                # Identifier is internal and validated by _quote_sql_identifier.
+                self._conn.execute(f"DROP TABLE IF EXISTS {table_sql}")  # nosemgrep
                 self._conn.commit()

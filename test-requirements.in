@@ -1,0 +1,16 @@
+# Test-only dependency input for the ONE full-suite lane (v4.9.0).
+#
+# The controller generates the hash-locked test-requirements.lock from this
+# file with the exact pinned uv (0.12.5). The full-test lane installs the
+# runtime lock FIRST, then this lock on top with --require-hashes, so test
+# tooling can never silently upgrade/downgrade a runtime pin: every overlap
+# resolves to the same hash-pinned version or the install fails loudly.
+#
+# NOTE: pytest-rerunfailures is deliberately ABSENT. There are NO automatic
+# reruns: a rerun is controller-authorized only after a confirmed infra-flake
+# or byte change.
+pytest
+pytest-cov
+hypothesis
+psutil
+pyyaml

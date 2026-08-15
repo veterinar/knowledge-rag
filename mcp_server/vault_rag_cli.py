@@ -178,8 +178,19 @@ async def _search(url: str, query: str, limit: int, method: str) -> dict:
 # and subject-free — no veterinary term appears here, and nothing reads a score.
 _SCAFFOLDING_TOKENS = frozenset({"что", "чем", "чём", "чего", "чему"})
 _SCAFFOLDING_PREFIXES = (
-    "как", "наш", "материал", "сказ", "говор", "рассказ", "расскаж",
-    "информац", "данн", "известн", "описан", "упомян", "упомин",
+    "как",
+    "наш",
+    "материал",
+    "сказ",
+    "говор",
+    "рассказ",
+    "расскаж",
+    "информац",
+    "данн",
+    "известн",
+    "описан",
+    "упомян",
+    "упомин",
 )
 
 
@@ -199,7 +210,7 @@ def _retrieval_query(query: str) -> str:
     folded = stripped.casefold()
     for prefix in _RETRIEVAL_QUESTION_PREFIXES:
         if folded.startswith(prefix):
-            subject = stripped[len(prefix):].strip().strip("?!.,;:")
+            subject = stripped[len(prefix) :].strip().strip("?!.,;:")
             return subject or query
     return query
 
@@ -229,7 +240,7 @@ def _strip_frontmatter(text: str) -> str:
     if text.startswith("---"):
         end = text.find("\n---", 3)
         if 0 < end < 2000:
-            return text[end + 4:]
+            return text[end + 4 :]
     return text
 
 
@@ -384,18 +395,26 @@ def _generate_answer(prompt: str) -> str:
     # --reasoning/--ignore-rules/--source are honored on the chat path
     # (hermes -z oneshot ignores all three — verified in hermes_cli 0.20.0).
     argv = [
-        hermes_bin, "chat",
-        "-q", prompt,
+        hermes_bin,
+        "chat",
+        "-q",
+        prompt,
         "--quiet",
-        "--provider", provider,
-        "--model", model,
-        "--reasoning", "none",
+        "--provider",
+        provider,
+        "--model",
+        model,
+        "--reasoning",
+        "none",
         "--ignore-rules",
-        "--source", "tool",
+        "--source",
+        "tool",
         # context_engine is a valid built-in toolset that enables no external
         # tools here; with --max-turns 1 the model answers in a single turn.
-        "--toolsets", "context_engine",
-        "--max-turns", "1",
+        "--toolsets",
+        "context_engine",
+        "--max-turns",
+        "1",
     ]
     try:
         proc = subprocess.run(
@@ -477,15 +496,19 @@ def main() -> int:
         return 1
     results = payload.get("results") or []
     if status != "success" or not results:
-        message = payload.get("message") or payload.get("error") or f"статус ответа: {status!r}"
-        print(f"Сервер вернул ошибку: {message}", file=sys.stderr)
+        # Stable machine-readable error code FIRST, then the server's safe
+        # message — scripts can grep the code while users still get detail.
+        error = str(payload.get("error") or f"статус ответа: {status!r}")
+        message = str(payload.get("message") or "").strip()
+        detail = f"{error}: {message}" if message else error
+        print(f"Сервер вернул ошибку: {detail}", file=sys.stderr)
         return 1
 
     units = _evidence_units(query, results)
     if not units:
-        answer = ("Ответ по источникам:\n"
-                  "— Подходящих текстовых фрагментов выделить не удалось; "
-                  "см. список источников ниже.")
+        answer = (
+            "Ответ по источникам:\n— Подходящих текстовых фрагментов выделить не удалось; см. список источников ниже."
+        )
         _render(answer, results, len(results))
         return 0
 

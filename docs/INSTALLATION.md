@@ -123,8 +123,21 @@ claude mcp add knowledge-rag -s user -- ~/knowledge-rag/venv/bin/python -m mcp_s
 git clone https://github.com/lyonzin/knowledge-rag.git ~/knowledge-rag
 cd ~/knowledge-rag
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+# Production install — build the EXACT wheel with the hash-locked build
+# toolchain, then install that wheel. `pip install .` is NOT a wheel
+# install (it lets pip resolve deps); never use it for production.
+pip install --require-hashes -r build-requirements.lock
+python -m build --no-isolation --wheel --outdir dist/
+pip install --require-hashes -r requirements.lock
+pip install --no-deps dist/*.whl
+pip check
 ```
+
+> The runtime always imports the **installed package bytes**. When running
+> from a clone, prefer the exact-wheel install above — the source tree is
+> for development, and a CWD source shadow can silently differ from the
+> locked environment. The ranged `requirements.txt` is a contribution
+> list, never a production install input.
 
 Then configure Claude Code:
 

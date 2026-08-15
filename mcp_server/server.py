@@ -23,6 +23,7 @@ Versao:  3.5.2
 Data:    2026-04-16
 """
 
+import copy
 import hashlib
 import json
 import math
@@ -35,7 +36,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -63,6 +64,13 @@ from watchdog.observers import Observer
 from . import __version__
 from .config import config
 from .fts5_index import Fts5LexicalIndex, Fts5NotReadyError, capture_chunk_rows, compute_rows_digest
+from .generations import (
+    FTS_ARTIFACT,
+    FTS_STATE_ARTIFACT,
+    METADATA_ARTIFACT,
+    GenerationError,
+    GenerationStore,
+)
 from .ingestion import Document, DocumentParser
 from .metrics import (
     FAST_PATH_ERRORS_TOTAL,
@@ -135,7 +143,12 @@ class QueryCache:
         hybrid_alpha: float,
         search_method: str = "auto",
     ) -> Optional[Any]:
-        """Get cached result if exists and not expired"""
+        """Get cached result if exists and not expired.
+
+        Returns a deep copy: callers (e.g. snippet_mode truncation in the
+        search_knowledge wrapper) mutate result dicts in place, and those
+        mutations must never corrupt the stored cache entry.
+        """
         key = self._make_key(query, max_results, category, hybrid_alpha, search_method)
 
         with self._lock:
@@ -144,7 +157,7 @@ class QueryCache:
                 if time.time() - timestamp < self.ttl_seconds:
                     self._cache.move_to_end(key)
                     self._hits += 1
-                    return result
+                    return copy.deepcopy(result)
                 else:
                     del self._cache[key]
 
@@ -165,12 +178,16 @@ class QueryCache:
         ``search_method`` is appended (with default ``"auto"``) rather than
         inserted before ``result`` so pre-v4.8.2 positional callers keep
         working — the FTS5 dispatch passes it as a keyword argument.
+
+        Stores a deep copy: the caller keeps ownership of the object it
+        passed, so later in-place mutations (snippet truncation, score
+        filtering rewrites) cannot poison the cache.
         """
         key = self._make_key(query, max_results, category, hybrid_alpha, search_method)
         with self._lock:
             if len(self._cache) >= self.max_size:
                 self._cache.popitem(last=False)
-            self._cache[key] = (time.time(), result)
+            self._cache[key] = (time.time(), copy.deepcopy(result))
 
     def invalidate(self) -> None:
         """Clear entire cache (call after reindex)"""
@@ -518,12 +535,18 @@ class FastEmbedEmbeddings:
         self.model_name = model or config.embedding_model
         self._dim = config.embedding_dim
         # Build kwargs once; defer the heavy TextEmbedding(**kwargs) call to first use.
-        self._init_kwargs = {"model_name": self.model_name, "cache_dir": str(config.models_cache_dir)}
+        # Value type is Any: versioned mode adds local_files_only(bool) and
+        # specific_model_path(str) kwargs (fastembed 0.8.0).
+        self._init_kwargs: Dict[str, Any] = {
+            "model_name": self.model_name,
+            "cache_dir": str(config.models_cache_dir),
+        }
         # v4.8.0+: tri-state mode drives the load routing. Legacy bool alias kept for BC.
         self._gpu_mode = getattr(config, "gpu_mode", "auto")
         self._gpu = bool(config.gpu_acceleration)
         self._model: Optional[TextEmbedding] = None
         self._load_lock = threading.Lock()
+        self._versioned_artifact_dir: Optional[Path] = None
         # Sticky failure flag: once load fails, subsequent calls re-raise immediately
         # instead of looping through download/retry. Same pattern as CrossEncoderReranker.
         self._load_failed: Optional[Exception] = None
@@ -608,11 +631,69 @@ class FastEmbedEmbeddings:
         self._print_gpu_banner(status=gpu_status, mode="forced-cuda-fallback")
 
     def _load_with_providers(self, providers: List[str], label: str) -> None:
-        """Instantiate TextEmbedding with the given ONNX providers list."""
+        """Instantiate TextEmbedding with the given ONNX providers list.
+
+        Versioned mode (P0 #5/A): the model bytes the loader opens are
+        exactly the bytes the receipt binds. FastEmbed 0.8.0 natively
+        supports offline exact-path admission:
+
+        - ``specific_model_path`` pins the top-level artifact DIRECTORY the
+          loader reads (never an ONNX file/subdir, never an inferred cache
+          name).
+        - ``local_files_only=True`` makes any fetch attempt fail loudly.
+
+        The configured exact directory's tree digest is verified BEFORE the
+        load and again AFTER the load against the pinned digest, so the
+        loader cannot have admitted different bytes than the receipt names.
+        Any absence/drift/load failure raises — retrieval blocks.
+        """
         kwargs = dict(self._init_kwargs)
         kwargs["providers"] = providers
+        if _versioned_mode():
+            from . import generations as gens
+
+            artifact = getattr(config, "embedding_artifact_path", None)
+            if not artifact:
+                raise EmbeddingModelLoadError(
+                    "versioned mode requires models.embedding.artifact_path "
+                    "(exact local model artifact directory; fail-closed)"
+                )
+            artifact_path = Path(str(artifact))
+            if artifact_path.is_symlink() or not artifact_path.is_dir():
+                raise EmbeddingModelLoadError(
+                    "versioned embedding artifact must be a materialized local "
+                    "directory (symlink forests from HF caches are rejected — "
+                    "materialize a real copy; see docs/reindex-operations.md)"
+                )
+            pinned = (config.generation_compatibility() or {}).get("model_artifact_sha256")
+            try:
+                observed, _entries = gens.digest_tree(artifact_path)
+            except Exception as exc:
+                raise EmbeddingModelLoadError(f"versioned embedding artifact unreadable: {exc}") from exc
+            if pinned and observed != pinned:
+                raise EmbeddingModelLoadError(
+                    "versioned embedding artifact digest drift: expected "
+                    f"{pinned[:12]}..., observed {observed[:12]}... — retrieval blocked"
+                )
+            kwargs["local_files_only"] = True
+            kwargs["specific_model_path"] = str(artifact_path)
+            self._versioned_artifact_dir = artifact_path
         print(f"[INFO] Loading embedding model: {self.model_name} ({self._dim}D) [{label}]...")
         self._model = TextEmbedding(**kwargs)
+        if _versioned_mode():
+            from . import generations as gens
+
+            artifact_path = self._versioned_artifact_dir
+            if artifact_path is not None:
+                try:
+                    after, _entries = gens.digest_tree(artifact_path)
+                except Exception as exc:
+                    raise EmbeddingModelLoadError(f"versioned embedding artifact unreadable after load: {exc}") from exc
+                pinned = (config.generation_compatibility() or {}).get("model_artifact_sha256")
+                if pinned and after != pinned:
+                    raise EmbeddingModelLoadError(
+                        "versioned embedding artifact changed during load — retrieval blocked"
+                    )
         print(f"[INFO] Embedding model loaded successfully [{label}]")
 
     @staticmethod
@@ -732,6 +813,13 @@ class CrossEncoderReranker:
     Dramatically improves precision over bi-encoder retrieval alone.
 
     Model: Xenova/ms-marco-MiniLM-L-6-v2 (ONNX, ~25MB)
+
+    Versioned mode (P0 #9): the ``enabled`` switch is IDENTITY. When enabled,
+    the EXACT local artifact is REQUIRED — absence or load failure raises
+    :class:`RerankerUnavailableError` so retrieval fails closed; an enabled
+    reranker is NEVER silently turned into RRF order. When disabled, the
+    disabled state itself is identity (recorded in the config digest) and the
+    reranker never loads. Legacy mode keeps best-effort behavior byte-for-byte.
     """
 
     def __init__(self, model: str = None):
@@ -740,16 +828,46 @@ class CrossEncoderReranker:
         self._load_failed = False
 
     def _ensure_model(self) -> bool:
-        """Lazy initialization of cross-encoder model"""
+        """Lazy initialization of cross-encoder model.
+
+        Returns True when the model is loaded. In versioned mode with the
+        reranker ENABLED, any failure raises :class:`RerankerUnavailableError`
+        (fail-closed, P0 #9) instead of degrading to RRF order.
+        """
         if self._load_failed:
             return False
         if self._model is None:
+            if _versioned_mode() and not _versioned_reranker_gate():
+                # Config-disabled (or artifact missing while enabled — the
+                # identity digest already flags that as drift): deterministic
+                # disable, no load attempt, no download.
+                print(
+                    "[RERANKER] Disabled in versioned mode (no admitted local artifact "
+                    "or reranker disabled in config); serving RRF order by configuration"
+                )
+                self._load_failed = True  # sticky: decided once, stays decided
+                return False
             print(f"[INFO] Loading reranker model: {self.model_name}...")
             try:
-                self._model = TextCrossEncoder(model_name=self.model_name, cache_dir=str(config.models_cache_dir))
+                rerank_kwargs: Dict[str, Any] = {
+                    "model_name": self.model_name,
+                    "cache_dir": str(config.models_cache_dir),
+                }
+                if _versioned_mode():
+                    artifact = getattr(config, "reranker_local_artifact", None)
+                    if artifact:
+                        # FastEmbed 0.8.0 exact offline admission (P0 #9/A):
+                        # specific_model_path pins the top-level artifact
+                        # DIRECTORY; local_files_only forbids any fetch. The
+                        # logical registered name is preserved in model_name.
+                        rerank_kwargs["local_files_only"] = True
+                        rerank_kwargs["specific_model_path"] = str(Path(str(artifact)).resolve())
+                self._model = TextCrossEncoder(**rerank_kwargs)
                 print("[INFO] Reranker model loaded successfully")
             except Exception as e:
                 self._load_failed = True
+                if _versioned_mode() and config.reranker_enabled:
+                    raise RerankerUnavailableError(f"versioned reranker load failed (enabled in config): {e}") from e
                 print(f"[WARN] Reranker unavailable, using RRF order: {e}")
                 return False
         return True
@@ -765,11 +883,20 @@ class CrossEncoderReranker:
 
         Returns:
             Reranked list of documents, sorted by cross-encoder score (top_k)
+
+        Raises:
+            RerankerUnavailableError: versioned mode, reranker enabled, and
+                the exact artifact could not be loaded (fail-closed, P0 #9).
         """
         if not documents or not config.reranker_enabled:
             return documents[:top_k]
 
         if not self._ensure_model():
+            if _versioned_mode() and config.reranker_enabled and not _versioned_reranker_gate():
+                raise RerankerUnavailableError(
+                    "versioned reranker required by config but no admitted local artifact "
+                    "(set models.reranker.local_artifact)"
+                )
             return documents[:top_k]
 
         texts = [doc.get("document", "") for doc in documents]
@@ -780,6 +907,8 @@ class CrossEncoderReranker:
                 doc["reranker_score"] = float(score)
             documents.sort(key=lambda x: x.get("reranker_score", 0), reverse=True)
         except Exception as e:
+            if _versioned_mode() and config.reranker_enabled:
+                raise RerankerUnavailableError(f"versioned reranker failed: {e}") from e
             print(f"[WARN] Reranker failed, using RRF order: {e}")
 
         return documents[:top_k]
@@ -810,6 +939,35 @@ def _metadata_path_score(query: str, metadata: Dict[str, Any]) -> float:
         score += 0.0012
 
     return min(score, 0.003)
+
+
+def _expected_path_matches(expected: str, source: str) -> bool:
+    """Lexical boundary match of an evaluation ``expected_filepath`` vs a source.
+
+    Purely lexical — no filesystem resolution. Backslashes are normalized to
+    "/" so Windows-style expected paths work. Rules:
+
+    - ABSOLUTE expected path — POSIX leading "/", Windows drive-absolute
+      (``C:/...``), or UNC (``//server/share/...``) — requires exact
+      normalized lexical equality.
+    - Relative expected path: matches when the source equals it OR ends with
+      ``"/" + expected``. ``security/a.md`` therefore matches
+      ``/corpus/security/a.md`` but NOT ``not-a.md`` (no substring) nor
+      ``a.md.bak`` (no trailing-extension bleed) nor ``mysecurity/a.md``
+      (boundary must be a real "/").
+    """
+    exp = (expected or "").replace("\\", "/")
+    src = (source or "").replace("\\", "/")
+    if not exp or not src:
+        return False
+    is_absolute = (
+        exp.startswith("/")
+        or re.match(r"^[A-Za-z]:/", exp) is not None  # Windows drive-absolute
+        or exp.startswith("//")  # UNC (covered by "/" but kept explicit)
+    )
+    if is_absolute:
+        return src == exp
+    return src == exp or src.endswith("/" + exp)
 
 
 # =============================================================================
@@ -1109,9 +1267,7 @@ class DocumentWatcher(FileSystemEventHandler):
         behind a dead unstarted object (corrective 6).
         """
         if self._scheduler is None and not self._stopped:
-            thread = threading.Thread(
-                target=self._scheduler_loop, name="knowledge-rag-watcher", daemon=True
-            )
+            thread = threading.Thread(target=self._scheduler_loop, name="knowledge-rag-watcher", daemon=True)
             thread.start()
             self._scheduler = thread
 
@@ -1222,10 +1378,7 @@ class DocumentWatcher(FileSystemEventHandler):
                 self._merge_retry(batch)
                 return
             if stats.get("errors", 0) > 0:
-                print(
-                    f"[WATCHER] Reindex completed with {stats['errors']} error(s), "
-                    "retrying changed paths later"
-                )
+                print(f"[WATCHER] Reindex completed with {stats['errors']} error(s), retrying changed paths later")
                 self._merge_retry(batch)
                 return
             with self._cond:
@@ -1280,6 +1433,680 @@ class DocumentWatcher(FileSystemEventHandler):
 _SKIP_DOC = object()
 
 
+# =============================================================================
+# Versioned-generation mode helpers (Phase B). Legacy mode (the default) never
+# enters these paths: every guard is keyed on config.index_mode == "versioned".
+# =============================================================================
+
+
+def _versioned_mode() -> bool:
+    """True when this process runs against sealed, immutable generations."""
+    return getattr(config, "index_mode", "legacy") == "versioned"
+
+
+def _versioned_read_only() -> bool:
+    """True when serving a sealed generation (versioned AND not building)."""
+    return _versioned_mode() and not getattr(config, "generation_build", False)
+
+
+# Stable, secret-free reason codes surfaced by get_index_stats while stale or
+# not ready. NEVER include paths, document text, credentials, or provider
+# payloads — only the code plus expected/observed digest/count pairs.
+DRIFT_REASON_POINTER_CHANGED = "restart_required_pointer_changed"
+DRIFT_REASON_POINTER_MISSING = "restart_required_pointer_missing"
+DRIFT_REASON_POINTER_INVALID = "restart_required_pointer_invalid"
+DRIFT_REASON_ENVIRONMENT_CHANGED = "restart_required_environment_changed"
+DRIFT_REASON_BACKEND_DRIFT = "restart_required_backend_drift"
+
+_INDEX_NOT_READY_CODES = frozenset(
+    {
+        DRIFT_REASON_POINTER_CHANGED,
+        DRIFT_REASON_POINTER_MISSING,
+        DRIFT_REASON_POINTER_INVALID,
+        DRIFT_REASON_ENVIRONMENT_CHANGED,
+        DRIFT_REASON_BACKEND_DRIFT,
+    }
+)
+
+
+class _IndexStaleError(RuntimeError):
+    """Raised (and caught at the MCP boundary) when the pinned generation's
+    identity no longer holds. Carries a stable reason code plus safe
+    expected/observed detail; retrieval MUST fail closed on it."""
+
+    def __init__(self, reason: str, detail: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail or {}
+
+    def safe_payload(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"reason": self.reason, "restart_required": True}
+        out.update(self.detail)
+        return out
+
+    def safe_payload_json(self) -> str:
+        import json as _json
+
+        return _json.dumps(self.safe_payload(), sort_keys=True)
+
+
+class RerankerUnavailableError(RuntimeError):
+    """Versioned mode, reranker ENABLED in config, but the exact pinned
+    artifact is missing or failed to load (P0 #9). Retrieval fails closed —
+    an enabled reranker must never silently degrade to RRF order."""
+
+
+def _retrieval_environment_digests() -> Dict[str, Any]:
+    """Current secret-free environment identity (recomputed on demand).
+
+    Only non-sensitive digests/counts; used both for pinning and for the
+    per-access drift recheck. Raises on artifact/path problems — callers
+    translate that into a stable stale reason.
+    """
+    from . import generations as gens
+
+    ident = gens.retrieval_config_digest(config)
+    compat = config.generation_compatibility() or {}
+    # v4.9.0: the runtime drift recheck enforces the SAME lock/installed
+    # version parity + self-version parity the generation builder sealed.
+    gens.verify_runtime_dependency_parity()
+    record_digest, _versions, _checked = gens.installed_runtime_record_evidence()
+    return {
+        "retrieval_config_sha256": ident,
+        "code_sha256": gens.code_identity(),
+        "installed_record_sha256": record_digest,
+        "dependency_lock_sha256": gens.dependency_lock_evidence()[0],
+        "model_artifact_sha256": compat.get("model_artifact_sha256"),
+    }
+
+
+def _versioned_read_only_error(op: str) -> Optional[str]:
+    """Stable JSON envelope for a mutating tool called in versioned serving mode.
+
+    Returned BEFORE any orchestrator/file/network work so a sealed generation
+    can never be mutated through the MCP surface. Tool names stay registered.
+    """
+    if not _versioned_read_only():
+        return None
+    return json.dumps(
+        {
+            "status": "error",
+            "error": "offline_generation_required",
+            "message": (
+                f"{op} is disabled: the server serves the sealed generation "
+                f"{config.active_generation_id} read-only. Build a new generation "
+                "with `knowledge-rag-generation build`; activating it requires a restart."
+            ),
+            "generation_id": config.active_generation_id,
+            "restart_required": True,
+        },
+        indent=2,
+    )
+
+
+def _generation_source_value(source: Any) -> str:
+    """Source metadata value: POSIX-relative under documents_dir in versioned mode.
+
+    Absolute elsewhere (legacy stays byte-identical). Relative sources survive
+    the ``.building-<id>`` -> ``generations/<id>`` rename; serving resolves
+    them under the bound (sealed) documents_dir. Escapes are rejected.
+    """
+    src = str(source)
+    if not _versioned_mode():
+        return src
+    base = Path(config.documents_dir).resolve()
+    p = Path(src)
+    resolved = (p if p.is_absolute() else base / p).resolve()
+    if resolved == base or base not in resolved.parents:
+        raise RuntimeError(f"document source escapes documents_dir: {src}")
+    return resolved.relative_to(base).as_posix()
+
+
+def _pin_versioned_generation() -> Any:
+    """Versioned startup: verify + bind ONE generation for the process lifetime.
+
+    Degraded, never abort (P0 #8): a missing/invalid/stale current records a
+    stable reason on ``config`` and returns ``None`` — the server still starts
+    so ``get_index_stats`` can report the safe reason, while EVERY retrieval
+    entry point fails closed with ``retrieval_blocked``. Nothing is created
+    and no Chroma/SQLite handle opens before verification.
+
+    On success the pin re-verifies the content-bound environment identities
+    (sealed corpus manifest, fresh secret-free retrieval-config digest, exact
+    local model artifact + model-config identities, chunking identity,
+    installed RECORD digest, dependency-lock digest) and the Chroma/FTS row
+    universes, then snapshots them for the per-access recheck.
+    """
+    expected = None
+    if config.active_generation_id and config.active_receipt_sha256:
+        expected = {
+            "generation_id": config.active_generation_id,
+            "receipt_sha256": config.active_receipt_sha256,
+        }
+    try:
+        store = GenerationStore(config.data_dir, create=False)
+        current = store.require_current(
+            expected_identity=expected,
+            expected_compatibility=config.generation_compatibility(),
+        )
+    except GenerationError as exc:
+        reason = (
+            DRIFT_REASON_POINTER_MISSING if "current pointer is missing" in str(exc) else DRIFT_REASON_POINTER_INVALID
+        )
+        object.__setattr__(config, "_pin_failure", {"reason": reason, "detail": {}})
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
+        return None
+    # Content-bound environment verification against the receipt (P0).
+    try:
+        env_fail = _verify_pinned_environment(current)
+    except GenerationError as exc:
+        # dependency_unverifiable and friends: stable degraded state, never
+        # an aborted startup (P0 #10).
+        reason = getattr(exc, "reason_code", None) or DRIFT_REASON_POINTER_INVALID
+        object.__setattr__(config, "_pin_failure", {"reason": reason, "detail": {}})
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
+        return None
+    if env_fail is not None:
+        object.__setattr__(config, "_pin_failure", env_fail.safe_payload())
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({env_fail.reason})")
+        return None
+    # Backend row universes must still match the receipt bytes.
+    try:
+        backend_fail = _verify_pinned_backends(current)
+    except GenerationError as exc:
+        reason = getattr(exc, "reason_code", None) or DRIFT_REASON_POINTER_INVALID
+        object.__setattr__(config, "_pin_failure", {"reason": reason, "detail": {}})
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
+        return None
+    if backend_fail is not None:
+        object.__setattr__(config, "_pin_failure", backend_fail.safe_payload())
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({backend_fail.reason})")
+        return None
+    config.bind_generation(current)
+    # Snapshot the pinned environment identity for per-access rechecks —
+    # failure to store the snapshot is itself a drift condition (never
+    # silently skipped: the recheck would be quietly disabled).
+    try:
+        object.__setattr__(config, "_pinned_environment_digests", _retrieval_environment_digests())
+    except GenerationError as exc:
+        reason = getattr(exc, "reason_code", None) or DRIFT_REASON_ENVIRONMENT_CHANGED
+        object.__setattr__(config, "_pin_failure", {"reason": reason, "detail": {}})
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({reason})")
+        return None
+    print(
+        f"[GENERATION] pinned {current.generation_id} "
+        f"(receipt {current.receipt_sha256[:12]}...) — query-only for this process"
+    )
+    return current
+
+
+def _pinned_env_snapshot() -> Optional[Dict[str, Any]]:
+    """The environment digests captured at pin time (None when unpinned)."""
+    return getattr(config, "_pinned_environment_digests", None)
+
+
+def _digest_mismatch_detail(field: str, expected: Any, observed: Any) -> Dict[str, Any]:
+    """Safe expected/observed pair: digests truncated to 12 hex chars."""
+
+    def _short(value: Any) -> Any:
+        text = value if isinstance(value, str) else ("" if value is None else str(value))
+        return text[:12] + "..." if len(text) > 12 else (text or None)
+
+    return {"field": field, "expected": _short(expected), "observed": _short(observed)}
+
+
+def _verify_pinned_environment(current: Any) -> Optional[_IndexStaleError]:
+    """Recompute and compare every applicable environment identity.
+
+    Returns a stale error carrying a SAFE detail payload, or None when every
+    identity matches the pinned receipt.
+    """
+    from . import generations as gens
+
+    receipt_identity = (current.receipt or {}).get("identity") or {}
+    try:
+        env = _retrieval_environment_digests()
+        corpus_digest, _count = gens.corpus_manifest(
+            current.generation_dir / gens.CORPUS_ARTIFACT,
+            supported_suffixes=set(config.supported_formats or []),
+            exclude_patterns=list(getattr(config, "exclude_patterns", None) or []),
+        )
+        chunking = gens.chunking_identity(config)
+        model_config = _model_config_identity()
+    except gens.DependencyUnverifiableError:
+        raise  # stable dependency_unverifiable — propagates to degraded mode
+    except Exception:
+        return _IndexStaleError(
+            DRIFT_REASON_ENVIRONMENT_CHANGED,
+            {"field": "environment_unreadable"},
+        )
+    checks = (
+        ("corpus_manifest_sha256", receipt_identity.get("corpus_manifest_sha256"), corpus_digest),
+        ("retrieval_config_sha256", receipt_identity.get("retrieval_config_sha256"), env["retrieval_config_sha256"]),
+        ("code_sha256", receipt_identity.get("code_sha256"), env["code_sha256"]),
+        ("installed_record_sha256", receipt_identity.get("installed_record_sha256"), env["installed_record_sha256"]),
+        ("dependency_lock_sha256", receipt_identity.get("dependency_lock_sha256"), env["dependency_lock_sha256"]),
+        ("model_artifact_sha256", receipt_identity.get("model_artifact_sha256"), env["model_artifact_sha256"]),
+        ("model_config_sha256", receipt_identity.get("model_config_sha256"), model_config),
+        ("chunking_sha256", receipt_identity.get("chunking_sha256"), chunking),
+    )
+    for check_name, expected, observed in checks:
+        if expected != observed:
+            return _IndexStaleError(
+                DRIFT_REASON_ENVIRONMENT_CHANGED,
+                _digest_mismatch_detail(check_name, expected, observed),
+            )
+    return None
+
+
+def _verify_pinned_backends(current: Any) -> Optional[_IndexStaleError]:
+    """Recompute Chroma + FTS row universes and require receipt parity.
+
+    The FTS recomputation runs through the independent read-only sealed
+    reader (never a writer handle, never WAL); Chroma is counted/digested
+    through a read-only persistent client on the sealed tree.
+
+    Parity is COMMON-FIELD ONLY (P0 #5): Chroma's COMPLETE digest (ids,
+    documents, embeddings, normalized full metadata) is compared against
+    its own receipt key; the FTS digest is compared against BOTH the FTS
+    receipt keys AND Chroma's ``common_row_digest`` — never against
+    Chroma's complete digest, which is intentionally unlike by design.
+    Backend generation IDs are recomputed from the sealed artifact trees
+    and compared against the receipt values the validator binds.
+    """
+    import hashlib as _hashlib
+
+    from . import generations as gens
+    from .fts5_index import (
+        capture_chunk_rows,
+        capture_full_chunk_rows,
+        compute_full_rows_digest,
+        compute_rows_digest,
+        read_sealed_fts_row_universe,
+    )
+
+    receipt = current.receipt or {}
+    chroma_ev = (receipt.get("backends") or {}).get("chroma") or {}
+    fts_ev = (receipt.get("backends") or {}).get("fts5") or {}
+    expected_full_digest = chroma_ev.get("row_digest")
+    expected_common_digest = chroma_ev.get("common_row_digest")
+    expected_count = chroma_ev.get("row_count")
+
+    # FTS: independent read-only open (P1-3).
+    try:
+        fts_digest, fts_count = read_sealed_fts_row_universe(current.generation_dir / gens.FTS_ARTIFACT)
+    except Exception:
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("fts5_row_digest", fts_ev.get("row_digest"), None),
+        )
+    if fts_digest != fts_ev.get("row_digest") or fts_count != fts_ev.get("row_count"):
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("fts5_row_digest", fts_ev.get("row_digest"), fts_digest),
+        )
+    if fts_ev.get("row_digest") != fts_ev.get("source_digest") or fts_ev.get("row_digest") != fts_ev.get(
+        "verified_digest"
+    ):
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("fts5_self_parity", fts_ev.get("row_digest"), fts_ev.get("verified_digest")),
+        )
+
+    # Chroma: read-only persistent client, no mutation surface. BOTH the
+    # complete and the common row universes are recomputed from sealed bytes.
+    # The locally opened client is closed IMMEDIATELY after the row
+    # universes are captured — before any digest_tree call or mismatch
+    # return — so no second client reference stays alive while the
+    # long-lived orchestrator exists. A close failure fails CLOSED as
+    # backend drift with a sanitized reason (flag + post-block return; a
+    # return inside finally would swallow in-flight exceptions).
+    client = None
+    close_failed = False
+    try:
+        client = chromadb.PersistentClient(path=str(current.generation_dir / gens.CHROMA_ARTIFACT))
+        collection = client.get_collection(name=str(chroma_ev.get("collection_name")))
+        common_rows = capture_chunk_rows(collection)
+        full_rows = capture_full_chunk_rows(collection)
+    except Exception:
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("chroma_row_digest", expected_full_digest, None),
+        )
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                close_failed = True
+    if close_failed:
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("chroma_row_digest", expected_full_digest, None),
+        )
+    common_digest, _common_count = compute_rows_digest(common_rows)
+    full_digest, full_count = compute_full_rows_digest(full_rows)
+    if full_digest != expected_full_digest or full_count != expected_count:
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("chroma_row_digest", expected_full_digest, full_digest),
+        )
+    if common_digest != expected_common_digest:
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("chroma_common_row_digest", expected_common_digest, common_digest),
+        )
+    unique_ids = {row[0] for row in common_rows}
+    if (
+        len(unique_ids) != full_count
+        or full_count != chroma_ev.get("unique_id_count")
+        or full_count != chroma_ev.get("hydrated_id_count")
+    ):
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("chroma_id_universe", expected_count, len(unique_ids)),
+        )
+    # COMMON-only cross-backend parity (never complete-vs-complete).
+    if common_digest != fts_digest or full_count != fts_count:
+        return _IndexStaleError(
+            DRIFT_REASON_BACKEND_DRIFT,
+            _digest_mismatch_detail("backend_common_parity", fts_digest, common_digest),
+        )
+
+    # Backend generation IDs are bound to the sealed artifact digests; any
+    # byte change in either backend flips them. Derivation MUST match the
+    # builder/publish side exactly: canonical TREE digest for the chroma_db
+    # directory, canonical FILE digest for the regular-file FTS artifact.
+    for kind, artifact, ev, digest in (
+        ("chroma", gens.CHROMA_ARTIFACT, chroma_ev, full_digest),
+        ("fts5", gens.FTS_ARTIFACT, fts_ev, fts_digest),
+    ):
+        try:
+            artifact_path = current.generation_dir / artifact
+            if kind == "chroma":
+                artifact_sha, _n = gens.digest_tree(artifact_path)
+            else:
+                artifact_sha = gens._sha256_file(artifact_path)
+            recomputed = _hashlib.sha256(f"{kind}:{artifact_sha}:{digest}".encode("utf-8")).hexdigest()
+        except Exception:
+            return _IndexStaleError(
+                DRIFT_REASON_BACKEND_DRIFT,
+                _digest_mismatch_detail(f"{kind}_backend_generation_id", ev.get("backend_generation_id"), None),
+            )
+        if recomputed != ev.get("backend_generation_id"):
+            return _IndexStaleError(
+                DRIFT_REASON_BACKEND_DRIFT,
+                _digest_mismatch_detail(f"{kind}_backend_generation_id", ev.get("backend_generation_id"), recomputed),
+            )
+    return None
+
+
+def _model_config_identity() -> str:
+    """Effective model-config identity (delegates to the ONE shared builder
+    in generations.py so builder, startup and per-request gate agree)."""
+    from . import generations as gens
+
+    return gens.model_config_identity(config)
+
+
+def _versioned_stale_state() -> Optional[_IndexStaleError]:
+    """Current staleness of the pinned generation, or None when healthy.
+
+    Per-access recheck (P0 #8/#9), ordered cheap-to-expensive:
+
+    1. Pin failure recorded at startup -> always stale (degraded mode).
+    2. Pointer identity + FULL receipt verification via ``require_current``:
+       reads the exact receipt the POINTER names, hashes it, parses it, and
+       verifies schema/compatibility cross-binding AND every artifact digest
+       against disk — then requires it equals the process pin. A rewritten
+       receipt can never smuggle in new self-declared expectations because
+       its sha256 must equal the pinned one AND every artifact must still
+       hash to the receipt's recorded values.
+    3. Environment digests: live corpus content manifest vs receipt,
+       retrieval-config, code, installed RECORD, dependency lock, model
+       artifact/config, chunking. Any drift -> stale. A HEAD-only vault
+       change never appears here (provenance is not identity).
+    4. Backend row universes: independent FTS recompute + full Chroma row
+       universe, recomputed per access and compared to the receipt evidence.
+
+    Read-only; never rebinds; never serves partial results.
+    """
+    if not _versioned_read_only():
+        return None
+    pin_failure = getattr(config, "_pin_failure", None)
+    if pin_failure:
+        return _IndexStaleError(
+            pin_failure.get("reason", DRIFT_REASON_POINTER_INVALID), pin_failure.get("detail") or {}
+        )
+    if not getattr(config, "active_generation_id", None):
+        return _IndexStaleError(DRIFT_REASON_POINTER_MISSING, {})
+    try:
+        store = GenerationStore(config.data_dir, create=False)
+        identity = store.current_identity()
+    except (GenerationError, OSError, ValueError):
+        return _IndexStaleError(DRIFT_REASON_POINTER_INVALID, {})
+    if identity is None:
+        return _IndexStaleError(DRIFT_REASON_POINTER_MISSING, {})
+    if identity.get("generation_id") != config.active_generation_id or (
+        identity.get("receipt_sha256") != config.active_receipt_sha256
+    ):
+        return _IndexStaleError(
+            DRIFT_REASON_POINTER_CHANGED,
+            _digest_mismatch_detail("receipt_sha256", config.active_receipt_sha256, identity.get("receipt_sha256")),
+        )
+    # Full receipt + artifact-hash verification of the EXACT receipt the
+    # pointer names (not a reopened/mutable one), under the store's shared
+    # lock. Malformed JSON/Unicode/schema -> GenerationError -> stale.
+    try:
+        current = store.require_current(
+            expected_identity=identity,
+            expected_compatibility=None,
+        )
+    except GenerationError:
+        return _IndexStaleError(DRIFT_REASON_POINTER_INVALID, {"field": "receipt_verification"})
+    # Full environment recheck against the RECEIPT (not merely the pinned
+    # snapshot): recomputes the LIVE corpus manifest under the shared
+    # selector, plus config/code/RECORD/lock/model identities.
+    env_fail = _verify_pinned_environment_for_identity(identity, live_corpus=True)
+    if env_fail is not None:
+        return env_fail
+    # Backend row universes + backend generation ids, recomputed per access
+    # from the sealed bytes and compared to the receipt evidence.
+    backend_fail = _verify_pinned_backends(current)
+    if backend_fail is not None:
+        return backend_fail
+    return None
+
+
+def _verify_pinned_environment_for_identity(
+    identity: Dict[str, Any], live_corpus: bool = False
+) -> Optional[_IndexStaleError]:
+    """Environment recheck for the per-access gate.
+
+    With ``live_corpus=True`` the corpus manifest is recomputed over the LIVE
+    configured source subtree (documents_dir) — the controlling freshness
+    input — and compared to the receipt. The sealed-corpus copy is checked at
+    startup and by store verification.
+    """
+    from . import generations as gens
+
+    receipt_identity: Optional[Dict[str, Any]] = None
+    if live_corpus:
+        try:
+            store = GenerationStore(config.data_dir, create=False)
+            gdir = store._resolve_generation_dir(identity["generation_id"])
+            receipt = store._read_receipt(gdir, identity["generation_id"])
+            receipt_identity = receipt.get("identity") or {}
+        except Exception:
+            return _IndexStaleError(DRIFT_REASON_POINTER_INVALID, {})
+        try:
+            live_digest, _count = gens.corpus_manifest(
+                Path(config.source_documents_dir),
+                supported_suffixes=set(config.supported_formats or []),
+                exclude_patterns=list(getattr(config, "exclude_patterns", None) or []),
+            )
+            expected_corpus = receipt_identity.get("corpus_manifest_sha256")
+            if live_digest != expected_corpus:
+                return _IndexStaleError(
+                    DRIFT_REASON_ENVIRONMENT_CHANGED,
+                    _digest_mismatch_detail("corpus_manifest_sha256", expected_corpus, live_digest),
+                )
+        except gens.UnsafePathError:
+            return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "corpus_unreadable"})
+        except gens.DependencyUnverifiableError:
+            return _IndexStaleError(gens.DEPENDENCY_UNVERIFIABLE, {})
+        except Exception:
+            return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "corpus_unreadable"})
+    # Config/code/RECORD/lock/model artifact/config/chunking drift.
+    try:
+        env = _retrieval_environment_digests()
+        receipt_identity = receipt_identity or _receipt_identity_from_pointer()
+        # model_config + chunking: recomputed from the LIVE config the same
+        # way the startup pin does (_verify_pinned_environment) — the
+        # per-access gate must fail closed on exactly the same semantics.
+        model_config = _model_config_identity()
+        chunking = gens.chunking_identity(config)
+        checks = (
+            (
+                "retrieval_config_sha256",
+                receipt_identity.get("retrieval_config_sha256"),
+                env["retrieval_config_sha256"],
+            ),
+            ("code_sha256", receipt_identity.get("code_sha256"), env["code_sha256"]),
+            (
+                "installed_record_sha256",
+                receipt_identity.get("installed_record_sha256"),
+                env["installed_record_sha256"],
+            ),
+            ("dependency_lock_sha256", receipt_identity.get("dependency_lock_sha256"), env["dependency_lock_sha256"]),
+            ("model_artifact_sha256", receipt_identity.get("model_artifact_sha256"), env["model_artifact_sha256"]),
+            ("model_config_sha256", receipt_identity.get("model_config_sha256"), model_config),
+            ("chunking_sha256", receipt_identity.get("chunking_sha256"), chunking),
+        )
+        for check_name, expected, observed in checks:
+            if expected != observed:
+                return _IndexStaleError(
+                    DRIFT_REASON_ENVIRONMENT_CHANGED,
+                    _digest_mismatch_detail(check_name, expected, observed),
+                )
+    except gens.DependencyUnverifiableError:
+        return _IndexStaleError(gens.DEPENDENCY_UNVERIFIABLE, {})
+    except Exception:
+        return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "environment_unreadable"})
+    return None
+
+
+def _receipt_identity_from_pointer() -> Dict[str, Any]:
+    """Identity block of the receipt the pinned pointer names (or {})."""
+    try:
+        store = GenerationStore(config.data_dir, create=False)
+        identity = store.current_identity()
+        if identity is None:
+            return {}
+        gdir = store._resolve_generation_dir(identity["generation_id"])
+        receipt = store._read_receipt(gdir, identity["generation_id"])
+        return receipt.get("identity") or {}
+    except Exception:
+        return {}
+
+
+def _versioned_pointer_drifted() -> bool:
+    """True when ``current`` no longer names the pinned generation.
+
+    Read-only and never rebinds — the process keeps serving its pinned
+    generation and callers surface ``restart_required`` instead.
+    """
+    return _versioned_stale_state() is not None
+
+
+def _retrieval_gate(op: str) -> None:
+    """THE retrieval freshness gate (P0 #7). Raises on drift; no-op in legacy.
+
+    Runs BEFORE the query cache and before every read entrypoint — orchestrator
+    methods call this directly so DIRECT internal calls are gated identically
+    to MCP tool calls. Fail-closed: missing/unreadable evidence is stale.
+    """
+    if not _versioned_read_only():
+        return
+    stale = _versioned_stale_state()
+    if stale is not None:
+        raise stale
+
+
+def _retrieval_gate_json(op: str) -> Optional[str]:
+    """MCP-boundary form of the gate (P0 #7/#8).
+
+    Returns the stable ``retrieval_blocked`` envelope when versioned serving
+    is stale/degraded, else ``None`` so the tool may proceed. MUST be called
+    BEFORE ``get_orchestrator()`` — in degraded mode there is no orchestrator
+    and none may be constructed (no Chroma/FTS handle opens).
+    """
+    if not _versioned_read_only():
+        return None
+    stale = _versioned_stale_state()
+    if stale is None:
+        return None
+    return json.dumps(
+        {
+            "status": "error",
+            "error": "retrieval_blocked",
+            "message": (
+                f"{op} is blocked: the pinned generation is not fresh "
+                f"({stale.reason}). Restart the server after building/activating "
+                "a healthy generation."
+            ),
+            "reason": stale.reason,
+            "detail": stale.detail,
+            "generation_id": getattr(config, "active_generation_id", None),
+            "restart_required": True,
+        },
+        indent=2,
+    )
+
+
+def _gate_still_valid() -> bool:
+    """Cheap post-execution recheck: the COMPLETE freshness gate (P0 #7).
+
+    Called after a retrieval result is materialized but before it is served:
+    if the pointer/receipt, live corpus, retrieval config, model bytes, or
+    backend evidence moved while the query ran, the result is discarded and
+    the caller surfaces ``restart_required`` — a result computed against a
+    superseded generation is never served. This is the FULL gate (same
+    checks as ``_retrieval_gate``), not pointer identity alone.
+    """
+    if not _versioned_read_only():
+        return True
+    return _versioned_stale_state() is None
+
+
+def _versioned_reranker_gate() -> bool:
+    """True when the reranker may run in versioned mode (P0 #5/#9).
+
+    Deterministic pinned-or-blocked: the reranker runs ONLY when it is
+    enabled AND an exact local reranker artifact is configured AND its tree
+    digest matches the receipt-pinned reranker identity. No silent download;
+    absence while ENABLED raises at the rerank call site (fail-closed) — the
+    gate returning False for a disabled reranker is the explicit disabled
+    identity state.
+    """
+    if not getattr(config, "reranker_enabled", False):
+        return False
+    artifact = getattr(config, "reranker_local_artifact", None)
+    if not artifact:
+        return False
+    from . import generations as gens
+
+    artifact_path = Path(str(artifact))
+    if artifact_path.is_symlink() or not artifact_path.is_dir():
+        return False
+    try:
+        digest, _ = gens.digest_tree(artifact_path)
+    except Exception:
+        return False
+    pinned = (config.generation_compatibility() or {}).get("reranker_artifact_sha256")
+    return bool(pinned) and digest == pinned
+
+
 class KnowledgeOrchestrator:
     """Main orchestrator for knowledge retrieval with semantic search + keyword routing"""
 
@@ -1315,13 +2142,35 @@ class KnowledgeOrchestrator:
         self.parser = DocumentParser()
         self.embed_fn = FastEmbedEmbeddings()
 
-        # Initialize ChromaDB with persistent storage (new API v1.4.0+)
-        self.chroma_client = chromadb.PersistentClient(path=str(config.chroma_dir))
-        if config.transport != "stdio":
-            _enable_wal_mode(config.chroma_dir)
+        if _versioned_read_only():
+            # Sealed generation: attach the EXISTING collection strictly.
+            # BOUNDED RESIDUAL (documented, not redesigned here): ChromaDB's
+            # PersistentClient has NO supported read-only open mode — it
+            # holds the sqlite tree open read-WRITE at the filesystem level.
+            # This package therefore enforces the immutability boundary at
+            # the APPLICATION level only: no mutating call path reaches the
+            # collection, no WAL pragma (it would rewrite the sealed sqlite
+            # file), no get_or_create (nothing may be materialized), no
+            # recovery delete/recreate, no dimension migration, no initial
+            # indexing. PHYSICAL write denial (OS-level immutable mount /
+            # read-only filesystem) is a DEPLOYMENT boundary, verified by
+            # the separately authorized sandboxed rollout E2E — do NOT
+            # claim PersistentClient itself is read-only or that the sealed
+            # bytes are physically immutable from this process.
+            self.chroma_client = chromadb.PersistentClient(path=str(config.chroma_dir))
+            self.collection = self.chroma_client.get_collection(name=config.collection_name)
+            print(
+                f"[GENERATION] serving sealed chroma_db: {config.chroma_dir} "
+                f"(collection {config.collection_name}, {self.collection.count()} chunks)"
+            )
+        else:
+            # Initialize ChromaDB with persistent storage (new API v1.4.0+)
+            self.chroma_client = chromadb.PersistentClient(path=str(config.chroma_dir))
+            if config.transport != "stdio":
+                _enable_wal_mode(config.chroma_dir)
 
-        # Get or create collection (with auto-recovery from corruption)
-        self.collection = self._safe_get_collection()
+            # Get or create collection (with auto-recovery from corruption)
+            self.collection = self._safe_get_collection()
 
         # BM25 index for hybrid search
         self.bm25_index = BM25Index()
@@ -1333,8 +2182,13 @@ class KnowledgeOrchestrator:
         # Query cache (LRU with TTL)
         self.query_cache = QueryCache(max_size=100, ttl_seconds=300)
 
-        # Index metadata cache
-        self._metadata_file = config.data_dir / "index_metadata.json"
+        # Index metadata cache. Versioned mode reads the SEALED generation's
+        # index_metadata.json artifact (read-only in serving; the builder
+        # writes it inside staging). Legacy keeps data_dir/index_metadata.json.
+        if _versioned_mode():
+            self._metadata_file = (config.index_dir or config.data_dir) / METADATA_ARTIFACT
+        else:
+            self._metadata_file = config.data_dir / "index_metadata.json"
         self._indexed_docs: Dict[str, Dict] = self._load_metadata()
 
         # v4.8.0 Fase 4: resume checkpoint file (written every 500 docs or 30s
@@ -1366,10 +2220,28 @@ class KnowledgeOrchestrator:
         # v4.8.0 Fase 5: sweep any staging collections left behind by a
         # crashed rebuild (older than 24h). Idempotent + non-fatal on
         # error; the swap path also calls this before each rebuild.
-        try:
-            self._cleanup_stale_staging_collections()
-        except Exception as e:
-            print(f"[STAGING] Startup cleanup skipped (non-fatal): {e}")
+        if _versioned_read_only():
+            # Sealed store: no staging sweep, no recovery writes of any kind.
+            pass
+        else:
+            try:
+                self._cleanup_stale_staging_collections()
+            except Exception as e:
+                print(f"[STAGING] Startup cleanup skipped (non-fatal): {e}")
+
+    def _require_mutable_index(self, op: str) -> None:
+        """Refuse every index mutation while serving a sealed generation.
+
+        The builder process (``generation_build=True``) is the only versioned
+        context allowed past this guard; the serving process fails closed
+        BEFORE any file, network, or orchestrator mutation.
+        """
+        if _versioned_read_only():
+            raise RuntimeError(
+                f"{op} is forbidden: the server serves sealed generation "
+                f"{config.active_generation_id} read-only (build a new generation "
+                "with `knowledge-rag-generation build`)"
+            )
 
     def _safe_get_collection(self):
         """
@@ -1535,6 +2407,7 @@ class KnowledgeOrchestrator:
         reindex_documents(resume=True) to pick up where the previous
         interrupted run left off.
         """
+        self._require_mutable_index("index_all")
         if not self._index_lock.acquire(blocking=False):
             return self._index_busy_stats()
         try:
@@ -1956,7 +2829,7 @@ class KnowledgeOrchestrator:
             unique_metas.append(
                 {
                     "doc_id": doc.id,
-                    "source": str(doc.source),
+                    "source": _generation_source_value(doc.source) if _versioned_mode() else str(doc.source),
                     "filename": doc.filename,
                     "category": doc.category,
                     "format": doc.format,
@@ -2046,6 +2919,7 @@ class KnowledgeOrchestrator:
         the previous run's checkpoint and continues chunk counting from
         where it stopped.
         """
+        self._require_mutable_index("start_reindex_background")
         with self._reindex_admission_lock:
             if self._reindex_progress.get("active"):
                 return {"status": "already_running", "progress": dict(self._reindex_progress)}
@@ -2123,6 +2997,7 @@ class KnowledgeOrchestrator:
         migration path documented in ``docs/migration-v4.8.0.md`` relies on
         this to re-embed unchanged files after prefix/model changes.
         """
+        self._require_mutable_index("reindex_all")
         if resume_state:
             print(
                 f"[REINDEX] Resuming smart reindex from checkpoint "
@@ -2612,6 +3487,7 @@ class KnowledgeOrchestrator:
         concurrent owner yields the standard busy envelope BEFORE any
         mutation; the inner ``index_all`` re-acquires the RLock re-entrantly.
         """
+        self._require_mutable_index("nuclear_rebuild")
         if not self._index_lock.acquire(blocking=False):
             return self._index_busy_stats()
         try:
@@ -2639,17 +3515,83 @@ class KnowledgeOrchestrator:
         Package B: construction creates handles only (no migration launch, no
         marker write); the single startup dispatch runs in ``main()`` (C1/C2).
         """
-        db_path = config.data_dir / "fts5_index.db"
-        state_path = config.data_dir / "fts5_migration.state"
-        self.fts5_index = Fts5LexicalIndex(db_path=db_path, state_path=state_path)
+        if _versioned_mode():
+            base = config.index_dir or config.data_dir
+            db_path = base / FTS_ARTIFACT
+            state_path = base / FTS_STATE_ARTIFACT
+        else:
+            db_path = config.data_dir / "fts5_index.db"
+            state_path = config.data_dir / "fts5_migration.state"
+        if _versioned_read_only():
+            # Sealed artifact: open read-only and admit it against the pinned
+            # receipt's FTS evidence. No rebuild worker is ever dispatched.
+            self.fts5_index = Fts5LexicalIndex(db_path=db_path, state_path=state_path, read_only=True)
+            receipt = getattr(config, "active_generation_receipt", None) or {}
+            fts_evidence = (receipt.get("backends") or {}).get("fts5") or {}
+            self.fts5_index.admit_existing(
+                expected_digest=str(fts_evidence.get("row_digest") or ""),
+                total=int(fts_evidence.get("row_count") or 0),
+            )
+        else:
+            self.fts5_index = Fts5LexicalIndex(db_path=db_path, state_path=state_path)
         # QueryRouter raises re.error at construction if any pattern is
         # malformed — treat that as a fatal startup error so the operator
         # sees the broken pattern immediately instead of on the first query.
         self.query_router = QueryRouter(config.fts5_patterns)
 
+    def close(self, strict: bool = False) -> None:
+        """Deterministically release EVERY backend handle.
+
+        Order matters: stop accepting new work, close the FTS5 SQLite
+        connection (checkpointing WAL), then drop the Chroma client/collection
+        references so its SQLite/duckdb handles become collectable BEFORE the
+        caller seals/renames the staging tree. Idempotent and safe to call
+        from finally blocks.
+
+        ``strict=True`` (the offline BUILDER path): a close/checkpoint
+        failure RAISES — a build whose WAL could not be checkpointed must
+        fail, never print-and-continue toward seal/publish. ``strict=False``
+        (runtime shutdown) keeps best-effort semantics: a failure is logged
+        and shutdown proceeds.
+        """
+        # FTS5 SQLite handle: close() checkpoints WAL under the fts5 lock.
+        fts = getattr(self, "fts5_index", None)
+        if isinstance(fts, Fts5LexicalIndex):
+            try:
+                fts.close()
+            except Exception as exc:  # noqa: BLE001 — release must not raise
+                if strict:
+                    raise
+                print(f"[FTS5] close during orchestrator shutdown failed: {exc}")
+        # Chroma: PersistentClient HAS a real public close() (chromadb 1.5.9)
+        # — it decrements the shared System reference count and releases the
+        # database connections. Call it explicitly: strict=True (builder)
+        # RAISES on close failure — a build that cannot release its backend
+        # handles must fail, never proceed toward seal/publish;
+        # strict=False (runtime shutdown) logs best-effort and proceeds.
+        client = getattr(self, "chroma_client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:  # noqa: BLE001 — release must not raise at runtime
+                if strict:
+                    raise
+                print(f"[CHROMA] close during orchestrator shutdown failed: {exc}")
+        # Drop references after the explicit close: del breaks any accidental
+        # later use loudly (AttributeError) instead of silently writing to
+        # sealed bytes.
+        for attr in ("collection", "chroma_client"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except AttributeError:
+                    pass
+
     def _dispatch_fts5_startup_rebuild(self) -> None:
         """One-shot idempotent startup dispatch (C2/B02/D1/P1-1/F6): bounded admission
         only — the worker verifies source identity or rebuilds; hybrid serves meanwhile."""
+        if _versioned_read_only():
+            return  # sealed artifact: admitted at construction, never rebuilt
         if self._fts5_startup_dispatch_done:
             return  # F6: truly one-shot
         self._fts5_startup_dispatch_done = True
@@ -2703,11 +3645,16 @@ class KnowledgeOrchestrator:
                     raise
                 get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_TOTAL, float(len(rows)))
                 source_digest, total = compute_rows_digest(rows)
-                if index.verify_and_publish(source_digest, total, generation):  # P1-1/P1-2/BC-04: source-verified promotion
+                if index.verify_and_publish(
+                    source_digest, total, generation
+                ):  # P1-1/P1-2/BC-04: source-verified promotion
                     get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, float(total))
                     return
                 result = index.rebuild_content_bound(rows, generation=generation)
-                get_metrics().set_gauge(FAST_PATH_MIGRATION_DOCS_INDEXED, float(result.get("docs_indexed") or 0) if result.get("status") == "complete" else 0.0)  # D6
+                get_metrics().set_gauge(
+                    FAST_PATH_MIGRATION_DOCS_INDEXED,
+                    float(result.get("docs_indexed") or 0) if result.get("status") == "complete" else 0.0,
+                )  # D6
         except Exception as exc:  # noqa: BLE001 — TQ-1: fail closed, demote the current generation
             if generation is not None:
                 index.publish_rebuild_failure(generation, exc)
@@ -2888,12 +3835,52 @@ class KnowledgeOrchestrator:
         Fast-path items use ``"content"`` as the text field, so alias it in and
         pop it out. ``search_method`` stays ``"fts5"`` — rerank is a layered
         rescorer, not a path change.
+
+        Requirement 8: after the rerank the EFFECTIVE raw score is the
+        reranker score, and ``query_relative_score``/``score`` are recomputed
+        from the reranked cohort's min/max (min-max normalized so the best
+        reranked item maps to 1.0). The pre-rerank normalized score carried
+        from ``_format_fts5_results`` must NEVER survive into the served
+        result — it ranks a different (pre-rerank) ordering.
+
+        The reranker receives COPIES of the formatted items — a disabled,
+        unavailable, or partially-failing reranker that returns the items
+        unchanged (or missing ``reranker_score``) must leave the original
+        FTS scores, ``score_source``, and order intact.
         """
-        for item in formatted:
+        rerank_input = [dict(item) for item in formatted]
+        for item in rerank_input:
             item["document"] = item.get("content", "")
-        reranked = self.reranker.rerank(query_text, formatted, top_k=max_results)
+        reranked = self.reranker.rerank(query_text, rerank_input, top_k=max_results)
         for item in reranked:
             item.pop("document", None)
+
+        # Attribute to the reranker ONLY when it actually scored every
+        # returned item with a REAL FINITE number (bool excluded — a bool is
+        # an int subclass but never a score; NaN/±inf are not scores either
+        # and would poison min-max normalization and JSON finiteness).
+        # Otherwise the rerank is a no-op and the original FTS-native
+        # scores/source/order must survive untouched.
+        def _finite_score(value: Any) -> Optional[float]:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return value if math.isfinite(value) else None
+
+        if not reranked or not all(_finite_score(item.get("reranker_score")) is not None for item in reranked):
+            return formatted
+
+        raw_scores = [float(item["reranker_score"]) for item in reranked]
+        max_score = max(raw_scores) if raw_scores else 1.0
+        min_score = min(raw_scores) if raw_scores else 0.0
+        score_range = max_score - min_score
+        for item in reranked:
+            raw = float(item["reranker_score"])
+            query_relative = round((raw - min_score) / score_range, 4) if score_range > 0 else 1.0
+            item["raw_score"] = raw
+            item["score_source"] = "reranker"
+            item["query_relative_score"] = query_relative
+            item["score"] = query_relative
         return reranked
 
     def _format_fts5_results(
@@ -2913,11 +3900,12 @@ class KnowledgeOrchestrator:
             return []
         documents_by_id = dict(zip(fetched.get("ids", []), fetched.get("documents", [])))
         metadata_by_id = dict(zip(fetched.get("ids", []), fetched.get("metadatas", [])))
-        formatted: List[Dict[str, Any]] = []
-        raw_scores = [float(score) for _, score in hits if chunk_ids]
-        max_score = max(raw_scores) if raw_scores else 1.0
-        min_score = min(raw_scores) if raw_scores else 0.0
-        score_range = max_score - min_score
+        # Requirement 8: collect the surviving cohort FIRST (orphan + category
+        # filtering, top-k slice), then normalize over THAT cohort's native
+        # FTS raw scores. Normalizing over the pre-filter hit list would let
+        # filtered-out orphans stretch the min/max and skew every served
+        # query_relative_score.
+        cohort: List[Tuple[str, float, str, Dict[str, Any]]] = []
         for chunk_id, raw_score in hits:
             # v4.8.3: skip orphan hits where FTS5 has the chunk_id but Chroma
             # doesn't (nuclear rebuild residue, manual delete race). Previous
@@ -2929,7 +3917,20 @@ class KnowledgeOrchestrator:
             metadata = metadata_by_id.get(chunk_id) or {}
             if category_filter and metadata.get("category") != category_filter:
                 continue
-            normalized = (float(raw_score) - min_score) / score_range if score_range > 0 else 1.0
+            cohort.append((chunk_id, float(raw_score), document, metadata))
+            if len(cohort) >= max_results:
+                break
+
+        raw_scores = [raw for _, raw, _, _ in cohort]
+        max_score = max(raw_scores) if raw_scores else 1.0
+        min_score = min(raw_scores) if raw_scores else 0.0
+        score_range = max_score - min_score
+
+        formatted: List[Dict[str, Any]] = []
+        for chunk_id, raw_score, document, metadata in cohort:
+            # Equal raw scores across the whole cohort map to 1.0 (range == 0).
+            normalized = (raw_score - min_score) / score_range if score_range > 0 else 1.0
+            query_relative = round(normalized, 4)
             formatted.append(
                 {
                     "content": document,
@@ -2937,7 +3938,10 @@ class KnowledgeOrchestrator:
                     "filename": metadata.get("filename", ""),
                     "category": metadata.get("category", ""),
                     "chunk_index": metadata.get("chunk_index", 0),
-                    "score": round(normalized, 4),
+                    "score": query_relative,
+                    "query_relative_score": query_relative,
+                    "raw_score": raw_score,
+                    "score_source": "fts5_bm25",
                     "raw_rrf_score": None,
                     "reranker_score": None,
                     "semantic_rank": None,
@@ -2947,8 +3951,6 @@ class KnowledgeOrchestrator:
                     "routed_by": "fts5_router",
                 }
             )
-            if len(formatted) >= max_results:
-                break
         return formatted
 
     # =========================================================================
@@ -2975,15 +3977,31 @@ class KnowledgeOrchestrator:
         - ``"hybrid"``: skip the router; force the hybrid pipeline (kill
           switch for suspected router misclassification).
         - ``"fts5"``: skip the router; force the FTS5 fast-path. Raises
-          ``Fts5NotReadyError`` when the feature is disabled or the index is
-          not ready — the MCP wrapper surfaces the error to the caller.
+          ``Fts5NotReadyError`` when the feature is disabled or the index
+          is not ready — the MCP wrapper surfaces the error to the caller.
+
+        Versioned mode: the freshness gate runs FIRST — before the query
+        cache — and the result is discarded when the pointer moves while the
+        query executes (post-check, P0 #7).
         """
+        _retrieval_gate("query")
         max_results = max_results or config.default_results
+
+        # P1 review fix: pin the CALLER's requested search_method for the
+        # entire call (cache key get/put must match, and per-result
+        # ``search_method`` labels like "hybrid"/"keyword"/"fts5" must never
+        # shadow it — that mismatch once served a cache miss for a repeat
+        # query and stored entries under the wrong dispatch label).
+        requested_search_method = search_method
 
         # Cache lookup (5-tuple key includes search_method — different paths
         # produce different result sets, they MUST NOT share cache entries).
-        cached = self.query_cache.get(query_text, max_results, category_filter, hybrid_alpha, search_method)
+        # A cache hit still requires the POST-CHECK: drift since the entry
+        # was cached must surface as retrieval_blocked, never stale results.
+        cached = self.query_cache.get(query_text, max_results, category_filter, hybrid_alpha, requested_search_method)
         if cached is not None:
+            if not _gate_still_valid():
+                raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
             return cached
 
         # FTS5 dispatch (feature-gated). When the toggle is off, this whole
@@ -2991,19 +4009,23 @@ class KnowledgeOrchestrator:
         hybrid_path_label = "hybrid"
         if config.fts5_enabled:
             fast_path_result, hybrid_path_label = self._maybe_dispatch_fts5(
-                query_text, max_results, category_filter, search_method
+                query_text, max_results, category_filter, requested_search_method
             )
             if fast_path_result is not None:
+                # FTS early-return path: post-check BEFORE caching/serving —
+                # an early return must not bypass the freshness gate.
+                if not _gate_still_valid():
+                    raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
                 self.query_cache.put(
                     query_text,
                     max_results,
                     category_filter,
                     hybrid_alpha,
                     fast_path_result,
-                    search_method=search_method,
+                    search_method=requested_search_method,
                 )
                 return fast_path_result
-        elif search_method == "fts5":
+        elif requested_search_method == "fts5":
             raise Fts5NotReadyError("FTS5 fast-path is disabled in config; set search.lexical_fast_path.enabled=true")
 
         self._ensure_bm25_index()
@@ -3137,11 +4159,16 @@ class KnowledgeOrchestrator:
                 "distance": data.get("distance", 0),
             }
 
-        # Sort by RRF score — take extra candidates for reranker
-        reranker_k = max_results * config.reranker_top_k_multiplier if config.reranker_enabled else max_results
-        sorted_results = sorted(combined_scores.items(), key=lambda x: x[1]["rrf_score"], reverse=True)[:reranker_k]
+        # P1 review fix: retain an honest candidate POOL larger than
+        # max_results so MMR below is actually reachable. Previously the
+        # non-reranker branch sliced to exactly max_results and the reranker
+        # branch asked for top_k=max_results, so ``len(sorted_results) >
+        # max_results`` was never true and the MMR call was dead code.
+        pool_size = max_results * config.reranker_top_k_multiplier
+        sorted_results = sorted(combined_scores.items(), key=lambda x: x[1]["rrf_score"], reverse=True)[:pool_size]
 
-        # Cross-encoder reranking
+        # Cross-encoder reranking — reranks the whole pool; MMR below selects
+        # the final max_results from it.
         if config.reranker_enabled and sorted_results:
             rerank_input = []
             for chunk_id, data in sorted_results:
@@ -3156,58 +4183,114 @@ class KnowledgeOrchestrator:
                         "distance": data["distance"],
                     }
                 )
-            reranked = self.reranker.rerank(query_text, rerank_input, top_k=max_results)
+            reranked = self.reranker.rerank(query_text, rerank_input, top_k=pool_size)
             sorted_results = [(d["chunk_id"], d) for d in reranked]
 
-        # Normalize scores and format
-        if sorted_results:
-            raw_scores = [data.get("reranker_score", data.get("rrf_score", 0)) for _, data in sorted_results]
-            max_score = max(raw_scores) if raw_scores else 1
-            min_score = min(raw_scores) if raw_scores else 0
-            score_range = max_score - min_score
-        else:
-            score_range = 0
-
-        # MMR: Maximal Marginal Relevance — diversify results to reduce redundancy
+        # MMR: Maximal Marginal Relevance — select the final max_results from
+        # the candidate pool, diversifying to reduce redundancy.
         if len(sorted_results) > max_results:
             sorted_results = self._apply_mmr(sorted_results, max_results, lambda_param=0.7)
 
+        # Requirement 8: score the FINAL returned cohort. Effective raw score
+        # is reranker_score when present, else rrf_score; cohort min/max are
+        # computed over the final returned candidates (AFTER MMR selection),
+        # not over the pre-MMR reranker_k pool. Equal raw scores map to 1.0.
         formatted = []
-        for chunk_id, data in sorted_results[:max_results]:
-            metadata = data.get("metadata", {})
-            s_rank = data.get("semantic_rank")
-            b_rank = data.get("bm25_rank")
+        if sorted_results:
+            final_cohort = sorted_results[:max_results]
 
-            if s_rank and b_rank:
-                search_method = "hybrid"
-            elif s_rank:
-                search_method = "semantic"
-            else:
-                search_method = "keyword"
+            def _effective_raw(data: Dict[str, Any]) -> float:
+                # Reranker value counts ONLY when it is a real finite number
+                # (bool excluded; NaN/±inf fall back to the non-reranker
+                # score so the served JSON stays finite). A reranker_score
+                # of None means "reranker did not score this item".
+                raw = data.get("reranker_score")
+                if not isinstance(raw, bool) and isinstance(raw, (int, float)):
+                    raw = float(raw)
+                    if math.isfinite(raw):
+                        return raw
+                fallback = data.get("rrf_score", 0)
+                if not isinstance(fallback, bool) and isinstance(fallback, (int, float)):
+                    fallback = float(fallback)
+                    if math.isfinite(fallback):
+                        return fallback
+                return 0.0
 
-            raw = data.get("reranker_score", data.get("rrf_score", 0))
-            normalized_score = (raw - min_score) / score_range if score_range > 0 else 1.0
+            eff_raws = [_effective_raw(data) for _, data in final_cohort]
+            eff_max = max(eff_raws) if eff_raws else 1.0
+            eff_min = min(eff_raws) if eff_raws else 0.0
+            eff_range = eff_max - eff_min
 
-            formatted.append(
-                {
-                    "content": data.get("document", ""),
-                    "source": metadata.get("source", ""),
-                    "filename": metadata.get("filename", ""),
-                    "category": metadata.get("category", ""),
-                    "chunk_index": metadata.get("chunk_index", 0),
-                    "score": round(normalized_score, 4),
-                    "raw_rrf_score": round(data.get("rrf_score", 0), 6),
-                    "reranker_score": round(data.get("reranker_score", 0), 6) if "reranker_score" in data else None,
-                    "semantic_rank": s_rank,
-                    "bm25_rank": b_rank,
-                    "search_method": search_method,
-                    "keywords": metadata.get("keywords", "").split(","),
-                    "routed_by": routed_category if routed_category else "none",
-                }
-            )
+            for chunk_id, data in final_cohort:
+                metadata = data.get("metadata", {})
+                s_rank = data.get("semantic_rank")
+                b_rank = data.get("bm25_rank")
+
+                if s_rank and b_rank:
+                    search_method = "hybrid"
+                elif s_rank:
+                    search_method = "semantic"
+                else:
+                    search_method = "keyword"
+
+                # One validity decision per item, using the SAME
+                # real-finite/bool-excluded rule as _effective_raw: the
+                # reranker value is USED only when it is a real finite
+                # number; otherwise fall back to finite RRF and label the
+                # source rrf. Emitted reranker_score is a rounded finite
+                # value or None — NaN/Infinity never reach the JSON.
+                finite_reranker = None
+                candidate_reranker = data.get("reranker_score")
+                if not isinstance(candidate_reranker, bool) and isinstance(candidate_reranker, (int, float)):
+                    candidate_reranker = float(candidate_reranker)
+                    if math.isfinite(candidate_reranker):
+                        finite_reranker = candidate_reranker
+                finite_rrf = None
+                candidate_rrf = data.get("rrf_score", 0)
+                if not isinstance(candidate_rrf, bool) and isinstance(candidate_rrf, (int, float)):
+                    candidate_rrf = float(candidate_rrf)
+                    if math.isfinite(candidate_rrf):
+                        finite_rrf = candidate_rrf
+                if finite_reranker is not None:
+                    score_source = "reranker"
+                    raw = finite_reranker
+                    emitted_reranker = round(finite_reranker, 6)
+                else:
+                    score_source = "rrf"
+                    raw = finite_rrf if finite_rrf is not None else 0.0
+                    emitted_reranker = None
+                normalized_score = (raw - eff_min) / eff_range if eff_range > 0 else 1.0
+                query_relative = round(normalized_score, 4)
+
+                formatted.append(
+                    {
+                        "content": data.get("document", ""),
+                        "source": metadata.get("source", ""),
+                        "filename": metadata.get("filename", ""),
+                        "category": metadata.get("category", ""),
+                        "chunk_index": metadata.get("chunk_index", 0),
+                        "score": query_relative,
+                        "query_relative_score": query_relative,
+                        "raw_score": raw,
+                        "score_source": score_source,
+                        "raw_rrf_score": round(finite_rrf, 6) if finite_rrf is not None else None,
+                        "reranker_score": emitted_reranker,
+                        "semantic_rank": s_rank,
+                        "bm25_rank": b_rank,
+                        "search_method": search_method,
+                        "keywords": metadata.get("keywords", "").split(","),
+                        "routed_by": routed_category if routed_category else "none",
+                    }
+                )
 
         # Adjacent Chunk Retrieval — expand content with surrounding chunks for context
         formatted = self._expand_with_adjacent_chunks(formatted)
+
+        # Post-check (P0 #7): if the pointer/evidence moved while this query
+        # executed, the result is discarded — a result computed against a
+        # superseded generation is never served nor cached.
+        if not _gate_still_valid():
+            raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
 
         self.query_cache.put(
             query_text,
@@ -3215,7 +4298,7 @@ class KnowledgeOrchestrator:
             category_filter,
             hybrid_alpha,
             formatted,
-            search_method=search_method,
+            search_method=requested_search_method,
         )
         if config.fts5_enabled:
             get_metrics().inc(FAST_PATH_HITS_TOTAL, f'{{path="{hybrid_path_label}"}}')
@@ -3323,6 +4406,16 @@ class KnowledgeOrchestrator:
 
         Balances relevance (score) vs diversity (dissimilarity to already selected docs).
         lambda=1.0 = pure relevance, lambda=0.0 = pure diversity, default 0.7 = relevance-heavy.
+
+        Relevance is a FINITE query-relative value in [0, 1] derived from the
+        effective ranking value of the CURRENT candidate pool: min-max
+        normalized ``reranker_score`` when finite, else ``rrf_score`` when
+        finite, else 0. Raw RRF (~0.01 scale) or arbitrary cross-encoder
+        logits are never combined directly with Jaccard [0,1] — the scales
+        are incomparable. Equal effective values map to a deterministic
+        relevance consistent with current rank (rank 1 of the pool maps to
+        1.0; ties below share the pool-maximum's normalized value). Stable
+        ordering: ties keep the incoming (already rank-sorted) order.
         """
         if len(results) <= top_k:
             return results
@@ -3335,28 +4428,60 @@ class KnowledgeOrchestrator:
                 return 0.0
             return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
-        selected = [results[0]]  # First result always selected (highest score)
-        remaining = list(results[1:])
+        def finite_or_none(value: Any) -> Optional[float]:
+            # Real finite numbers only — bool is excluded (a bool is an int
+            # subclass but never a score), NaN/inf never pass isfinite.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return value if math.isfinite(value) else None
+
+        # Query-relative relevance in [0, 1] over the current candidate pool.
+        effective = []
+        for rank, (_chunk_id, data) in enumerate(results, start=1):
+            raw = finite_or_none(data.get("reranker_score"))
+            if raw is None:
+                raw = finite_or_none(data.get("rrf_score"))
+            effective.append((rank, raw))
+        raws = [raw for _rank, raw in effective if raw is not None]
+        eff_max = max(raws) if raws else None
+        eff_min = min(raws) if raws else None
+        eff_range = (eff_max - eff_min) if (eff_max is not None and eff_min is not None) else 0.0
+
+        relevance: List[float] = []
+        for _rank, raw in effective:
+            if raw is None:
+                relevance.append(0.0)
+            elif eff_range > 0:
+                relevance.append((raw - eff_min) / eff_range)
+            else:
+                # All equal (or single) effective values: no ordering signal
+                # exists, every item is the pool maximum.
+                relevance.append(1.0)
+
+        # Carry each ORIGINAL result bound to its precomputed relevance so
+        # the association survives every pop from ``remaining`` (index-based
+        # lookup drifts after the first pop — item i is no longer at i).
+        selected: List[Tuple[str, Dict]] = [results[0]]
+        remaining = list(zip(results[1:], relevance[1:]))
 
         while len(selected) < top_k and remaining:
             best_idx = 0
-            best_mmr = -1.0
+            best_mmr = -math.inf
 
-            for i, (chunk_id, data) in enumerate(remaining):
-                # Relevance score (normalized)
-                relevance = data.get("reranker_score", data.get("rrf_score", 0))
-
+            for i, ((chunk_id, data), relevance_i) in enumerate(remaining):
                 # Max similarity to any already-selected doc
                 doc_text = data.get("document", "")
                 max_sim = max(jaccard_sim(doc_text, sel_data.get("document", "")) for _, sel_data in selected)
 
-                mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim
+                mmr_score = lambda_param * relevance_i - (1 - lambda_param) * max_sim
 
                 if mmr_score > best_mmr:
                     best_mmr = mmr_score
                     best_idx = i
 
-            selected.append(remaining.pop(best_idx))
+            selected_entry = remaining.pop(best_idx)
+            selected.append(selected_entry[0])
 
         return selected
 
@@ -3371,7 +4496,10 @@ class KnowledgeOrchestrator:
         the endpoint from becoming an arbitrary-file-read primitive.
         Returns ``None`` on rejection so the failure mode matches the
         existing "not found" case exposed to MCP clients.
+
+        Versioned mode: gated on pinned-generation freshness (P0 #7).
         """
+        _retrieval_gate("get_document")
         try:
             resolved = validate_path_within(config.documents_dir, filepath)
         except PathEscapeError as exc:
@@ -3380,7 +4508,7 @@ class KnowledgeOrchestrator:
         try:
             doc = self.parser.parse_file(resolved)
             if doc:
-                return {
+                payload = {
                     "content": doc.content,
                     "source": str(doc.source),
                     "filename": doc.filename,
@@ -3390,6 +4518,12 @@ class KnowledgeOrchestrator:
                     "keywords": doc.keywords,
                     "chunk_count": len(doc.chunks),
                 }
+                # Post-check (P0 #7): discard if freshness moved mid-parse.
+                if not _gate_still_valid():
+                    raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
+                return payload
+        except _IndexStaleError:
+            raise
         except Exception as e:
             print(f"[ERROR] Failed to read document {resolved}: {e}")
         return None
@@ -3412,6 +4546,7 @@ class KnowledgeOrchestrator:
         ``config.documents_dir``; escapes via ``..`` or absolute paths are
         rejected with a structured error and never write to disk.
         """
+        self._require_mutable_index("add_document_from_content")
         try:
             full_path = validate_path_within(config.documents_dir, filepath)
         except PathEscapeError as exc:
@@ -3480,6 +4615,7 @@ class KnowledgeOrchestrator:
         Rejects paths that resolve outside ``config.documents_dir`` so
         this endpoint cannot be used to overwrite arbitrary host files.
         """
+        self._require_mutable_index("update_document_content")
         try:
             filepath = validate_path_within(config.documents_dir, filepath)
         except PathEscapeError as exc:
@@ -3548,6 +4684,7 @@ class KnowledgeOrchestrator:
         client cannot use ``delete_file=True`` as an arbitrary-file-delete
         primitive against paths outside the corpus.
         """
+        self._require_mutable_index("remove_document_by_path")
         try:
             resolved_path = validate_path_within(config.documents_dir, filepath)
         except PathEscapeError as exc:
@@ -3580,6 +4717,8 @@ class KnowledgeOrchestrator:
         """Fetch URL content, convert to markdown, and add to knowledge base."""
         import requests
         from bs4 import BeautifulSoup
+
+        self._require_mutable_index("add_from_url")
 
         # Validate URL scheme (only http/https allowed)
         if not url.startswith(("http://", "https://")):
@@ -3618,7 +4757,10 @@ class KnowledgeOrchestrator:
         Paths that resolve outside ``config.documents_dir`` return an empty
         list rather than probing index state — an attacker must not be able
         to use this endpoint to test for the existence of arbitrary files.
+
+        Versioned mode: gated on pinned-generation freshness (P0 #7).
         """
+        _retrieval_gate("search_similar")
         if not is_path_within(config.documents_dir, filepath):
             return []
 
@@ -3627,17 +4769,26 @@ class KnowledgeOrchestrator:
         doc_id = self._source_to_docid.get(filepath_resolved)
 
         if not doc_id:
+            # Post-check (P0 #10): even the not-indexed path must not mask drift.
+            if not _gate_still_valid():
+                raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
             return []
 
         try:
             results = self.collection.get(where={"doc_id": doc_id}, include=["embeddings"], limit=1)
-            if not results["ids"] or not results.get("embeddings"):
-                return []
-            embeddings = results.get("embeddings", [])
-            if not embeddings:
+            # Never truth-test ndarray-backed values: branch on None/length.
+            raw_ids = results.get("ids") if isinstance(results, dict) else None
+            embeddings = results.get("embeddings") if isinstance(results, dict) else None
+            if raw_ids is None or embeddings is None or len(raw_ids) == 0 or len(embeddings) == 0:
+                if not _gate_still_valid():
+                    raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
                 return []
             query_embedding = embeddings[0]
+        except _IndexStaleError:
+            raise
         except Exception:
+            if not _gate_still_valid():
+                raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
             return []
 
         try:
@@ -3646,10 +4797,16 @@ class KnowledgeOrchestrator:
                 n_results=max_results + 20,
                 include=["documents", "metadatas", "distances"],
             )
+        except _IndexStaleError:
+            raise
         except Exception:
+            if not _gate_still_valid():
+                raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
             return []
 
         if not similar["ids"] or not similar["ids"][0]:
+            if not _gate_still_valid():
+                raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
             return []
 
         seen_sources = set()
@@ -3680,24 +4837,71 @@ class KnowledgeOrchestrator:
             if len(output) >= max_results:
                 break
 
+        # Post-check (P0 #10): runs even when EMPTY — mid-request drift must
+        # never surface as a misleading empty success.
+        if not _gate_still_valid():
+            raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
         return output
 
     def evaluate_retrieval(self, test_cases: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Evaluate retrieval quality with test queries. Returns MRR@5, Recall@5, Precision@5."""
+        """Evaluate retrieval quality with test queries. Returns MRR@5, Recall@5, Precision@5.
+
+        This is an OFFLINE SMOKE check, not a benchmark: the returned metrics
+        (``evaluation_mode: "offline_smoke"``) only verify that the retrieval
+        pipeline finds the expected documents for a handful of curated queries.
+        They carry no statistical weight and MUST NOT be quoted as
+        retrieval-quality benchmarks.
+
+        Expected-path matching is LEXICAL BOUNDARY matching (no filesystem
+        resolution): backslashes are normalized to "/", an absolute expected
+        path requires exact equality, and a relative expected path matches a
+        source only when the source equals it OR ends with ``"/" + expected``
+        — so ``security/a.md`` matches ``/corpus/security/a.md`` but not
+        ``not-a.md`` nor ``a.md.bak``.
+
+        Raises ``ValueError`` on malformed input: non-list test_cases,
+        non-dict entries, or non-string/blank ``query`` /
+        ``expected_filepath`` values. Direct callers get the error instead
+        of silently dropped or coerced cases.
+        """
+        _retrieval_gate("evaluate_retrieval")
+
+        # P1 review fix: DIRECT calls must reject malformed cases loudly
+        # (ValueError) — silently dropping or coercing them would inflate the
+        # smoke metrics' denominators differently from what the caller typed.
+        # The MCP wrapper keeps its structured JSON validation error.
+        if not isinstance(test_cases, list):
+            raise ValueError("test_cases must be a list of {'query': str, 'expected_filepath': str} dicts")
+        if not test_cases:
+            # Zero-query success is forbidden: an empty run would report
+            # perfect 1.0 metrics over nothing.
+            raise ValueError("test_cases must contain at least one query case")
+        validated_cases: List[Dict[str, str]] = []
+        for idx, tc in enumerate(test_cases):
+            if not isinstance(tc, dict):
+                raise ValueError(f"test_cases[{idx}] must be a dict, got {type(tc).__name__}")
+            query = tc.get("query")
+            expected = tc.get("expected_filepath")
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError(f"test_cases[{idx}].query must be a non-empty string")
+            if not isinstance(expected, str) or not expected.strip():
+                raise ValueError(f"test_cases[{idx}].expected_filepath must be a non-empty string")
+            validated_cases.append({"query": query, "expected_filepath": expected})
+
         per_query = []
         mrr_sum = 0.0
         recall_sum = 0.0
         k = 5
 
-        for tc in test_cases:
-            query = tc.get("query", "")
-            expected = tc.get("expected_filepath", "")
+        for tc in validated_cases:
+            query = tc["query"]
+            expected = tc["expected_filepath"]
 
             results = self.query(query, max_results=k)
 
             found_rank = None
             for i, r in enumerate(results):
-                if expected in r.get("source", ""):
+                if _expected_path_matches(expected, r.get("source", "")):
                     found_rank = i + 1
                     break
 
@@ -3717,9 +4921,14 @@ class KnowledgeOrchestrator:
                 }
             )
 
-        n = len(test_cases) if test_cases else 1
+        n = len(validated_cases) if validated_cases else 1
+        # Post-check (P0 #10): runs even when EMPTY — mid-request drift must
+        # never surface as a misleading empty success.
+        if not _gate_still_valid():
+            raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
         return {
-            "total_queries": len(test_cases),
+            "evaluation_mode": "offline_smoke",
+            "total_queries": len(validated_cases),
             "mrr_at_5": round(mrr_sum / n, 4),
             "recall_at_5": round(recall_sum / n, 4),
             "per_query": per_query,
@@ -3731,14 +4940,20 @@ class KnowledgeOrchestrator:
 
     def list_categories(self) -> Dict[str, int]:
         """List all categories with document counts"""
+        _retrieval_gate("list_categories")
         categories = {}
         for doc_info in list(self._indexed_docs.values()):
             cat = doc_info.get("category", "unknown")
             categories[cat] = categories.get(cat, 0) + 1
+        # Post-check (P0 #10): runs even when EMPTY — mid-request drift must
+        # never surface as a misleading empty success.
+        if not _gate_still_valid():
+            raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
         return categories
 
     def list_documents(self, category: Optional[str] = None) -> List[Dict[str, str]]:
         """List all indexed documents, optionally filtered by category"""
+        _retrieval_gate("list_documents")
         docs = []
         for doc_id, info in list(self._indexed_docs.items()):
             if category and info.get("category") != category:
@@ -3753,6 +4968,10 @@ class KnowledgeOrchestrator:
                     "keywords": info.get("keywords", [])[:5],
                 }
             )
+        # Post-check (P0 #10): runs even when EMPTY — mid-request drift must
+        # never surface as a misleading empty success.
+        if not _gate_still_valid():
+            raise _IndexStaleError(DRIFT_REASON_POINTER_CHANGED, {})
         return docs
 
     def get_stats(self) -> Dict[str, Any]:
@@ -3769,6 +4988,18 @@ class KnowledgeOrchestrator:
             "chunk_overlap": config.chunk_overlap,
             "query_cache": self.query_cache.stats(),
         }
+
+        if _versioned_mode():
+            # Safe, non-revealing generation surface (no absolute private
+            # paths): mode, pinned identity, sealed-corpus marker, disabled
+            # runtime mutations/watcher, and restart_required on pointer drift.
+            stats["index_mode"] = "versioned"
+            stats["generation_id"] = config.active_generation_id
+            stats["receipt_sha256"] = config.active_receipt_sha256
+            stats["corpus"] = "sealed_generation"
+            stats["runtime_mutations"] = "disabled"
+            stats["watcher"] = "disabled"
+            stats["restart_required"] = _versioned_pointer_drifted()
 
         progress = self._reindex_progress
         if progress.get("active"):
@@ -3845,8 +5076,21 @@ class KnowledgeOrchestrator:
 
     def _save_metadata(self) -> None:
         """Save index metadata to disk"""
+        if _versioned_read_only():
+            raise RuntimeError(
+                f"index metadata is sealed with generation {config.active_generation_id}; _save_metadata refused"
+            )
+        if _versioned_mode():
+            # Builder context: record POSIX-relative sources so the sealed
+            # metadata survives the .building-<id> -> generations/<id> rename
+            # and resolves under whichever corpus root serves it later.
+            snapshot = {
+                doc_id: {**info, "source": _generation_source_value(info.get("source", ""))}
+                for doc_id, info in self._indexed_docs.items()
+            }
+        else:
+            snapshot = dict(self._indexed_docs)
         self._metadata_file.parent.mkdir(parents=True, exist_ok=True)
-        snapshot = dict(self._indexed_docs)
         self._metadata_file.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
 
     # =========================================================================
@@ -3879,6 +5123,8 @@ class KnowledgeOrchestrator:
         partially-written file (Windows-safe: os.replace is atomic on
         NTFS in-directory).
         """
+        if _versioned_mode():
+            return  # never pollute the generation-store root from a versioned process
         self._checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": self.CHECKPOINT_VERSION,
@@ -3935,6 +5181,8 @@ class KnowledgeOrchestrator:
 
     def _clear_checkpoint(self) -> None:
         """Remove the checkpoint file (call after successful reindex)."""
+        if _versioned_mode():
+            return
         try:
             if self._checkpoint_file.exists():
                 self._checkpoint_file.unlink()
@@ -3946,7 +5194,16 @@ class KnowledgeOrchestrator:
         lookup: Dict[str, str] = {}
         for doc_id, info in list(self._indexed_docs.items()):
             src = info.get("source", "")
-            if src:
+            if not src:
+                continue
+            if _versioned_mode():
+                # Sealed metadata stores POSIX-relative sources; resolve them
+                # under the bound (sealed) documents_dir, never the CWD.
+                p = Path(src)
+                if not p.is_absolute():
+                    p = Path(config.documents_dir) / p
+                lookup[str(p.resolve())] = doc_id
+            else:
                 lookup[str(Path(src).resolve())] = doc_id
         return lookup
 
@@ -3970,6 +5227,15 @@ def get_orchestrator() -> KnowledgeOrchestrator:
     if _orchestrator is None:
         with _orchestrator_lock:
             if _orchestrator is None:
+                if _versioned_read_only() and getattr(config, "_pin_failure", None):
+                    # Degraded stats-only mode (P0 #8): no orchestrator is
+                    # ever constructed — no Chroma/FTS handle may open. Every
+                    # retrieval tool has already returned retrieval_blocked;
+                    # get_index_stats reads the failure record directly.
+                    pin_failure = getattr(config, "_pin_failure", None) or {}
+                    raise RuntimeError(
+                        f"retrieval_blocked: no orchestrator in degraded mode ({pin_failure.get('reason')})"
+                    )
                 _orchestrator = KnowledgeOrchestrator()
     return _orchestrator
 
@@ -4028,9 +5294,13 @@ def search_knowledge(
         hybrid_alpha: Balance between semantic and keyword search. 0.0 = keyword-only (best for exact
             technical terms like CVE IDs or tool names), 0.3 = balanced default, 1.0 = semantic-only
             (best for conceptual or natural-language queries).
-        min_score: Minimum normalized relevance score (0.0–1.0) to include a result. Results scoring
-            below this threshold are discarded. Default 0.0 returns all results. Use 0.2–0.4 to cut
-            low-relevance noise.
+        min_score: Minimum query-relative relevance score (0.0–1.0) to include a result. This
+            score is min-max normalized WITHIN the cohort of results returned for THIS query:
+            the best result of the query maps to 1.0 and the worst to 0.0. It measures relative
+            standing among the returned candidates, NOT absolute retrieval quality — a 0.5 in
+            one query's cohort is not comparable to a 0.5 in another's, and no value of this
+            score is by itself evidence that a result is good or bad. Results scoring below
+            this threshold are discarded. Default 0.0 returns all results.
         snippet_mode: When true (default), truncates content to ~500 characters at a natural break
             point and adds a content_length field with the original size. Use get_document() to
             fetch full content when needed. Set to false to return full chunk content.
@@ -4045,12 +5315,16 @@ def search_knowledge(
         JSON string with results including content chunks, source filepath, relevance score, and
         search method used. Returns chunks, not full document content.
 
-    Usage: Primary search tool — use for any topic or keyword lookup. Prefer search_similar() when
-    you already have a reference document and want more like it. Prefer get_document() when you
+    Usage: Primary search tool — use for any topic or keyword lookup. Prefer search_similar() when you
+    already have a reference document and want more like it. Prefer get_document() when you
     already know the exact filepath and need the full content.
     """
     if not query or not query.strip():
         return json.dumps({"status": "error", "message": "Query cannot be empty"})
+
+    gate = _retrieval_gate_json("search_knowledge")
+    if gate is not None:
+        return gate
 
     if search_method not in ("auto", "hybrid", "fts5"):
         return json.dumps(
@@ -4089,13 +5363,36 @@ def search_knowledge(
                 "suggestion": "search_method='auto' fallback gracefully",
             }
         )
+    except _IndexStaleError as exc:
+        return json.dumps({"status": "error", "error": "retrieval_blocked", **exc.safe_payload()}, indent=2)
+    except RerankerUnavailableError as exc:
+        # P0 #9: enabled reranker with missing/failed artifact blocks retrieval
+        # instead of silently serving RRF order.
+        return json.dumps(
+            {
+                "status": "error",
+                "error": "retrieval_blocked",
+                "reason": "reranker_artifact_unavailable",
+                "detail": str(exc)[:200],
+                "restart_required": True,
+            },
+            indent=2,
+        )
 
     if not results:
         return json.dumps({"status": "no_results", "query": query, "message": "No relevant documents found."})
 
     total_before_filter = len(results)
     if min_score > 0.0:
-        results = [r for r in results if r.get("score", 0) >= min_score]
+        # Requirement 8: min_score filters on query_relative_score. Legacy /
+        # custom mocked results that predate the new key fall back to the
+        # legacy ``score`` field ONLY when ``query_relative_score`` is absent.
+        results = [
+            r
+            for r in results
+            if (r["query_relative_score"] if "query_relative_score" in r else r.get("score", 0)) >= min_score
+        ]
+    filtered_count = total_before_filter - len(results)
 
     if snippet_mode:
         for r in results:
@@ -4109,7 +5406,8 @@ def search_knowledge(
             "query": query,
             "hybrid_alpha": hybrid_alpha,
             "result_count": len(results),
-            "filtered_by_score": total_before_filter - len(results),
+            "filtered_by_score": filtered_count,
+            "filtered_by_query_relative_score": filtered_count,
             "cache_hit_rate": orchestrator.query_cache.stats()["hit_rate"],
             "results": results,
         },
@@ -4140,8 +5438,16 @@ def get_document(filepath: str) -> str:
     returns chunks, not full docs. Use search_knowledge() first to find the filepath
     if unknown. Use list_documents() to browse all available files by category.
     """
+    gate = _retrieval_gate_json("get_document")
+    if gate is not None:
+        return gate
     orchestrator = get_orchestrator()
-    doc = orchestrator.get_document(filepath)
+    try:
+        doc = orchestrator.get_document(filepath)
+    except _IndexStaleError as exc:
+        # Drift mid-read (including the empty/None path): blocked, never a
+        # misleading "not found".
+        return json.dumps({"status": "error", "error": "retrieval_blocked", **exc.safe_payload()}, indent=2)
 
     if not doc:
         return json.dumps({"status": "error", "message": f"Document not found: {filepath}"})
@@ -4236,6 +5542,10 @@ def reindex_documents(
     ``reindex.active`` becomes false. Add/update/URL tools already auto-index —
     use these flags only for the recovery/rebuild scenarios above.
     """
+    _versioned_error = _versioned_read_only_error("reindex_documents")
+    if _versioned_error is not None:
+        return _versioned_error
+
     orchestrator = get_orchestrator()
 
     if resume and full_rebuild:
@@ -4286,8 +5596,14 @@ def list_categories() -> str:
     which categories exist and how many documents each contains. Use get_index_stats() instead
     for broader system health metrics (model name, cache hit rate, BM25 status).
     """
+    gate = _retrieval_gate_json("list_categories")
+    if gate is not None:
+        return gate
     orchestrator = get_orchestrator()
-    categories = orchestrator.list_categories()
+    try:
+        categories = orchestrator.list_categories()
+    except _IndexStaleError as exc:
+        return json.dumps({"status": "error", "error": "retrieval_blocked", **exc.safe_payload()}, indent=2)
     return json.dumps(
         {"status": "success", "categories": categories, "total_documents": sum(categories.values())}, indent=2
     )
@@ -4313,10 +5629,16 @@ def list_documents(category: str = None) -> str:
     Usage: Use to browse what's in the index or verify a specific file is indexed. Use
     list_categories() first to see valid category names. Use search_knowledge() when you
     want to find documents by topic rather than browsing the full list. Use get_document()
-    to read a specific file once you have its filepath.
+    to read a specific file once you know its filepath.
     """
+    gate = _retrieval_gate_json("list_documents")
+    if gate is not None:
+        return gate
     orchestrator = get_orchestrator()
-    docs = orchestrator.list_documents(category=category)
+    try:
+        docs = orchestrator.list_documents(category=category)
+    except _IndexStaleError as exc:
+        return json.dumps({"status": "error", "error": "retrieval_blocked", **exc.safe_payload()}, indent=2)
     return json.dumps(
         {"status": "success", "filter": category or "all", "count": len(docs), "documents": docs},
         indent=2,
@@ -4331,7 +5653,10 @@ def get_index_stats() -> str:
     """
     Get statistics and health metrics for the knowledge base index.
 
-    Read-only. No side effects.
+    Read-only. No side effects. In versioned degraded mode this is the ONLY
+    available tool: it never instantiates an orchestrator and never opens a
+    Chroma/FTS handle — it reports ``ready:false`` plus a stable, sanitized
+    reason/evidence summary built from the lenient receipt reader.
 
     Returns:
         JSON string with system metrics: total documents, total chunks, embedding model name,
@@ -4342,6 +5667,84 @@ def get_index_stats() -> str:
     document counts instead. Use evaluate_retrieval() to measure actual search quality with
     test queries.
     """
+    if _versioned_read_only():
+        checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        from .generations import inspect_current_receipt
+
+        summary = None
+        try:
+            summary = inspect_current_receipt(Path(config.data_dir))
+        except Exception:
+            summary = None
+        generation_block = (
+            {
+                "generation_id": summary.get("generation_id"),
+                "receipt_sha256": summary.get("receipt_sha256"),
+                "schema_version": summary.get("schema_version"),
+                "servable": summary.get("servable"),
+                "created_at": summary.get("created_at"),
+                "backends": summary.get("backends"),
+            }
+            if summary
+            else None
+        )
+        pin_failure = getattr(config, "_pin_failure", None)
+        if pin_failure:
+            # Degraded stats-only mode (startup pin failure): safe summary,
+            # no orchestrator, no Chroma/FTS handles, no paths/HEAD/secrets.
+            payload = {
+                "status": "success",
+                "stats": {
+                    "index_mode": "versioned",
+                    "ready": False,
+                    "reason": pin_failure.get("reason"),
+                    "checked_at": checked_at,
+                    "detail": pin_failure.get("detail") or {},
+                    "generation": generation_block,
+                    "restart_required": True,
+                    "runtime_mutations": "disabled",
+                    "watcher": "disabled",
+                },
+            }
+            return json.dumps(payload, indent=2)
+        # Healthy versioned serving: orchestrator already pinned at startup.
+        # Freshness check BEFORE any collection.count() — a stale/corrupt
+        # backend must yield ready:false with a safe reason, never an
+        # exception and never a handle open on drifted bytes.
+        stale = _versioned_stale_state()
+        if stale is not None:
+            return json.dumps(
+                {
+                    "status": "success",
+                    "stats": {
+                        "index_mode": "versioned",
+                        "ready": False,
+                        "reason": stale.reason,
+                        "checked_at": checked_at,
+                        "detail": stale.detail or {},
+                        "generation": generation_block,
+                        "restart_required": True,
+                        "runtime_mutations": "disabled",
+                        "watcher": "disabled",
+                    },
+                },
+                indent=2,
+            )
+        if generation_block is not None:
+            generation_block["servable"] = True
+        orchestrator = get_orchestrator()
+        stats = orchestrator.get_stats()
+        stats["ready"] = True
+        stats["index_mode"] = "versioned"
+        stats.setdefault("reason", None)
+        stats.setdefault("detail", {})
+        stats["checked_at"] = checked_at
+        stats["generation"] = generation_block
+        stats["restart_required"] = False
+        stats["runtime_mutations"] = "disabled"
+        stats["watcher"] = "disabled"
+        return json.dumps({"status": "success", "stats": stats}, indent=2)
+
     orchestrator = get_orchestrator()
     stats = orchestrator.get_stats()
     return json.dumps({"status": "success", "stats": stats}, indent=2)
@@ -4380,6 +5783,10 @@ def add_document(content: str, filepath: str, category: str = "general") -> str:
     if not filepath or not filepath.strip():
         return json.dumps({"status": "error", "message": "Filepath cannot be empty"})
 
+    _versioned_error = _versioned_read_only_error("add_document")
+    if _versioned_error is not None:
+        return _versioned_error
+
     orchestrator = get_orchestrator()
     result = orchestrator.add_document_from_content(content.strip(), filepath.strip(), category)
 
@@ -4415,6 +5822,10 @@ def update_document(filepath: str, content: str) -> str:
         return json.dumps({"status": "error", "message": "Filepath required"})
     if not content or not content.strip():
         return json.dumps({"status": "error", "message": "Content cannot be empty"})
+
+    _versioned_error = _versioned_read_only_error("update_document")
+    if _versioned_error is not None:
+        return _versioned_error
 
     orchestrator = get_orchestrator()
     result = orchestrator.update_document_content(filepath, content.strip())
@@ -4452,6 +5863,10 @@ def remove_document(filepath: str, delete_file: bool = False) -> str:
     if not filepath:
         return json.dumps({"status": "error", "message": "Filepath required"})
 
+    _versioned_error = _versioned_read_only_error("remove_document")
+    if _versioned_error is not None:
+        return _versioned_error
+
     orchestrator = get_orchestrator()
     result = orchestrator.remove_document_by_path(filepath, delete_file=delete_file)
 
@@ -4487,6 +5902,10 @@ def add_from_url(url: str, category: str = "general", title: str = None) -> str:
     if not url or not url.strip():
         return json.dumps({"status": "error", "message": "URL cannot be empty"})
 
+    _versioned_error = _versioned_read_only_error("add_from_url")
+    if _versioned_error is not None:
+        return _versioned_error
+
     orchestrator = get_orchestrator()
     result = orchestrator.add_from_url(url.strip(), category, title)
 
@@ -4518,13 +5937,19 @@ def search_similar(filepath: str, max_results: int = 5) -> str:
     document. The reference document must be indexed — call list_documents() to confirm
     it exists before calling this tool.
     """
+    gate = _retrieval_gate_json("search_similar")
+    if gate is not None:
+        return gate
     if not filepath:
         return json.dumps({"status": "error", "message": "Filepath required"})
 
     max_results = max(1, min(max_results or 5, 20))
 
     orchestrator = get_orchestrator()
-    results = orchestrator.search_similar(filepath, max_results=max_results)
+    try:
+        results = orchestrator.search_similar(filepath, max_results=max_results)
+    except _IndexStaleError as exc:
+        return json.dumps({"status": "error", "error": "retrieval_blocked", **exc.safe_payload()}, indent=2)
 
     if not results:
         return json.dumps({"status": "no_results", "message": "No similar documents found or document not indexed"})
@@ -4545,19 +5970,29 @@ def evaluate_retrieval(test_cases: str) -> str:
 
     Read-only. Runs multiple search queries internally. No side effects on the index.
 
+    This is an OFFLINE SMOKE check, not a benchmark. It answers one narrow question:
+    "did the expected document appear in the top-5 for each hand-picked query?" The
+    returned MRR@5/Recall@5 are computed over that tiny curated set and carry no
+    statistical weight — do not quote them as retrieval-quality measurements.
+
     Args:
-        test_cases: JSON string array of test cases. Each item requires "query" (search string)
-            and "expected_filepath" (path of the document that should appear in top-5 results).
+        test_cases: JSON string array of test cases. Each item requires "query" (non-empty
+            search string) and "expected_filepath" (non-empty path of the document that
+            should appear in top-5 results).
             Example: [{"query": "suid exploit", "expected_filepath": "security/suid.md"}]
 
     Returns:
-        JSON string with MRR@5 (Mean Reciprocal Rank), Recall@5, and per-query hit/miss breakdown.
-        MRR@5 above 0.7 indicates good retrieval quality.
+        JSON string with evaluation_mode ("offline_smoke"), MRR@5, Recall@5, and
+        per-query hit/miss breakdown.
 
-    Usage: Use to audit search quality after bulk document ingestion or after tuning
-    hybrid_alpha. Use get_index_stats() for system health checks instead. Use
-    search_knowledge() for actual document retrieval — this tool is for quality measurement only.
+    Usage: Use to audit whether specific expected documents are reachable after bulk
+    document ingestion or after tuning hybrid_alpha — a smoke check, not a quality
+    measurement. Use get_index_stats() for system health checks instead. Use
+    search_knowledge() for actual document retrieval — this tool is for smoke checks only.
     """
+    gate = _retrieval_gate_json("evaluate_retrieval")
+    if gate is not None:
+        return gate
     try:
         cases = json.loads(test_cases) if isinstance(test_cases, str) else test_cases
     except json.JSONDecodeError:
@@ -4566,8 +6001,40 @@ def evaluate_retrieval(test_cases: str) -> str:
     if not isinstance(cases, list) or not cases:
         return json.dumps({"status": "error", "message": "test_cases must be a non-empty JSON array"})
 
+    # Requirement 8: validate shape before touching the index — every case
+    # must be an object carrying ACTUAL non-empty STRING "query" and
+    # "expected_filepath" values. No str(...) coercion: a number or null
+    # must be rejected, not stringified.
+    for tc in cases:
+        if not isinstance(tc, dict):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": 'Each test case must be an object with non-empty "query" and "expected_filepath"',
+                }
+            )
+        query = tc.get("query")
+        expected = tc.get("expected_filepath")
+        if not isinstance(query, str) or not query.strip() or not isinstance(expected, str) or not expected.strip():
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": 'Each test case must have non-empty string "query" and "expected_filepath" values '
+                    "(no coercion — numbers/null are rejected)",
+                }
+            )
+
     orchestrator = get_orchestrator()
-    results = orchestrator.evaluate_retrieval(cases)
+    try:
+        results = orchestrator.evaluate_retrieval(cases)
+    except _IndexStaleError as exc:
+        return json.dumps(
+            {"status": "error", "error": "retrieval_blocked", "reason": exc.reason, "restart_required": True}, indent=2
+        )
+    except ValueError as exc:
+        # Direct ValueError escaping the boundary (defense in depth — the
+        # shape gate above should have caught it already).
+        return json.dumps({"status": "error", "message": f"Invalid test cases: {exc}"}, indent=2)
     return json.dumps({"status": "success", **results}, indent=2)
 
 
@@ -4745,6 +6212,17 @@ def _serve_with_lifecycle(transport: str, observer, watcher) -> None:
         _stop_watcher_stack(observer, watcher)
 
 
+def _resolve_transport_cli() -> str:
+    """Config transport, overridden by --transport / --transport= CLI args."""
+    transport = config.transport
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--transport" and i < len(sys.argv) - 1:
+            transport = sys.argv[i + 1]
+        elif arg.startswith("--transport="):
+            transport = arg.split("=", 1)[1]
+    return transport
+
+
 def main():
     """Run the MCP server"""
     if len(sys.argv) > 1 and sys.argv[1] == "init":
@@ -4766,6 +6244,14 @@ def main():
     # single-line JSON ready for ELK/Loki/Datadog ingestion.
     setup_logging(fmt=config.log_format, level=config.log_level)
 
+    # P0 #8: versioned pin/verify happens BEFORE the instance-lock directory
+    # is created, before preflight, and before ANY Chroma/FTS handle opens.
+    # A missing/corrupt/stale/unverifiable current records a stable degraded
+    # reason and the server starts stats-only (only get_index_stats works).
+    pinned_generation = None
+    if _versioned_mode():
+        pinned_generation = _pin_versioned_generation()
+
     try:
         # SSE/HTTP mode: auto-enable single-instance lock (port collision prevention)
         transport = config.transport
@@ -4778,42 +6264,64 @@ def main():
             os.environ["KNOWLEDGE_RAG_SINGLE_INSTANCE"] = "1"
 
         with single_instance_lock():
-            run_preflight()
+            if _versioned_mode():
+                if pinned_generation is None:
+                    # Degraded stats-only mode (P0 #8): no orchestrator, no
+                    # preflight, no migration, no watcher. get_index_stats
+                    # reports the sanitized reason; every other tool returns
+                    # retrieval_blocked.
+                    print("[SERVER] Starting in DEGRADED stats-only mode (get_index_stats only; retrieval blocked)")
+                    _serve_with_lifecycle(_resolve_transport_cli(), None, None)
+                    return
+                # Healthy versioned serving: generation verified and pinned
+                # above — preflight, dimension migration, initial indexing,
+                # the FTS rebuild worker, and the watcher are legacy repair
+                # paths and NEVER run.
+            else:
+                run_preflight()
 
             orchestrator = get_orchestrator()
 
             # Migration: check dimension mismatch AFTER full init (avoids segfault during __init__)
-            orchestrator._needs_rebuild = orchestrator._check_dimension_mismatch()
-            if orchestrator._needs_rebuild:
-                print("[MIGRATION] Running nuclear rebuild for embedding model change...")
-                try:
-                    stats = orchestrator.nuclear_rebuild()
-                    print(
-                        f"[MIGRATION] Rebuild complete: {stats['indexed']} docs, "
-                        f"{stats['chunks_added']} chunks in {stats.get('elapsed_seconds', '?')}s"
-                    )
-                except Exception as e:
-                    print(f"[ERROR] Migration failed: {e}")
-                    print("[FALLBACK] Attempting regular index instead...")
-                    stats = orchestrator.index_all(force=True)
-            elif orchestrator.collection.count() == 0:
-                print("[INFO] No documents indexed. Running initial indexing...")
-                stats = orchestrator.index_all()
-                print(f"[INFO] Indexed {stats['indexed']} documents with {stats['chunks_added']} chunks")
+            if not _versioned_mode():
+                orchestrator._needs_rebuild = orchestrator._check_dimension_mismatch()
+                if orchestrator._needs_rebuild:
+                    print("[MIGRATION] Running nuclear rebuild for embedding model change...")
+                    try:
+                        stats = orchestrator.nuclear_rebuild()
+                        print(
+                            f"[MIGRATION] Rebuild complete: {stats['indexed']} docs, "
+                            f"{stats['chunks_added']} chunks in {stats.get('elapsed_seconds', '?')}s"
+                        )
+                    except Exception as e:
+                        print(f"[ERROR] Migration failed: {e}")
+                        print("[FALLBACK] Attempting regular index instead...")
+                        stats = orchestrator.index_all(force=True)
+                elif orchestrator.collection.count() == 0:
+                    print("[INFO] No documents indexed. Running initial indexing...")
+                    stats = orchestrator.index_all()
+                    print(f"[INFO] Indexed {stats['indexed']} documents with {stats['chunks_added']} chunks")
 
-            # Package B: single explicit FTS5 startup dispatch after the primary indexing decision (C2/C3).
-            fts5_dispatch = getattr(orchestrator, "_dispatch_fts5_startup_rebuild", None)
-            if callable(fts5_dispatch):
-                fts5_dispatch()
+                # Package B: single explicit FTS5 startup dispatch after the primary indexing decision (C2/C3).
+                fts5_dispatch = getattr(orchestrator, "_dispatch_fts5_startup_rebuild", None)
+                if callable(fts5_dispatch):
+                    fts5_dispatch()
 
             # Start file watcher for auto-reindex on document changes
             watcher = None
             observer = None
-            if os.environ.get("KNOWLEDGE_RAG_WATCHER_DISABLED", "").strip() == "1":
+            if _versioned_mode():
+                print("[WATCHER] Disabled in versioned generation mode (sealed corpus)")
+            elif os.environ.get("KNOWLEDGE_RAG_WATCHER_DISABLED", "").strip() == "1":
                 print("[WATCHER] Disabled via KNOWLEDGE_RAG_WATCHER_DISABLED=1")
+            elif not getattr(config, "watch_for_changes", True):
+                print("[WATCHER] Disabled via advanced.watch_for_changes=false")
             else:
                 try:
-                    watcher = DocumentWatcher(get_orchestrator, debounce_seconds=10.0)
+                    watcher = DocumentWatcher(
+                        get_orchestrator,
+                        debounce_seconds=float(getattr(config, "watch_debounce_seconds", 10.0)),
+                    )
                     observer = Observer()
                     observer.schedule(watcher, str(config.documents_dir), recursive=True)
                     observer.daemon = True

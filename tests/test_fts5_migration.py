@@ -302,8 +302,11 @@ def _metric_value(name: str, label: str) -> float:
 
 def _fake_collection(rows: List[Row], *, shuffle: bool = False, fault: str | None = None):
     rows = [tuple(str(v) for v in row) for row in rows]
-    all_ids = ([row[0] for row in rows] + ([rows[0][0]] if fault == "duplicate_id" else [])
-               + (["chunk_alien"] if fault == "overlong" else []))
+    all_ids = (
+        [row[0] for row in rows]
+        + ([rows[0][0]] if fault == "duplicate_id" else [])
+        + (["chunk_alien"] if fault == "overlong" else [])
+    )
 
     def count():
         if fault == "count":
@@ -320,8 +323,11 @@ def _fake_collection(rows: List[Row], *, shuffle: bool = False, fault: str | Non
         if fault in ("dup_hydrated", "extra_hydrated"):
             sel = sel + (sel[:1] if fault == "dup_hydrated" else [("chunk_alien", "x", "y", "z")])
         docs = [row[1] for row in sel]
-        return {"ids": [row[0] for row in sel], "documents": docs[:-1] if fault == "truncated" else docs,
-                "metadatas": [{"filename": row[2], "category": row[3]} for row in sel]}
+        return {
+            "ids": [row[0] for row in sel],
+            "documents": docs[:-1] if fault == "truncated" else docs,
+            "metadatas": [{"filename": row[2], "category": row[3]} for row in sel],
+        }
 
     return types.SimpleNamespace(count=count, get=get)
 
@@ -339,8 +345,10 @@ def _block_finalize(monkeypatch: pytest.MonkeyPatch) -> Tuple[threading.Event, t
     return entered, release
 
 
-_STALE_STAGING_SQL = ('CREATE VIRTUAL TABLE IF NOT EXISTS "fts5_documents_staging_g1" '
-                      "USING fts5(chunk_id UNINDEXED, content, filename, category)")
+_STALE_STAGING_SQL = (
+    'CREATE VIRTUAL TABLE IF NOT EXISTS "fts5_documents_staging_g1" '
+    "USING fts5(chunk_id UNINDEXED, content, filename, category)"
+)
 
 
 def _worker_shell(index, collection):
@@ -354,7 +362,10 @@ def _worker_shell(index, collection):
     return orch
 
 
-@pytest.mark.parametrize("fault", ["count", "read", "short_source", "duplicate_id", "overlong", "dup_hydrated", "extra_hydrated", "truncated", "sql"])
+@pytest.mark.parametrize(
+    "fault",
+    ["count", "read", "short_source", "duplicate_id", "overlong", "dup_hydrated", "extra_hydrated", "truncated", "sql"],
+)
 def test_b04_b10_fts5_snapshot_faults_publish_failed_non_ready(tmp_path, monkeypatch, fault):
     index = _make_index(tmp_path)
     if fault == "sql":
@@ -363,8 +374,12 @@ def test_b04_b10_fts5_snapshot_faults_publish_failed_non_ready(tmp_path, monkeyp
     KnowledgeOrchestrator._fts5_rebuild_worker(orch)  # synchronous in-test; admission inside the worker
     try:
         state = index.state.read()
-        assert (state["status"] == "failed" and state["generation"] == 1 and index.is_ready() is False
-                and index.search_if_ready("CVE-2021-0001") is None)
+        assert (
+            state["status"] == "failed"
+            and state["generation"] == 1
+            and index.is_ready() is False
+            and index.search_if_ready("CVE-2021-0001") is None
+        )
     finally:
         index.close()
 
@@ -380,7 +395,9 @@ def test_b05_to_b10_fts5_generation_lifecycle_and_locks(tmp_path, monkeypatch):
         index.add_document("chunk_0007", "CORRUPTED stale content", "f.md", "security")
         with index._fts5_lock:  # noqa: SLF001 — stale staging residue from an interrupted run (TQ-2)
             index._conn.execute(_STALE_STAGING_SQL)  # noqa: SLF001
-            index._conn.execute('INSERT INTO "fts5_documents_staging_g1" VALUES (?, ?, ?, ?)', ("stale_1", "STALE relic", "s.md", "x"))  # noqa: SLF001
+            index._conn.execute(
+                'INSERT INTO "fts5_documents_staging_g1" VALUES (?, ?, ?, ?)', ("stale_1", "STALE relic", "s.md", "x")
+            )  # noqa: SLF001
             index._conn.commit()  # noqa: SLF001
         assert index.is_ready() is False, "unversioned partial marker must not be credible (B05)"
         release.set()  # B05 rebuild runs through unblocked; reversed input rows (D4)
@@ -390,7 +407,9 @@ def test_b05_to_b10_fts5_generation_lifecycle_and_locks(tmp_path, monkeypatch):
         with index._fts5_lock:  # noqa: SLF001
             rowid_order = [r[0] for r in index._conn.execute("SELECT chunk_id FROM fts5_documents ORDER BY rowid")]  # noqa: SLF001
         assert rowid_order == sorted(rowid_order, key=lambda c: c.encode("utf-8")), "canonical rowid order (D4)"
-        assert index.search_if_ready("CORRUPTED") == [] and index.search_if_ready("STALE") == [], "no residue (B05/TQ-2)"
+        assert index.search_if_ready("CORRUPTED") == [] and index.search_if_ready("STALE") == [], (
+            "no residue (B05/TQ-2)"
+        )
         assert index.search_if_ready("CVE-2021-0001"), "credible generation must serve (B08)"
         release.clear()
         entered.clear()
@@ -410,8 +429,9 @@ def test_b05_to_b10_fts5_generation_lifecycle_and_locks(tmp_path, monkeypatch):
         worker.join(timeout=10.0)
         assert index._mutation_epoch == epoch_before, "a stale generation must never execute the swap ALTER (TQ-3)"  # noqa: SLF001
         state = index.state.read()
-        assert state["status"] == "invalidated" and state["generation"] == gen2 and index.is_ready() is False, \
+        assert state["status"] == "invalidated" and state["generation"] == gen2 and index.is_ready() is False, (
             "durable invalidation; late complete dropped (D2/B07)"
+        )
         assert index.rebuild_content_bound(_gen_rows(8, "succ"), generation=gen2)["status"] == "complete"
         index.publish_rebuild_failure(1, RuntimeError("stale late failure"))  # B10 stale guard (gen1)
         state = index.state.read()
@@ -426,6 +446,7 @@ def test_b05_to_b10_fts5_generation_lifecycle_and_locks(tmp_path, monkeypatch):
                 armed["on"] = False
                 raise OSError("disk full during publication")
             real_write(payload)
+
         index.state.write = failing_complete_write
         with pytest.raises(Fts5MigrationError, match="complete-marker publication failed"):
             index.rebuild_content_bound(_gen_rows(8, "succ"), generation=gen2)  # same-source candidate
@@ -445,6 +466,7 @@ def test_p1_8_fts5_dispatch_daemon_and_thread_start_rollback(tmp_path, monkeypat
 
     def failing_start(self):
         raise RuntimeError("thread start failed")
+
     monkeypatch.setattr(threading.Thread, "start", failing_start)
     KnowledgeOrchestrator._start_fts5_rebuild_worker(orch)  # must neither raise nor consume admission
     monkeypatch.undo()
@@ -489,12 +511,15 @@ def test_p1_8_fts5_dispatch_daemon_and_thread_start_rollback(tmp_path, monkeypat
         assert _metric_value("knowledge_rag_fast_path_migration_docs_indexed", "") == 3.0, "indexed after complete (D6)"
         monkeypatch.setattr(Fts5LexicalIndex, "_populate_staging", _sql_boom)
         KnowledgeOrchestrator._fts5_rebuild_worker(_worker_shell(index, _fake_collection(_gen_rows(3, "other"))))
-        assert _metric_value("knowledge_rag_fast_path_migration_docs_total", "") == 3.0, "total = captured snapshot (D6)"
+        assert _metric_value("knowledge_rag_fast_path_migration_docs_total", "") == 3.0, (
+            "total = captured snapshot (D6)"
+        )
         assert _metric_value("knowledge_rag_fast_path_migration_docs_indexed", "") == 0.0, "failure resets indexed (D6)"
         KnowledgeOrchestrator._fts5_rebuild_worker(_worker_shell(index, _fake_collection(_gen_rows(3), fault="count")))
-        assert (_metric_value("knowledge_rag_fast_path_migration_docs_total", "") == 0.0
-                and _metric_value("knowledge_rag_fast_path_migration_docs_indexed", "") == 0.0), \
-            "capture failure resets BOTH gauges (D6)"
+        assert (
+            _metric_value("knowledge_rag_fast_path_migration_docs_total", "") == 0.0
+            and _metric_value("knowledge_rag_fast_path_migration_docs_indexed", "") == 0.0
+        ), "capture failure resets BOTH gauges (D6)"
     finally:
         index.close()
 
@@ -511,10 +536,15 @@ def test_p1_7_fts5_builder_binds_source_and_target_to_cli_root(tmp_path, monkeyp
     monkeypatch.setattr(srv.config, "data_dir", lab, raising=False)
     monkeypatch.setattr(srv.config, "chroma_dir", lab / "chroma_db", raising=False)
     collection = chromadb.PersistentClient(path=str(root / "chroma_db")).get_or_create_collection(name="knowledge_base")
-    collection.add(ids=["c1", "c2", "c3"], documents=["alpha TOKROOT", "beta", "gamma"],
-                   metadatas=[{"filename": "a.md", "category": "x"}] * 3, embeddings=[[0.0, 0.1]] * 3)
-    spec = importlib.util.spec_from_file_location("build_fts5_index_under_test",
-                                                  _REPO_ROOT / "scripts" / "build_fts5_index.py")
+    collection.add(
+        ids=["c1", "c2", "c3"],
+        documents=["alpha TOKROOT", "beta", "gamma"],
+        metadatas=[{"filename": "a.md", "category": "x"}] * 3,
+        embeddings=[[0.0, 0.1]] * 3,
+    )
+    spec = importlib.util.spec_from_file_location(
+        "build_fts5_index_under_test", _REPO_ROOT / "scripts" / "build_fts5_index.py"
+    )
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     monkeypatch.delenv("KNOWLEDGE_RAG_DIR", raising=False)
@@ -536,24 +566,43 @@ def test_p1_7_fts5_builder_binds_source_and_target_to_cli_root(tmp_path, monkeyp
     project = tmp_path / "project"  # D5-r5: canonical layout — project/config.yaml beside project/data
     (project / "data" / "chroma_db").mkdir(parents=True)
     (project / "config.yaml").write_text("search:\n  collection_name: vet_custom\n", encoding="utf-8")
-    sub = chromadb.PersistentClient(path=str(project / "data" / "chroma_db")).get_or_create_collection(name="vet_custom")
-    sub.add(ids=["c1"], documents=["alpha SUBTOKEN"], metadatas=[{"filename": "a", "category": "x"}], embeddings=[[0.1, 0.2]])
+    sub = chromadb.PersistentClient(path=str(project / "data" / "chroma_db")).get_or_create_collection(
+        name="vet_custom"
+    )
+    sub.add(
+        ids=["c1"],
+        documents=["alpha SUBTOKEN"],
+        metadatas=[{"filename": "a", "category": "x"}],
+        embeddings=[[0.1, 0.2]],
+    )
     env = {**os.environ, "KNOWLEDGE_RAG_DIR": str(tmp_path / "sub-lab-sentinel")}
-    proc = subprocess.run([sys.executable, str(_REPO_ROOT / "scripts" / "build_fts5_index.py"),
-                           "--data-dir", str(project / "data")], env=env, cwd=str(_REPO_ROOT),
-                          capture_output=True, text=True, timeout=55)
+    proc = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "scripts" / "build_fts5_index.py"), "--data-dir", str(project / "data")],
+        env=env,
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=55,
+    )
     assert proc.returncode == 0, (proc.stdout + proc.stderr)[-500:]
-    assert (project / "data" / "fts5_index.db").exists() and not (tmp_path / "sub-lab-sentinel").exists(), \
+    assert (project / "data" / "fts5_index.db").exists() and not (tmp_path / "sub-lab-sentinel").exists(), (
         "canonical project/config.yaml collection_name honored; lab binding overridden (D5-r5)"
-    assert (not (project / "data" / "data").exists() and not (project / "data" / "documents").exists()
-            and not (project / "data" / "models").exists()), "no nested config-created roots (D5)"
-    reopened = Fts5LexicalIndex(db_path=project / "data" / "fts5_index.db",
-                                state_path=project / "data" / "fts5_migration.state")
+    )
+    assert (
+        not (project / "data" / "data").exists()
+        and not (project / "data" / "documents").exists()
+        and not (project / "data" / "models").exists()
+    ), "no nested config-created roots (D5)"
+    reopened = Fts5LexicalIndex(
+        db_path=project / "data" / "fts5_index.db", state_path=project / "data" / "fts5_migration.state"
+    )
     try:  # TQ-4: exact row count, token retrieval and digest — not only file existence
         assert reopened.count() == 1 and reopened.search("SUBTOKEN"), "exact rows must be retrievable (TQ-4)"
         marker = reopened.state.read()
-        assert marker["docs_total"] == 1 and marker["source_rows_sha256"] == compute_rows_digest(
-            [("c1", "alpha SUBTOKEN", "a", "x")])[0], "exact digest (TQ-4)"
+        assert (
+            marker["docs_total"] == 1
+            and marker["source_rows_sha256"] == compute_rows_digest([("c1", "alpha SUBTOKEN", "a", "x")])[0]
+        ), "exact digest (TQ-4)"
     finally:
         reopened.close()
 
@@ -573,7 +622,12 @@ def test_d2_d3_durable_invalidation_generation_authority_and_rollback(tmp_path, 
     index = Fts5LexicalIndex(db_path=tmp_path / "fts5_index.db", state_path=tmp_path / "fts5_migration.state")
     try:
         assert index._generation == gen2 and index.is_ready() is False, "reopen restores counter, non-ready (D2)"  # noqa: SLF001
-        assert index.rebuild_content_bound([(f"c{i}", f"OLDTOKEN {i}", "f.md", "x") for i in range(3)], generation=index.begin_rebuild())["status"] == "complete"
+        assert (
+            index.rebuild_content_bound(
+                [(f"c{i}", f"OLDTOKEN {i}", "f.md", "x") for i in range(3)], generation=index.begin_rebuild()
+            )["status"]
+            == "complete"
+        )
         assert index.is_ready() is True, "retry after reopen must succeed (D2)"
         started, resume = threading.Event(), threading.Event()
 
@@ -582,19 +636,33 @@ def test_d2_d3_durable_invalidation_generation_authority_and_rollback(tmp_path, 
                 started.set()
                 assert resume.wait(timeout=10.0), "early barrier never released"
             return _real(rows_arg)
+
         monkeypatch.setattr(fts5_module, "compute_rows_digest", delaying_digest)
-        delayed = threading.Thread(target=index.rebuild_content_bound, args=([("d1", "DELAYED", "f.md", "x")],), kwargs={"generation": gen2})
+        delayed = threading.Thread(
+            target=index.rebuild_content_bound, args=([("d1", "DELAYED", "f.md", "x")],), kwargs={"generation": gen2}
+        )
         delayed.start()
         assert started.wait(timeout=5.0)
         gen3 = index.invalidate_generation()
-        assert index.rebuild_content_bound([(f"n{i}", f"GEN3TOKEN {i}", "f.md", "x") for i in range(3)], generation=gen3)["status"] == "complete"
+        assert (
+            index.rebuild_content_bound([(f"n{i}", f"GEN3TOKEN {i}", "f.md", "x") for i in range(3)], generation=gen3)[
+                "status"
+            ]
+            == "complete"
+        )
         resume.set()
         delayed.join(timeout=10.0)
         state = index.state.read()
-        assert state["status"] == "complete" and state["generation"] == gen3 and index.count() == 3 \
-            and index.is_ready() is True, "delayed pre-marker write dropped; live DB stays gen3 (P1-2/D2)"
+        assert (
+            state["status"] == "complete"
+            and state["generation"] == gen3
+            and index.count() == 3
+            and index.is_ready() is True
+        ), "delayed pre-marker write dropped; live DB stays gen3 (P1-2/D2)"
         reverse_name = "_reverse_swap" if hasattr(Fts5LexicalIndex, "_reverse_swap") else "_reverse_swap_quiet"
-        monkeypatch.setattr(Fts5LexicalIndex, reverse_name, lambda self, staging, backup: True)  # false success: bytes stay candidate
+        monkeypatch.setattr(
+            Fts5LexicalIndex, reverse_name, lambda self, staging, backup: True
+        )  # false success: bytes stay candidate
         real_write, armed = index.state.write, {"armed": True}
 
         def failing_write(payload):
@@ -602,11 +670,14 @@ def test_d2_d3_durable_invalidation_generation_authority_and_rollback(tmp_path, 
                 armed["armed"] = False
                 raise OSError("publication failed")
             real_write(payload)
+
         index.state.write = failing_write
         with pytest.raises(Fts5MigrationError, match="complete-marker publication failed"):
             index.rebuild_content_bound([(f"n{i}", f"NEWTOKEN {i}", "f.md", "x") for i in range(3)], generation=gen3)
         del index.state.write
-        assert index.is_ready() is False and index.state.read()["status"] != "complete", "restore requires exact live match (D3)"
+        assert index.is_ready() is False and index.state.read()["status"] != "complete", (
+            "restore requires exact live match (D3)"
+        )
         assert index.search_if_ready("NEWTOKEN") is None and index.search_if_ready("GEN3TOKEN") is None
     finally:
         resume.set()
@@ -730,7 +801,9 @@ def test_bc05_recovery_request_while_worker_finishes_starts_one_successor(tmp_pa
     monkeypatch.setattr(threading, "Thread", Rec)
     KnowledgeOrchestrator._start_fts5_rebuild_worker(orch)
     assert in_finish.wait(timeout=10.0)  # _index_lock already released; dispatch flag still set
-    KnowledgeOrchestrator._start_fts5_rebuild_worker(orch, material=True)  # material recovery inside the window (BC-05/P1-C)
+    KnowledgeOrchestrator._start_fts5_rebuild_worker(
+        orch, material=True
+    )  # material recovery inside the window (BC-05/P1-C)
     assert len(workers) == 1, "no parallel worker inside the finish window (BC-05)"
     resume_finish.set()
     workers[0].join(timeout=10.0)

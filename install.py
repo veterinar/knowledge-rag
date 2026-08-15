@@ -49,9 +49,11 @@ for _stream in (sys.stdout, sys.stderr):
 
 SERVER_NAME = "knowledge-rag"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-REQUIREMENTS_FILE = "requirements.txt"
+RUNTIME_LOCK_FILE = "requirements.lock"
+BUILD_LOCK_FILE = "build-requirements.lock"
+REQUIREMENTS_FILE = "requirements.txt"  # loose contribution list — NEVER a production install input
 PYPI_PACKAGE = "knowledge-rag"
-SUPPORTED_PY = {"3.11", "3.12"}
+SUPPORTED_PY = {"3.11", "3.12", "3.13"}
 DEFAULT_INSTALL_DIRNAME = "knowledge-rag"
 BACKUP_SUFFIX = ".knowledge-rag.bak"
 
@@ -547,21 +549,80 @@ def setup_venv(
     else:
         ok("Virtual environment exists")
 
-    info("Upgrading pip ...")
-    subprocess.check_call([str(venv_py), "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
+    # No floating pip upgrade: pip is hash-pinned inside the locks for the
+    # reproducible --from-source path; the PyPI convenience path uses the
+    # venv's bundled pip as-is.
 
     if from_source:
-        req_here = Path.cwd() / REQUIREMENTS_FILE
-        req_installed = install_path / REQUIREMENTS_FILE
-        req = req_installed if req_installed.exists() else req_here
-        if not req.exists():
-            err(f"{REQUIREMENTS_FILE} not found in {install_path} nor {Path.cwd()}")
+        # PRODUCTION reproducible source install (v4.9.0 final):
+        #   1. hash-locked runtime deps from requirements.lock;
+        #   2. ONE temporary builder venv from build-requirements.lock
+        #      (--require-hashes), building EXACTLY ONE wheel with
+        #      `python -m build --no-isolation` (no floating isolated
+        #      PEP517 build, no floating pip upgrade anywhere);
+        #   3. that exact wheel installed --no-deps into the runtime venv;
+        #   4. pip check.
+        # The ranged requirements.txt is a contribution list and is never a
+        # production install input.
+        def _locate(filename: str) -> Path:
+            installed = install_path / filename
+            if installed.exists():
+                return installed
+            here = Path.cwd() / filename
+            if here.exists():
+                return here
+            err(f"{filename} not found in {install_path} nor {Path.cwd()}")
             err("Clone the repo first, or drop --from-source to install from PyPI")
             sys.exit(1)
-        info(f"Installing from {req} ...")
-        subprocess.check_call([str(venv_py), "-m", "pip", "install", "-r", str(req), "--quiet"])
+
+        runtime_lock = _locate(RUNTIME_LOCK_FILE)
+        build_lock = _locate(BUILD_LOCK_FILE)
+
+        info(f"Installing runtime lock from {runtime_lock} (--require-hashes) ...")
+        subprocess.check_call(
+            [str(venv_py), "-m", "pip", "install", "--require-hashes", "-r", str(runtime_lock), "--quiet"]
+        )
+
+        with tempfile.TemporaryDirectory(prefix="kr-build-") as tmp:
+            builder_dir = Path(tmp) / "builder-venv"
+            dist_dir = Path(tmp) / "dist"
+            venv.EnvBuilder(with_pip=True, upgrade_deps=False, clear=True).create(builder_dir)
+            builder_py = venv_python_path(builder_dir)
+            info("Installing build lock into temporary builder venv (--require-hashes) ...")
+            subprocess.check_call(
+                [str(builder_py), "-m", "pip", "install", "--require-hashes", "-r", str(build_lock), "--quiet"]
+            )
+            info(f"Building exactly one wheel from {install_path} (--no-isolation) ...")
+            subprocess.check_call(
+                [
+                    str(builder_py),
+                    "-m",
+                    "build",
+                    "--no-isolation",
+                    "--wheel",
+                    "--outdir",
+                    str(dist_dir),
+                    str(install_path),
+                ]
+            )
+            wheels = sorted(dist_dir.glob("*.whl"))
+            if len(wheels) != 1:
+                err(f"Expected exactly one built wheel, found {len(wheels)}: {[w.name for w in wheels]}")
+                sys.exit(1)
+            wheel_path = wheels[0]
+            info(f"Installing exact wheel {wheel_path.name} (--no-deps) ...")
+            subprocess.check_call(
+                [str(venv_py), "-m", "pip", "install", "--no-deps", str(wheel_path), "--quiet"]
+            )
+        subprocess.check_call([str(venv_py), "-m", "pip", "check", "--quiet"])
     else:
         target = PYPI_PACKAGE if not pypi_version else f"{PYPI_PACKAGE}=={pypi_version}"
+        warn(
+            "PyPI convenience path: this resolves dependencies at install time "
+            "and is NOT the admitted reproducible versioned-mode deployment "
+            "route (use --from-source with the hash locks, or the exact "
+            "release wheel + requirements.lock)."
+        )
         info(f"Installing {target} from PyPI ...")
         subprocess.check_call([str(venv_py), "-m", "pip", "install", target, "--quiet"])
 
@@ -705,7 +766,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--from-source",
         action="store_true",
-        help="Install from local requirements.txt instead of PyPI",
+        help="Production install from a source checkout: hash-locked requirements.lock deps, then the exact project with --no-deps",
     )
     p.add_argument(
         "--pypi-version",

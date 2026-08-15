@@ -220,6 +220,27 @@ models:
     # Full setup guide + troubleshooting: docs/gpu-setup.md
     gpu: "auto"
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Versioned-generation compatibility pins (only used when
+    # indexing.mode: "versioned" — see the INDEXING section below).
+    # ─────────────────────────────────────────────────────────────────────
+    # When indexing.mode is "versioned", these three fields are REQUIRED and
+    # are sealed into every generation receipt's compatibility object. A
+    # generation can only be served/activated by a process whose pins match
+    # byte-for-byte, so a swapped model or runtime can never silently serve
+    # stale embeddings.
+    #
+    # artifact_path — exact LOCAL model artifact directory (the ONNX/model
+    #   files themselves, NOT a model name and NOT the whole cache dir). Its
+    #   recursive SHA-256 becomes compatibility.model_artifact_sha256.
+    # runtime_version — exact embedding runtime identity, e.g.
+    #   "fastembed 0.3.6" or "sentence-transformers 3.0.1+onnx".
+    # pooling — exact pooling strategy, e.g. "cls" or "mean".
+    #
+    # artifact_path: "models_cache/bge-small-en-v1.5"
+    # runtime_version: "fastembed 0.3.6"
+    # pooling: "cls"
+
   # Reranker — re-scores search results for better accuracy.
   # Adds ~50-100ms per query but significantly improves result quality.
   # Set enabled: false on low-resource machines if search feels slow.
@@ -367,15 +388,42 @@ query_expansion_groups: []
 
 
 # ============================================================================
+# INDEXING — legacy (default) vs versioned generations
+# ============================================================================
+# "legacy"    — the classic in-place mutable index: watcher auto-reindex,
+#               add/update/remove tools, smart/nuclear reindex. This is the
+#               default and preserves prior behavior exactly.
+# "versioned" — immutable sealed generations served read-only. The server
+#               pins ONE verified generation for its entire process lifetime;
+#               all mutations move to the offline builder CLI:
+#
+#                   knowledge-rag-generation status
+#                   knowledge-rag-generation build
+#                   knowledge-rag-generation activate <generation_id>
+#                   knowledge-rag-generation rollback <generation_id>
+#
+#               Requires the models.embedding pins above (artifact_path,
+#               runtime_version, pooling). Build/activate/rollback always
+#               require a server restart to take effect.
+#
+# indexing:
+#   mode: "versioned"
+
+
+# ============================================================================
 # ADVANCED
 # ============================================================================
 # Settings for power users. Most people never need to touch these.
 
 # advanced:
-#   # File watcher — auto-reindex when documents change.
-#   # Disable if you prefer manual reindexing only.
+#   # File watcher — auto-reindex when documents change (legacy mode only;
+#   # versioned mode forcibly disables the watcher regardless of this flag,
+#   # and KNOWLEDGE_RAG_WATCHER_DISABLED=1 remains the emergency override).
 #   watch_for_changes: true
-#   watch_debounce_seconds: 5
+#   # Silence window (seconds) the watcher accumulates file events in before
+#   # triggering one reindex. Must be a finite positive number (invalid
+#   # values fall back to 10.0 with a WARN).
+#   watch_debounce_seconds: 10.0
 #
 #   # BM25 parameters (keyword search tuning).
 #   # k1: term frequency saturation (1.2-2.0). Higher = more weight on repeated terms.

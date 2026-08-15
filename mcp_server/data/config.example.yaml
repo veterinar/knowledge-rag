@@ -58,11 +58,19 @@ documents:
     - .txt       # Plain text
     - .pdf       # PDF documents
     - .docx      # Word documents
+    - .py        # Python source code
+    - .c         # C source code
+    - .h         # C/C++ header files
+    - .cpp       # C++ source code
+    - .js        # JavaScript
+    - .jsx       # React JSX
+    - .ts        # TypeScript
+    - .tsx       # React TypeScript TSX
+    - .json      # JSON files
+    - .xml       # XML files
     # - .xlsx    # Excel spreadsheets
     # - .pptx    # PowerPoint presentations
     # - .csv     # CSV data files
-    # - .py      # Python source code
-    # - .json    # JSON files
     # - .ipynb   # Jupyter Notebooks (extracts markdown + code cells)
     # - .mq4     # MetaTrader MQL4 source (opt-in, add to enable)
     # - .mqh     # MetaTrader MQL4/5 headers (opt-in, add to enable)
@@ -100,6 +108,34 @@ documents:
     chunk_size: 1000
     chunk_overlap: 200
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Indexing performance tuning (v4.8.0+)
+  # ─────────────────────────────────────────────────────────────────────
+  #
+  # batch_size — Number of chunks per ChromaDB batch add() call. Higher
+  # values mean fewer SQLite round-trips and faster indexing, at the
+  # cost of RAM (roughly batch_size * embedding_dim * 4 bytes for
+  # float32 vectors sitting in memory while the batch flushes).
+  # Default 500 preserves prior hardcoded behavior byte-for-byte.
+  # Valid range: 1 to 5000 (values outside are clamped with a WARN).
+  batch_size: 500
+
+  # parallel_workers — Opt-in threading around ChromaDB batch adds.
+  # Default 1 = single-threaded = safe on all platforms.
+  #
+  # When set > 1, per-batch ``collection.add(...)`` calls run inside a
+  # ThreadPoolExecutor. ONNX embedding itself is serialized (internal
+  # session lock), so the win comes from SQLite writes overlapping with
+  # the NEXT batch's inference — NOT from parallel inference. Expect
+  # modest gains (10-30%) on multi-batch documents, zero gain on
+  # single-batch docs (the pool is skipped for those).
+  #
+  # WARNING: parallel_workers > 4 on Windows may hit ONNX threading
+  # issues or SQLite lock contention — monitor stability. Recommended
+  # cap: 4 on Windows, 8 on Linux/macOS.
+  # Valid range: 1 to 16 (values outside are clamped with a WARN).
+  parallel_workers: 1
+
 
 # ============================================================================
 # MODELS
@@ -111,19 +147,99 @@ models:
   # Embedding model — converts text into vectors for semantic search.
   # Runs locally via ONNX (no API key needed, no data leaves your machine).
   #
-  # Options (from fastest to most accurate):
-  #   "BAAI/bge-small-en-v1.5"    → 384 dims, ~33MB, fast    (default)
-  #   "BAAI/bge-base-en-v1.5"     → 768 dims, ~130MB, balanced
-  #   "BAAI/bge-large-en-v1.5"    → 1024 dims, ~335MB, most accurate
+  # Two ways to configure (v4.8.0+):
   #
-  # Multilingual alternatives:
-  #   "BAAI/bge-small-zh-v1.5"         → Chinese
-  #   "intfloat/multilingual-e5-small"  → 100+ languages
+  # ---- Option A: named profile (recommended) ----
+  # ``profile`` is a shorthand that fills model + dimensions + prefixes
+  # from a single named preset. Available profiles:
   #
-  # WARNING: Changing this after indexing requires a full reindex.
+  #   compact       — BAAI/bge-small-en-v1.5 (384D, ~33MB, English-only, fastest — default)
+  #   quality       — BAAI/bge-large-en-v1.5 (1024D, ~335MB, English-only, ~2x slower)
+  #   multilingual  — intfloat/multilingual-e5-large (1024D, 100+ languages
+  #                   incl. PT-BR / Spanish / Cyrillic / Arabic / CJK; ships
+  #                   the required "query: " / "passage: " prefixes)
+  #   custom        — opt out: respect the explicit model/dimensions/prefix
+  #                   fields below (default when ``profile`` is omitted)
+  #
+  # When ``profile`` is anything other than "custom", the resolver IGNORES
+  # any explicit ``model`` declared below and emits a
+  # ``[WARN] profile takes precedence`` log on startup.
+  #
+  # ---- Option B: explicit model (custom profile) ----
+  # Legacy shape — set ``profile: "custom"`` (or omit ``profile``) and
+  # declare the model + dimensions directly. Additional community models:
+  #   "BAAI/bge-base-en-v1.5"          → 768 dims, ~130MB, balanced
+  #   "BAAI/bge-small-zh-v1.5"         → 384 dims, Chinese-only
+  #   "intfloat/multilingual-e5-small" → 384 dims, 100+ languages (smaller e5)
+  #
+  # WARNING: changing profile / model / dimensions / prefix after indexing
+  # REQUIRES a full reindex (``reindex_documents(force=True)``). Existing
+  # chunks were embedded with the previous configuration and their vectors
+  # are not comparable to the new ones.
   embedding:
+    # Uncomment to switch to a named profile (see Option A above).
+    # profile: "multilingual"
+
+    # Explicit model / dimensions — respected only when profile is
+    # "custom" (default). Ignored with a WARN under any other profile.
     model: "BAAI/bge-small-en-v1.5"
     dimensions: 384
+
+    # Query / passage prefixes — prepended to text BEFORE embedding.
+    # Required by some model families (intfloat/e5, thenlper/gte, ...);
+    # leave empty for bge / mxbai. When a profile ships prefixes, this
+    # override wins ONLY if the key is present here (empty string "" IS
+    # an explicit override).
+    query_prefix: ""
+    passage_prefix: ""
+
+    # GPU acceleration mode (v4.8.0+):
+    #   "auto"  → probe CUDA at startup; use if ready, fall back to CPU (default)
+    #   "true"  → force CUDA; if not ready, log WARN and fall back to CPU
+    #   "false" → never probe; runs on CPU with zero startup overhead
+    #
+    # Legacy bool `gpu: true/false` continues to work — it is normalized to the
+    # string form internally, so old configs keep behaving exactly the same.
+    #
+    # GPU dependency chain (all installed via pip in the same venv):
+    #   1. onnxruntime-gpu, CUDA 12 variant (CUDA 13 is NOT supported by FastEmbed):
+    #        pip install onnxruntime-gpu \
+    #          --extra-index-url \
+    #          https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+    #   2. NVIDIA runtime libs (pulled by pip, no system driver rewrite):
+    #        pip install nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 \
+    #          nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 \
+    #          nvidia-cusparse-cu12 nvidia-nvjitlink-cu12 nvidia-cuda-nvrtc-cu12
+    #   3. Host: NVIDIA driver >= 525 (for CUDA 12). cuDNN 9 comes with nvidia-cudnn-cu12.
+    #
+    # Verify readiness manually without loading the embedding model:
+    #   python -c "from mcp_server.server import FastEmbedEmbeddings; \
+    #     import json; print(json.dumps(FastEmbedEmbeddings.verify_gpu_readiness().__dict__, \
+    #     default=str, indent=2))"
+    #
+    # Full setup guide + troubleshooting: docs/gpu-setup.md
+    gpu: "auto"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Versioned-generation compatibility pins (only used when
+    # indexing.mode: "versioned" — see the INDEXING section below).
+    # ─────────────────────────────────────────────────────────────────────
+    # When indexing.mode is "versioned", these three fields are REQUIRED and
+    # are sealed into every generation receipt's compatibility object. A
+    # generation can only be served/activated by a process whose pins match
+    # byte-for-byte, so a swapped model or runtime can never silently serve
+    # stale embeddings.
+    #
+    # artifact_path — exact LOCAL model artifact directory (the ONNX/model
+    #   files themselves, NOT a model name and NOT the whole cache dir). Its
+    #   recursive SHA-256 becomes compatibility.model_artifact_sha256.
+    # runtime_version — exact embedding runtime identity, e.g.
+    #   "fastembed 0.3.6" or "sentence-transformers 3.0.1+onnx".
+    # pooling — exact pooling strategy, e.g. "cls" or "mean".
+    #
+    # artifact_path: "models_cache/bge-small-en-v1.5"
+    # runtime_version: "fastembed 0.3.6"
+    # pooling: "cls"
 
   # Reranker — re-scores search results for better accuracy.
   # Adds ~50-100ms per query but significantly improves result quality.
@@ -146,12 +262,55 @@ search:
   default_results: 5
 
   # Hard maximum — even if a client requests more, cap at this number.
-  max_results: 20
+  # Also bounds the candidate pool size in the semantic branch of the
+  # hybrid retriever (``_do_semantic`` asks ChromaDB for
+  # ``min(max_results * 3, config.max_results)`` candidates).
+  #
+  # v4.8.0 Fase 3 raised the default from 20 to 100. Prior to that fix,
+  # the ``min(...)`` capped semantic candidates at 20 while BM25 pulled
+  # up to ``max_results * 20 = 400`` — semantic silently starved on
+  # hybrid mode. Callers passing ``max_results`` explicitly in the MCP
+  # tool call are unaffected; only the default changed.
+  max_results: 100
 
   # ChromaDB collection name. Change this to maintain separate
   # knowledge bases in the same data directory.
   # Example: "work_kb", "research_kb", "personal_kb"
   collection_name: "knowledge_base"
+
+  # -----------------------------------------------------------------------
+  # FTS5 Lexical Fast-Path (v4.8.2+, opt-in — default OFF pending v4.9.0)
+  # -----------------------------------------------------------------------
+  # Dedicated SQLite FTS5 index (data/fts5_index.db) optimized for exact
+  # identifier queries (CVE-IDs, MITRE ATT&CK codes, VRT/CWE codes, file
+  # hashes, error strings). See ADR-001 (storage), ADR-005 (tokenizer),
+  # ADR-004 (v4.9.0 default flip gated on bench), ADR-009 (gate deferred
+  # to CI perf-gate). Full user guide: docs/features/fts5_fast_path.md.
+  #
+  # The default remains `enabled: false` for v4.8.x. Setting `enabled: true`
+  # here opts your instance in early — see the docs page for latency
+  # expectations, migration behaviour, and telemetry counters.
+  lexical_fast_path:
+    # Master toggle. Default false preserves v4.8.1 behavior byte-for-byte.
+    enabled: false
+
+    # Minimum FTS5 hits required to skip the hybrid fallback. Queries
+    # returning fewer than this many results fall back to hybrid so recall
+    # is not sacrificed for a nearly-empty lexical result set.
+    min_hits: 3
+
+    # Run the cross-encoder reranker on FTS5 results. Default false (ADR-003)
+    # because identifier queries rank correctly on bm25() alone and the
+    # reranker adds ~40-80ms per query without measurable recall gain.
+    rerank_enabled: false
+
+    # First-match-wins regex patterns that classify a query as "lexical".
+    # Ordering matters (PRD OQ-2). Default set targets bug bounty + SOC/DFIR
+    # identifier vocabulary. Add custom project-specific codes below.
+    patterns:
+      - "[A-Z]{2,}-\\d+"        # H1-P4-XXX, MDR-AD002, CWE-79, MS17-010
+      - "CVE-\\d{4}-\\d+"       # canonical CVE identifiers
+      - "^[a-f0-9]{32,64}$"     # md5/sha1/sha256 file hashes
 
 
 # ============================================================================
@@ -213,6 +372,43 @@ keyword_routes: {}
 
 query_expansions: {}
 
+# Symmetric query expansion groups — every term expands to every other term
+# in the same group. Use this when you want mutual synonyms without writing
+# duplicate directional entries in query_expansions.
+#
+# Format:
+#   - ["term a", "term b", "term c"]
+#   - ["abbreviation", "full phrase"]
+#
+# The final expansion table is built from BOTH query_expansions and
+# query_expansion_groups. Legacy query_expansions entries are kept, then group
+# links are added on top.
+
+query_expansion_groups: []
+
+
+# ============================================================================
+# INDEXING — legacy (default) vs versioned generations
+# ============================================================================
+# "legacy"    — the classic in-place mutable index: watcher auto-reindex,
+#               add/update/remove tools, smart/nuclear reindex. This is the
+#               default and preserves prior behavior exactly.
+# "versioned" — immutable sealed generations served read-only. The server
+#               pins ONE verified generation for its entire process lifetime;
+#               all mutations move to the offline builder CLI:
+#
+#                   knowledge-rag-generation status
+#                   knowledge-rag-generation build
+#                   knowledge-rag-generation activate <generation_id>
+#                   knowledge-rag-generation rollback <generation_id>
+#
+#               Requires the models.embedding pins above (artifact_path,
+#               runtime_version, pooling). Build/activate/rollback always
+#               require a server restart to take effect.
+#
+# indexing:
+#   mode: "versioned"
+
 
 # ============================================================================
 # ADVANCED
@@ -220,10 +416,14 @@ query_expansions: {}
 # Settings for power users. Most people never need to touch these.
 
 # advanced:
-#   # File watcher — auto-reindex when documents change.
-#   # Disable if you prefer manual reindexing only.
+#   # File watcher — auto-reindex when documents change (legacy mode only;
+#   # versioned mode forcibly disables the watcher regardless of this flag,
+#   # and KNOWLEDGE_RAG_WATCHER_DISABLED=1 remains the emergency override).
 #   watch_for_changes: true
-#   watch_debounce_seconds: 5
+#   # Silence window (seconds) the watcher accumulates file events in before
+#   # triggering one reindex. Must be a finite positive number (invalid
+#   # values fall back to 10.0 with a WARN).
+#   watch_debounce_seconds: 10.0
 #
 #   # BM25 parameters (keyword search tuning).
 #   # k1: term frequency saturation (1.2-2.0). Higher = more weight on repeated terms.
@@ -233,3 +433,36 @@ query_expansions: {}
 #
 #   # Logging verbosity: DEBUG, INFO, WARNING, ERROR
 #   # log_level: "INFO"
+
+
+# ============================================================================
+# SERVER (new in v4.0.0)
+# ============================================================================
+# Controls transport, networking, and enterprise features.
+# All fields are optional — defaults preserve v3.x stdio behavior.
+
+server:
+  # Transport protocol: "stdio" (legacy), "sse", "streamable-http"
+  # stdio: 1 process per client (compatible with all MCP clients)
+  # sse: 1 server serves N clients over HTTP+SSE (recommended for multi-agent)
+  # streamable-http: 1 server, HTTP streaming
+  transport: "stdio"
+
+  # Network settings (ignored when transport is stdio)
+  host: "127.0.0.1"
+  port: 8179
+
+  # Auth: optional bearer token validation (SSE/HTTP only)
+  auth:
+    bearer_token: ""
+
+  # Rate limiting: optional per-client request throttling
+  rate_limit:
+    enabled: false
+    requests_per_minute: 60
+    burst: 10
+
+  # Metrics: optional Prometheus-compatible /metrics endpoint
+  metrics:
+    enabled: false
+    port: 9179
