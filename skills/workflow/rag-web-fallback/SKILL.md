@@ -41,26 +41,27 @@ The agent will:
 
 1. **First-pass RAG:**
    ```
-   search_knowledge(query="<extracted keywords>", max_results=5, min_score=0.15)
+   search_knowledge(query="<extracted keywords>", max_results=5)
    ```
 
-2. **If 0 hits (or top score < 0.3), try a paraphrase.** Common variants:
+2. **If 0 hits (or nothing relevant after reading the snippets), try a paraphrase.** Common variants:
    - Swap synonyms ("auth" ↔ "authentication", "reindex" ↔ "rebuild", "ttl" ↔ "expiration")
    - Broaden ("payment refund cancellation" → "refund process")
    - Narrow ("architecture" → "authentication architecture")
 
 3. **Second-pass RAG:**
    ```
-   search_knowledge(query="<paraphrased keywords>", max_results=5, min_score=0.10)
+   search_knowledge(query="<paraphrased keywords>", max_results=5)
    ```
-   Note: lower `min_score` (0.10) to catch weaker matches.
+   Note: `query_relative_score` is normalized within each query's returned cohort and is not
+   comparable across queries — judge "weak match" by reading the content, not by a score number.
 
 4. **Decide:**
 
    | Local result quality | Action |
    |---|---|
-   | Solid hit (score > 0.5) | Answer from RAG, do NOT hit web |
-   | Weak hit (score 0.15–0.5) | Answer from RAG **and** add a web-search suggestion "for more context" |
+   | Solid hit (snippet clearly answers it) | Answer from RAG, do NOT hit web |
+   | Weak hit (only loosely related) | Answer from RAG **and** add a web-search suggestion "for more context" |
    | No hit | **Explicitly** tell the user "corpus does not have this" then optionally invoke web search |
 
 5. **If escalating to web,** prefix the answer with:
@@ -78,7 +79,7 @@ User: *"What is our retry policy for external HTTP calls?"*
 
 Agent:
 ```
-search_knowledge(query="retry policy external http") → 2 hits, top score 0.79
+search_knowledge(query="retry policy external http") → 2 hits, top snippet answers it
 
 Reply: "Per [docs/adr/0031-retries.md], the policy is 3 attempts with exponential
 backoff starting at 1s, max 30s. See services/common/retry.py:12–28 for the impl."
@@ -92,8 +93,8 @@ User: *"What are the top CVEs in Python cryptography package in Q3 2026?"*
 
 Agent:
 ```
-search_knowledge(query="cve python cryptography 2026", min_score=0.10) → 0 hits
-search_knowledge(query="python cryptography vulnerabilities", min_score=0.10) → 0 hits
+search_knowledge(query="cve python cryptography 2026") → 0 hits
+search_knowledge(query="python cryptography vulnerabilities") → 0 hits
 
 Reply: "The local corpus does not track CVE data (searched 'cve python cryptography 2026'
 and 'python cryptography vulnerabilities', 0 hits). Falling back to external web search..."
@@ -107,8 +108,9 @@ User: *"Explain the LangChain LCEL syntax."*
 
 Agent:
 ```
-search_knowledge(query="langchain lcel syntax") → 1 hit, score 0.22
-(a passing mention in one of your ADRs comparing frameworks)
+search_knowledge(query="langchain lcel syntax") → 1 hit
+(a lone hit always normalizes to query_relative_score 1.0 — the snippet shows only
+a passing mention in one of your ADRs comparing frameworks, so read it to tell)
 
 Reply: "The corpus has one passing mention of LangChain LCEL in
 [docs/adr/0044-framework-choice.md]. That does not fully explain the syntax

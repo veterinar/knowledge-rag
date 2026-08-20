@@ -133,7 +133,7 @@ User: "Yes, do it."
 
 Agent:
 [Writes file, calls add_document, then confirms with a search]
-search_knowledge(query='refresh token rotation') → new ADR appears at score 0.92
+search_knowledge(query='refresh token rotation') → new ADR is now the top hit
 
 "Done. ADR-0045 is indexed and searchable. Next time anyone asks about refresh
 tokens, rag-check-first will surface it immediately."

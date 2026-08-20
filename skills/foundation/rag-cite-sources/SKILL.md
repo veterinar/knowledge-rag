@@ -82,7 +82,7 @@ User: *"What is our default request timeout?"*
 Agent:
 ```
 search_knowledge(query="default request timeout") →
-1 hit: config/http.yaml (line 8, score 0.87)
+1 hit: config/http.yaml (line 8 — the snippet shows the value)
 
 Reply: "The default request timeout is 30 seconds [config/http.yaml:8].
 This is enforced globally by the HTTP client middleware [services/common/http_client.py:45]."
@@ -95,7 +95,7 @@ User: *"Is this retry logic correct?"*
 Agent:
 ```
 search_knowledge(query="retry policy exponential backoff") →
-2 hits: docs/adr/0031-retries.md (0.79), services/common/retry.py (0.65)
+2 hits: docs/adr/0031-retries.md, services/common/retry.py (rank order)
 
 Reply: "Per our retry ADR [docs/adr/0031-retries.md], the policy is
 '3 attempts, exponential backoff starting at 1s, max 30s'. Your code

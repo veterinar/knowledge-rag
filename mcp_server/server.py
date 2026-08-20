@@ -4955,7 +4955,9 @@ class KnowledgeOrchestrator:
         return output
 
     def evaluate_retrieval(self, test_cases: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Evaluate retrieval quality with test queries. Returns MRR@5, Recall@5, Precision@5.
+        """Offline smoke reachability check over curated test queries (evaluation_mode
+        "offline_smoke"). Returns MRR@5 and Recall@5 diagnostics for that curated
+        set only — never a quality benchmark or Precision measurement.
 
         This is an OFFLINE SMOKE check, not a benchmark: the returned metrics
         (``evaluation_mode: "offline_smoke"``) only verify that the retrieval
@@ -5461,8 +5463,12 @@ def search_knowledge(
             disabled in config.
 
     Returns:
-        JSON string with results including content chunks, source filepath, relevance score, and
-        search method used. Returns chunks, not full document content.
+        JSON string with results including content chunks, source filepath, per-result scoring
+        (raw_score — the unrounded effective scorer output; query_relative_score — 0.0-1.0
+        normalized within this query's returned cohort, with the legacy score field as its
+        alias; and score_source — the scorer identity), and search method used. Scores are
+        query-relative and never comparable across queries. Returns chunks, not full document
+        content.
 
     Usage: Primary search tool — use for any topic or keyword lookup. Prefer search_similar() when you
     already have a reference document and want more like it. Prefer get_document() when you
@@ -5816,8 +5822,9 @@ def get_index_stats() -> str:
 
     Usage: Use for system health checks — verifying the embedding model loaded, checking
     index population, or monitoring cache efficiency. Use list_categories() for per-category
-    document counts instead. Use evaluate_retrieval() to measure actual search quality with
-    test queries.
+    document counts instead. Use evaluate_retrieval() only as an offline smoke check that
+    expected documents are reachable in top-5 results — it is not a search-quality
+    measurement or benchmark.
     """
     if _versioned_read_only():
         checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -6118,7 +6125,7 @@ def search_similar(filepath: str, max_results: int = 5) -> str:
 @instrument("evaluate_retrieval")
 def evaluate_retrieval(test_cases: str) -> str:
     """
-    Evaluate search quality by testing whether search_knowledge() retrieves expected documents.
+    Offline smoke check: test whether search_knowledge() reaches each expected document in the top-5 (reachability, not quality).
 
     Read-only. Runs multiple search queries internally. No side effects on the index.
 

@@ -22,6 +22,7 @@ When a real breaking change is required:
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 
 import yaml
@@ -333,3 +334,106 @@ def test_evaluate_retrieval_offline_smoke_payload_additive(monkeypatch):
     assert out["recall_at_5"] == 1.0
     assert out["per_query"][0]["found_at_rank"] == 1
     assert out["total_queries"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Requirement 8 — public documentation contract: query-relative scoring only
+# ---------------------------------------------------------------------------
+
+
+def test_api_docs_describe_query_relative_scoring_contract():
+    """docs/API.md documents the additive result-scoring schema and the
+    query-relative min_score contract, with no absolute-threshold advice,
+    no universal cut-off recommendation, and no Precision@5 claims."""
+    api_md = (Path(__file__).resolve().parent.parent / "docs" / "API.md").read_text(encoding="utf-8")
+    assert (
+        all(
+            key in api_md
+            for key in ("raw_score", "query_relative_score", "score_source", "filtered_by_query_relative_score")
+        )
+        and "0.2-0.4" not in api_md
+        and "Precision@5" not in api_md
+    ), "docs/API.md must document query-relative scoring and must not claim absolute thresholds or Precision@5"
+
+
+def test_public_surfaces_label_evaluate_retrieval_offline_smoke():
+    """README's MCP tool table and the server docstrings present
+    evaluate_retrieval as an offline smoke/reachability check — never a
+    quality measurement, benchmark, or Precision@5 claim."""
+    from mcp_server import server
+
+    stats_doc = server.get_index_stats.__doc__ or ""
+    orch_doc = server.KnowledgeOrchestrator.evaluate_retrieval.__doc__ or ""
+    readme_md = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    mcp_row = next(ln for ln in readme_md.splitlines() if ln.strip().startswith("| `evaluate_retrieval`"))
+    assert (
+        "smoke" in stats_doc
+        and "Precision@5" not in orch_doc
+        and "offline smoke" in mcp_row.lower()
+        and "Measure MRR@5" not in mcp_row
+    ), "evaluate_retrieval must be labelled an offline smoke check in every public surface"
+
+
+# ---------------------------------------------------------------------------
+# Requirement 8 — public skill guides follow the query-relative scoring
+# contract: cohort-relative scores, no universal numeric cut-offs, and
+# evaluate_retrieval presented strictly as an offline_smoke reachability
+# check with the real test-case schema. Static contract coverage over the
+# exact public skill surfaces (skills/**/SKILL.md + their catalog labels);
+# intentional historical files (docs/legacy, docs/adr) and measured release
+# benchmarks (CHANGELOG, bench/) are out of scope by design.
+# ---------------------------------------------------------------------------
+
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
+
+#: Anchored stale patterns that must never appear in a shipped skill guide.
+#: Each matches either a universal numeric min_score cut-off, an absolute
+#: score band or naked illustrative relevance value presented as guidance
+#: (e.g. "top score 0.7", "file.md (0.8)", "at score 0.9"), or a
+#: benchmark-era evaluate_retrieval claim (Precision@5, wrong test-case
+#: schema). Naked values invite absolute cross-query interpretation, and a
+#: singleton cohort always normalizes query_relative_score to 1.0, so a
+#: "one hit, score 0.22" style example is impossible as well as misleading.
+_STALE_SKILL_PATTERNS = (
+    re.compile(r"min_score\s*=\s*0\.\d+"),
+    re.compile(r"\bs?core\s*[<>]\s*0\.\d+"),
+    re.compile(r"\bscore\s+0?\.\d+\s*[–-]\s*0?\.\d+"),
+    re.compile(r"\btop(?:\s+score)?\s+0\.\d+"),
+    re.compile(r"\bscore\s+0\.\d+"),
+    re.compile(r"\(\s*0\.\d+\s*\)"),
+    re.compile(r"Precision@5"),
+    re.compile(r"expected_docs"),
+    re.compile(r"\bMRR@?5?\s*[<>]\s*0\.\d+"),
+    re.compile(r"quality report"),
+)
+
+
+def test_public_skill_guides_follow_query_relative_scoring_contract():
+    """Every shipped skills/**/SKILL.md avoids universal absolute-score
+    guidance and benchmark framing for evaluate_retrieval; the smoke-check
+    skill documents the real schema and cohort-relative scores."""
+    guides = sorted(SKILLS_DIR.glob("*/*/SKILL.md"))
+    assert len(guides) >= 10, "skill guide set shrank unexpectedly"
+    for guide in guides:
+        text = guide.read_text(encoding="utf-8")
+        for pattern in _STALE_SKILL_PATTERNS:
+            match = pattern.search(text)
+            assert match is None, (
+                f"{guide.relative_to(SKILLS_DIR.parent)} still contains stale public "
+                f"contract text {match.group(0)!r} (pattern {pattern.pattern!r}): scores "
+                "are cohort-relative per query, and evaluate_retrieval is an offline "
+                "smoke reachability check, not a benchmark"
+            )
+
+    smoke = SKILLS_DIR / "maintenance" / "rag-evaluate-quality" / "SKILL.md"
+    smoke_text = smoke.read_text(encoding="utf-8")
+    catalog_text = (SKILLS_DIR / "CATALOG.md").read_text(encoding="utf-8")
+    assert (
+        "offline_smoke" in smoke_text
+        and "offline_smoke" in smoke_text.split("description: ", 1)[1].split("\n", 1)[0]
+        and '"expected_filepath"' in smoke_text
+        and "query" in smoke_text
+        and "not a benchmark" in catalog_text
+    ), (
+        "the smoke-check skill and its catalog label must describe offline_smoke reachability with the expected_filepath schema"
+    )

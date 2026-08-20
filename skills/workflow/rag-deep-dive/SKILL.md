@@ -44,7 +44,7 @@ Then synthesizes an answer that pulls from all three, cites each source, and fla
 
 1. **Search — cast a wide net:**
    ```
-   search_knowledge(query="<user's topic>", max_results=8, snippet_mode=true, min_score=0.15)
+   search_knowledge(query="<user's topic>", max_results=8, snippet_mode=true)
    ```
    Wider than usual (8 not 5) because we want candidate diversity for the similar-search step.
 
@@ -80,8 +80,8 @@ Then synthesizes an answer that pulls from all three, cites each source, and fla
 Agent (internal):
 ```
 1. search_knowledge(query="document ingestion pipeline chunks embedding", max_results=8)
-   → 6 hits: ingestion.md (0.88), parsers.md (0.72), chunker.md (0.69), embeddings.md (0.65),
-             fastembed.md (0.61), watchdog.md (0.55)
+   → 6 hits (rank order): ingestion.md, parsers.md, chunker.md, embeddings.md,
+             fastembed.md, watchdog.md
 
 2. get_document(filepath="docs/ingestion.md")
    → 4200-char full doc: 5 sections (parsing / chunking / embedding / storage / watcher)

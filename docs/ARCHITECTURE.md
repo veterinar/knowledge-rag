@@ -139,7 +139,7 @@ flowchart TB
     end
 
     subgraph OUTPUT["Output Processing"]
-        MINSCORE["min_score Filter<br/>(discard below threshold)"]
+        MINSCORE["min_score Filter<br/>(filters query_relative_score —<br/>cohort-normalized, query-relative only)"]
         SNIPPET["snippet_mode Truncation<br/>(~500 chars at natural break)"]
 
         MINSCORE --> SNIPPET
@@ -152,7 +152,7 @@ flowchart TB
 
     ADJ --> MINSCORE
     NOTREADY -->|yes, hit| MINSCORE
-    SNIPPET --> RESULTS["Results<br/>search_method: fts5 | hybrid | semantic | keyword<br/>routed_by: fts5_router | none<br/>score + filtered_by_score + content_length"]
+    SNIPPET --> RESULTS["Results<br/>search_method: fts5 | hybrid | semantic | keyword<br/>routed_by: fts5_router | none<br/>raw_score + query_relative_score (score = legacy alias)<br/>+ score_source + filtered_by_score<br/>+ filtered_by_query_relative_score + content_length"]
 ```
 
 ### Document Ingestion Flow

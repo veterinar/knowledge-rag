@@ -93,7 +93,7 @@ User: *"Review this. `for attempt in range(5): try: ... except: sleep(2)` — ne
 Agent:
 ```
 search_knowledge(query="retry policy exponential backoff") → 2 hits
-  → docs/adr/0031-retries.md (0.83), services/common/retry.py (0.71)
+  → docs/adr/0031-retries.md, services/common/retry.py (rank order)
 
 search_similar(filepath="services/payment/refund_service.py") → 5 hits
   → All use `services/common/retry.retry_with_backoff` decorator
