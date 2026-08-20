@@ -225,21 +225,33 @@ models:
     # indexing.mode: "versioned" — see the INDEXING section below).
     # ─────────────────────────────────────────────────────────────────────
     # When indexing.mode is "versioned", these three fields are REQUIRED and
-    # are sealed into every generation receipt's compatibility object. A
-    # generation can only be served/activated by a process whose pins match
-    # byte-for-byte, so a swapped model or runtime can never silently serve
-    # stale embeddings.
+    # are sealed into every generation receipt's compatibility object. At
+    # startup the declared runtime_version, dimensions, and pooling are
+    # verified against the INSTALLED FastEmbed registry (registry-only
+    # inspection — no model construction, download, or network); a mismatch
+    # degrades the server to stats-only (never an aborted start) and blocks
+    # retrieval. Versioned mode admits EXACTLY these three models:
+    #   BAAI/bge-small-en-v1.5   384 dims,  pooling cls-or-prepooled (Onnx)
+    #   BAAI/bge-large-en-v1.5  1024 dims,  pooling cls-or-prepooled (Onnx)
+    #   intfloat/multilingual-e5-large 1024 dims, pooling mean (Pooled)
+    # "cls-or-prepooled" is the exact FastEmbed 0.8.0 OnnxTextEmbedding
+    # branch contract (CLS for rank-3 output, pass-through for already-pooled
+    # rank-2 output); it is not a claim about the artifact's internals.
+    # Generations sealed with the older generic "cls" value must be rebuilt
+    # offline (compatibility mismatch).
     #
     # artifact_path — exact LOCAL model artifact directory (the ONNX/model
     #   files themselves, NOT a model name and NOT the whole cache dir). Its
     #   recursive SHA-256 becomes compatibility.model_artifact_sha256.
-    # runtime_version — exact embedding runtime identity, e.g.
-    #   "fastembed 0.3.6" or "sentence-transformers 3.0.1+onnx".
-    # pooling — exact pooling strategy, e.g. "cls" or "mean".
+    # runtime_version — registry-verified installed runtime identity, e.g.
+    #   "fastembed 0.8.0" (must equal the installed distribution exactly).
+    # pooling — the registry-verified pooling contract above; "cls-or-prepooled"
+    #   for the BGE models, "mean" for multilingual-e5-large.
+    # dimensions — must equal the dimension FastEmbed registers for the model.
     #
     # artifact_path: "models_cache/bge-small-en-v1.5"
-    # runtime_version: "fastembed 0.3.6"
-    # pooling: "cls"
+    # runtime_version: "fastembed 0.8.0"
+    # pooling: "cls-or-prepooled"
 
   # Reranker — re-scores search results for better accuracy.
   # Adds ~50-100ms per query but significantly improves result quality.
@@ -403,7 +415,10 @@ query_expansion_groups: []
 #                   knowledge-rag-generation rollback <generation_id>
 #
 #               Requires the models.embedding pins above (artifact_path,
-#               runtime_version, pooling). Build/activate/rollback always
+#               runtime_version, pooling). The declared runtime, dimension,
+#               and pooling are verified against the installed FastEmbed
+#               registry at startup; any mismatch fails closed.
+#               Build/activate/rollback always
 #               require a server restart to take effect.
 #
 # indexing:
@@ -422,7 +437,8 @@ query_expansion_groups: []
 #   watch_for_changes: true
 #   # Silence window (seconds) the watcher accumulates file events in before
 #   # triggering one reindex. Must be a finite positive number (invalid
-#   # values fall back to 10.0 with a WARN).
+#   # values fall back to 10.0 with a WARN). config.yaml owns this default —
+#   # the server passes the field to the watcher directly (no fallback).
 #   watch_debounce_seconds: 10.0
 #
 #   # BM25 parameters (keyword search tuning).

@@ -716,6 +716,49 @@ def test_watcher_uses_config_fields_not_hardcoded_debounce(monkeypatch: Any) -> 
     assert captured == {"debounce_seconds": 2.5}
 
 
+def test_watcher_debounce_is_config_field_verbatim_no_fallback_no_coercion(monkeypatch: Any) -> None:
+    """main() hands config.watch_debounce_seconds to DocumentWatcher by identity.
+
+    A float-subclass sentinel proves no float() re-coercion and no
+    getattr(default) fallback runs — config.py is the sole owner.
+    """
+    import mcp_server as package
+    import mcp_server.instance_lock as instance_lock
+    import mcp_server.preflight as preflight
+
+    class _SentinelFloat(float):
+        pass
+
+    sentinel = _SentinelFloat(3.25)
+    captured: Dict[str, Any] = {}
+
+    def capture_watcher(_get_orch, **kwargs):
+        captured.update(kwargs)
+        return _FakeWatcher([])
+
+    orch = SimpleNamespace(collection=SimpleNamespace(count=lambda: 1), _check_dimension_mismatch=lambda: False)
+    monkeypatch.setattr(instance_lock, "single_instance_lock", nullcontext)
+    monkeypatch.setattr(preflight, "run_preflight", lambda: None)
+    monkeypatch.setattr(srv, "get_orchestrator", lambda: orch)
+    monkeypatch.setattr(srv, "DocumentWatcher", capture_watcher)
+    monkeypatch.setattr(srv, "Observer", lambda: _FakeObserver([]))
+    monkeypatch.setattr(srv, "_serve_with_lifecycle", lambda transport, observer, watcher: None)
+    monkeypatch.setattr(package, "_original_stdout", sys.stdout)
+    monkeypatch.setattr(srv.config, "transport", "stdio")
+    monkeypatch.setattr(srv.config, "metrics_enabled", False)
+    monkeypatch.delenv("KNOWLEDGE_RAG_WATCHER_DISABLED", raising=False)
+    monkeypatch.setattr(srv.config, "watch_for_changes", True)
+    monkeypatch.setattr(srv.config, "watch_debounce_seconds", sentinel)
+    with _main_invocation():
+        srv.main()
+    assert captured == {"debounce_seconds": sentinel}
+    assert type(captured["debounce_seconds"]) is _SentinelFloat
+    # Static guard: the removed patterns must not reappear in server.py.
+    source = Path(srv.__file__).read_text(encoding="utf-8")
+    assert 'getattr(config, "watch_debounce_seconds"' not in source
+    assert "float(getattr(config" not in source
+
+
 def test_watcher_disabled_by_watch_for_changes_false(monkeypatch: Any, capsys: Any) -> None:
     """advanced.watch_for_changes=false skips construction entirely."""
     import mcp_server as package

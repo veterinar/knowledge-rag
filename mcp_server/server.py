@@ -64,7 +64,7 @@ from watchdog.observers import Observer
 
 # Local imports
 from . import __version__
-from .config import config
+from .config import EmbeddingRuntimeContractError, config
 from .fts5_index import Fts5LexicalIndex, Fts5NotReadyError, capture_chunk_rows, compute_rows_digest
 from .generations import (
     FTS_ARTIFACT,
@@ -1661,6 +1661,12 @@ def _pin_versioned_generation() -> Any:
             expected_identity=expected,
             expected_compatibility=config.generation_compatibility(),
         )
+    except EmbeddingRuntimeContractError:
+        # Installed FastEmbed runtime/registry drift: safe degraded state,
+        # never an aborted startup and never raw exception text in stats.
+        object.__setattr__(config, "_pin_failure", {"reason": DRIFT_REASON_ENVIRONMENT_CHANGED, "detail": {}})
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({DRIFT_REASON_ENVIRONMENT_CHANGED})")
+        return None
     except GenerationError as exc:
         reason = (
             DRIFT_REASON_POINTER_MISSING if "current pointer is missing" in str(exc) else DRIFT_REASON_POINTER_INVALID
@@ -1715,6 +1721,14 @@ def _pin_versioned_generation() -> Any:
     # silently skipped: the recheck would be quietly disabled).
     try:
         object.__setattr__(config, "_pinned_environment_digests", _retrieval_environment_digests())
+    except EmbeddingRuntimeContractError:
+        # TOCTOU closure: the installed runtime changed between the initial
+        # compatibility verification and this snapshot. Same safe degraded
+        # mapping — no raw exception text, no paths, stats stays available.
+        _cleanup_versioned_chroma_runtime_copy()
+        object.__setattr__(config, "_pin_failure", {"reason": DRIFT_REASON_ENVIRONMENT_CHANGED, "detail": {}})
+        print(f"[GENERATION] NOT pinned — degraded stats-only mode ({DRIFT_REASON_ENVIRONMENT_CHANGED})")
+        return None
     except GenerationError as exc:
         _cleanup_versioned_chroma_runtime_copy()
         reason = getattr(exc, "reason_code", None) or DRIFT_REASON_ENVIRONMENT_CHANGED
@@ -1763,6 +1777,13 @@ def _verify_pinned_environment(current: Any) -> Optional[_IndexStaleError]:
         model_config = _model_config_identity()
     except gens.DependencyUnverifiableError:
         raise  # stable dependency_unverifiable — propagates to degraded mode
+    except EmbeddingRuntimeContractError:
+        # Explicit, safe per-access mapping for installed-runtime drift: a
+        # stable field name only — never the raw exception text or paths.
+        return _IndexStaleError(
+            DRIFT_REASON_ENVIRONMENT_CHANGED,
+            {"field": "embedding_runtime_contract"},
+        )
     except Exception:
         return _IndexStaleError(
             DRIFT_REASON_ENVIRONMENT_CHANGED,
@@ -6482,7 +6503,7 @@ def main():
                 try:
                     watcher = DocumentWatcher(
                         get_orchestrator,
-                        debounce_seconds=float(getattr(config, "watch_debounce_seconds", 10.0)),
+                        debounce_seconds=config.watch_debounce_seconds,
                     )
                     observer = Observer()
                     observer.schedule(watcher, str(config.documents_dir), recursive=True)

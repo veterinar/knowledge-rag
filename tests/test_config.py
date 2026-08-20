@@ -1,5 +1,12 @@
 """Tests for configuration integrity."""
 
+import importlib.metadata
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+import mcp_server.config as config_module
 from mcp_server.config import _merge_query_expansion_sources, config
 
 
@@ -132,3 +139,209 @@ def test_query_expansion_groups_extend_legacy_entries():
     assert merged["tb"] == ["triple barrier", "trip_barr", "legacy_alias"]
     assert "tb" in merged["triple barrier"]
     assert "trip_barr" in merged["triple barrier"]
+
+
+# ── Versioned-mode registry-verified embedding runtime contract ──────────────
+# Deterministic fakes: the resolver imports ``fastembed`` lazily, so stub
+# modules in ``sys.modules`` (the registry plus the two admitted exact
+# implementation submodules, exposing the SAME class objects the registry
+# lists) are inspected instead of the real ones. No model is ever
+# constructed, downloaded, or contacted.
+
+
+class OnnxTextEmbedding:
+    @staticmethod
+    def _list_supported_models():
+        return [
+            SimpleNamespace(model="BAAI/bge-small-en-v1.5", dim=384),
+            SimpleNamespace(model="BAAI/bge-large-en-v1.5", dim=1024),
+        ]
+
+
+class PooledEmbedding:
+    @staticmethod
+    def _list_supported_models():
+        return [SimpleNamespace(model="intfloat/multilingual-e5-large", dim=1024)]
+
+
+def _install_fake_fastembed(monkeypatch, registry):
+    for name, module in {
+        "fastembed": SimpleNamespace(TextEmbedding=SimpleNamespace(EMBEDDINGS_REGISTRY=registry)),
+        "fastembed.text.onnx_embedding": SimpleNamespace(OnnxTextEmbedding=OnnxTextEmbedding),
+        "fastembed.text.pooled_embedding": SimpleNamespace(PooledEmbedding=PooledEmbedding),
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    real_version = importlib.metadata.version
+
+    def _fake_version(name):
+        if name == "fastembed":
+            return "0.8.0"
+        if name == "fastembed-gpu":
+            raise importlib.metadata.PackageNotFoundError("fastembed-gpu")
+        return real_version(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", _fake_version)
+
+
+def _versioned_yaml(tmp_path, *, model, dimensions, runtime_version, pooling):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir(exist_ok=True)
+    return {
+        "indexing": {"mode": "versioned"},
+        "models": {
+            "embedding": {
+                "model": model,
+                "dimensions": dimensions,
+                "runtime_version": runtime_version,
+                "pooling": pooling,
+                "artifact_path": str(artifact),
+            }
+        },
+    }
+
+
+def _build_config(monkeypatch, tmp_path, yaml_payload, registry=None):
+    _install_fake_fastembed(monkeypatch, registry if registry is not None else [OnnxTextEmbedding, PooledEmbedding])
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "_yaml", yaml_payload, raising=False)
+    return config_module.Config()
+
+
+@pytest.mark.parametrize(
+    "model,dim,pooling",
+    [
+        ("BAAI/bge-small-en-v1.5", 384, "cls-or-prepooled"),
+        ("BAAI/bge-large-en-v1.5", 1024, "cls-or-prepooled"),
+        ("intfloat/multilingual-e5-large", 1024, "mean"),
+    ],
+)
+def test_versioned_matching_contract_passes_and_canonicalizes(monkeypatch, tmp_path, model, dim, pooling):
+    """Matching versioned config is admitted; canonical actuals are stored."""
+    cfg = _build_config(
+        monkeypatch,
+        tmp_path,
+        _versioned_yaml(
+            tmp_path,
+            model=model,
+            dimensions=dim,
+            runtime_version="fastembed 0.8.0",
+            pooling=f"  {pooling.upper()}  ",  # case/whitespace tolerated, canonicalized
+        ),
+    )
+    assert cfg.index_mode == "versioned"
+    assert cfg._embedding_runtime_contract_error is None
+    assert cfg.embedding_model == model
+    assert cfg.embedding_runtime_version == "fastembed 0.8.0"
+    assert cfg.embedding_dim == dim
+    assert cfg.embedding_pooling == pooling
+    # Compatibility is built from the freshly returned canonical actuals.
+    compat = cfg.generation_compatibility()
+    assert compat["embedding_model"] == model
+    assert compat["embedding_dimension"] == dim
+    assert compat["runtime_version"] == "fastembed 0.8.0"
+    assert compat["pooling"] == pooling
+
+
+def test_versioned_wrong_runtime_version_survives_but_compatibility_fails(monkeypatch, tmp_path):
+    payload = _versioned_yaml(
+        tmp_path,
+        model="BAAI/bge-small-en-v1.5",
+        dimensions=384,
+        runtime_version="fastembed 0.3.6",
+        pooling="cls-or-prepooled",
+    )
+    cfg = _build_config(monkeypatch, tmp_path, payload)
+    # Config construction (and module import) survives the drift...
+    assert cfg.index_mode == "versioned"
+    assert isinstance(cfg._embedding_runtime_contract_error, str)
+    assert "runtime_version" in cfg._embedding_runtime_contract_error
+    # ...while generation compatibility hard-fails with the typed error.
+    with pytest.raises(config_module.EmbeddingRuntimeContractError, match="runtime_version"):
+        cfg.generation_compatibility()
+
+
+def test_versioned_wrong_dimension_survives_but_compatibility_fails(monkeypatch, tmp_path):
+    payload = _versioned_yaml(
+        tmp_path,
+        model="BAAI/bge-small-en-v1.5",
+        dimensions=768,
+        runtime_version="fastembed 0.8.0",
+        pooling="cls-or-prepooled",
+    )
+    cfg = _build_config(monkeypatch, tmp_path, payload)
+    assert cfg._embedding_runtime_contract_error is not None
+    with pytest.raises(config_module.EmbeddingRuntimeContractError, match="dimensions"):
+        cfg.generation_compatibility()
+
+
+def test_versioned_wrong_pooling_survives_but_compatibility_fails(monkeypatch, tmp_path):
+    payload = _versioned_yaml(
+        tmp_path,
+        model="intfloat/multilingual-e5-large",
+        dimensions=1024,
+        runtime_version="fastembed 0.8.0",
+        pooling="cls",
+    )
+    cfg = _build_config(monkeypatch, tmp_path, payload)
+    assert cfg._embedding_runtime_contract_error is not None
+    with pytest.raises(config_module.EmbeddingRuntimeContractError, match="pooling"):
+        cfg.generation_compatibility()
+
+
+def test_versioned_unregistered_model_survives_but_compatibility_fails(monkeypatch, tmp_path):
+    payload = _versioned_yaml(
+        tmp_path,
+        model="org/never-registered",
+        dimensions=384,
+        runtime_version="fastembed 0.8.0",
+        pooling="cls",
+    )
+    cfg = _build_config(monkeypatch, tmp_path, payload)
+    assert cfg._embedding_runtime_contract_error is not None
+    with pytest.raises(config_module.EmbeddingRuntimeContractError):
+        cfg.generation_compatibility()
+
+
+def test_legacy_mode_never_calls_the_resolver(monkeypatch, tmp_path):
+    """Legacy config never resolves the runtime contract (imports unchanged)."""
+    calls: list = []
+
+    def _explode(self, *args, **kwargs):
+        calls.append(1)
+        raise AssertionError("resolver must never be called in legacy mode")
+
+    monkeypatch.setattr(config_module.Config, "_resolve_embedding_runtime_contract", _explode, raising=True)
+    monkeypatch.setattr(config_module.Config, "require_embedding_runtime_contract", _explode, raising=True)
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "_yaml", {"indexing": {"mode": "legacy"}}, raising=False)
+    cfg = config_module.Config()
+    assert cfg.index_mode == "legacy"
+    assert cfg._embedding_runtime_contract_error is None
+    assert cfg.embedding_runtime_version == ""
+    assert calls == []
+
+
+def test_static_versioned_misconfiguration_still_hard_fails(monkeypatch, tmp_path):
+    """Missing declared runtime (a STATIC gap) still aborts Config()."""
+    _install_fake_fastembed(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+    artifact = tmp_path / "artifact"
+    artifact.mkdir(exist_ok=True)
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(
+        config_module,
+        "_yaml",
+        {
+            "indexing": {"mode": "versioned"},
+            "models": {
+                "embedding": {
+                    "model": "BAAI/bge-small-en-v1.5",
+                    "dimensions": 384,
+                    "pooling": "cls-or-prepooled",
+                    "artifact_path": str(artifact),
+                }
+            },
+        },
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="runtime_version"):
+        config_module.Config()
