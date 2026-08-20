@@ -1,40 +1,38 @@
 ---
 name: rag-evaluate-quality
-description: Periodically measure the retrieval quality of the knowledge base using evaluate_retrieval (MRR@5, Recall@5, Precision@5) plus get_index_stats for health metrics. Run weekly, after significant reindex activity, or when the user reports declining answer quality. Prevents silent index rot and grounds "should we tune X" decisions in real numbers.
+description: Offline smoke check that expected documents are still reachable in top-5 results, using evaluate_retrieval (evaluation_mode offline_smoke, MRR@5/Recall@5 diagnostics only) plus get_index_stats for health metrics. Run after significant reindex activity, model changes, or when the user reports search problems. Not a benchmark and not a retrieval-quality measurement.
 metadata:
   type: rag-workflow
   kind: maintenance
   target: any-mcp-client
 ---
 
-# rag-evaluate-quality — measure, do not guess
+# rag-evaluate-quality — reachability smoke check, not a benchmark
 
 ## When to use this skill
 
 Trigger this skill:
 
-- **Weekly cadence** — set a recurring reminder (Monday morning, Friday afternoon)
 - **After significant reindex activity** — new content added, models changed, presets swapped
-- **When answer quality feels off** — the user reports "search is worse than it used to be"
-- **After a version upgrade** — `pip install -U knowledge-rag` bump, worth confirming no regression
-- **Before proposing tuning changes** — if you are about to suggest `hybrid_alpha=0.5` or `min_score=0.3`, measure first
+- **After a version upgrade** — `pip install -U knowledge-rag` bump, worth confirming expected docs are still reachable
+- **When the user reports search problems** — "I can't find X anymore" translates directly into a reachability case
 
 **Do NOT run:**
 
-- Every session (waste of cycles; retrieval quality is stable session-to-session)
-- On brand-new empty corpora (nothing to evaluate)
+- Every session (waste of cycles)
+- On brand-new empty corpora (nothing to reach)
 
 ---
 
 ## What this skill commits to
 
-The agent produces a **numeric quality report**, not a vibe check. Outputs:
+The agent produces a **reachability report over curated queries**, not a quality measurement. Outputs:
 
-- **Index health** — chunks, cache hit rate, embedding model, dimensions
-- **Retrieval metrics** — MRR@5, Recall@5, Precision@5 across a small set of representative queries
-- **Interpretation** — what the numbers mean, whether they moved vs last run, what to do about it
+- **Index health** — chunks, cache hit rate, embedding model, dimensions (from `get_index_stats`)
+- **Per-query reachability** — for each hand-picked query, did the expected document appear in the top-5, and at what rank
+- **Aggregate diagnostics** — MRR@5 and Recall@5 over that curated set only (`evaluation_mode: "offline_smoke"`)
 
-Numbers get logged so the trend is visible over time.
+These numbers describe THIS curated set on THIS corpus. They carry no statistical weight: do not quote them as retrieval-quality measurements, do not compare them to universal thresholds (none exist), and do not derive tuning decisions from them.
 
 ---
 
@@ -49,164 +47,91 @@ Numbers get logged so the trend is visible over time.
    - `cache_hit_rate` (higher after warmup = healthy)
    - `embedding_model`, `embedding_dim`
 
-2. **Prepare or reuse an evaluation set.** knowledge-rag's `evaluate_retrieval` tool needs test queries + expected documents (ground truth). Two options:
+2. **Prepare or reuse a curated case set.** Each `evaluate_retrieval` test case carries exactly `query` (non-empty string) and `expected_filepath` (non-empty path of the document that should appear in top-5):
 
    - **Reuse a canonical set** — if the project already has `tests/evaluation-queries.json` or similar, load it.
-   - **Build a quick set inline** — 5-10 queries that a domain expert (or the user) knows the "correct" answer document for.
+   - **Build a quick set inline** — 5-10 queries where a domain expert (or the user) knows the expected document.
 
    Format (per the API contract):
    ```json
    [
-     {"query": "authentication design", "expected_docs": ["docs/adr/0018-auth.md"]},
-     {"query": "retry policy", "expected_docs": ["docs/adr/0031-retries.md"]},
-     ...
+     {"query": "authentication design", "expected_filepath": "docs/adr/0018-auth.md"},
+     {"query": "retry policy", "expected_filepath": "docs/adr/0031-retries.md"}
    ]
    ```
 
-3. **Run the evaluation:**
+3. **Run the smoke check:**
    ```
-   evaluate_retrieval(test_queries=<the-json-array>)
+   evaluate_retrieval(test_cases=<the-json-array>)
    ```
    Response includes:
-   - `mrr_at_5` — Mean Reciprocal Rank (0-1; higher is better; >0.7 is good)
-   - `recall_at_5` — fraction of expected docs found in top-5 (0-1; >0.8 is good)
-   - `precision_at_5` — fraction of top-5 that are relevant (0-1; >0.4 is good)
-   - Per-query breakdown
+   - `evaluation_mode` — `"offline_smoke"`
+   - `mrr_at_5` — mean reciprocal rank of expected docs across the curated set
+   - `recall_at_5` — fraction of curated queries whose expected doc appeared in top-5
+   - `per_query` — which expected doc was found and at what rank
 
-4. **Interpret honestly:**
+4. **Read the per-query breakdown, not the aggregates.** The actionable output is the list of queries whose expected document was NOT reached (`found_at_rank: null`). Those are concrete reachability failures worth investigating; the aggregate numbers are context, not a verdict.
 
-   | Metric | Value | Interpretation |
+5. **Investigate unreached documents concretely:**
+
+   | Symptom | Likely cause | Next step |
    |---|---|---|
-   | MRR@5 | < 0.5 | Poor — expected docs rarely in top result |
-   | MRR@5 | 0.5–0.7 | OK — often top-3 but not top-1 |
-   | MRR@5 | > 0.7 | Good — expected doc usually first |
-   | Recall@5 | < 0.5 | Poor — expected docs missing from top-5 half the time |
-   | Recall@5 | 0.5–0.8 | OK |
-   | Recall@5 | > 0.8 | Good |
-   | Precision@5 | < 0.3 | Poor — top-5 mostly irrelevant |
-   | Precision@5 | 0.3–0.5 | OK |
-   | Precision@5 | > 0.5 | Good |
-
-5. **Compare to prior runs** if there is a history log (e.g. `docs/eval-history.md`). Movement of ±0.02 = noise, ±0.05 = signal.
-
-6. **Recommend action based on findings:**
-
-   | Symptom | Likely cause | Recommendation |
-   |---|---|---|
-   | MRR@5 drops after upgrade | Embedding model changed | Confirm `models.embedding.model` matches prior; consider `reindex_documents(force=True)` |
-   | Recall@5 drops after adding new docs | New docs shifted the vector distribution | Reindex; check if a different `embedding.profile` fits better |
-   | Precision@5 drops | Corpus grew but queries not more specific | Tune `min_score`, add query expansions |
-   | All metrics low from day 1 | Model / language mismatch | English `bge-small-en-v1.5` on multilingual corpus? Switch to `multilingual` profile |
+   | Expected doc absent from index | Ingestion skipped it | Check `list_documents` / reindex |
+   | Doc indexed but unreached | Chunking or embedding changed how it matches | Inspect the doc with `get_document`; try its exact vocabulary as a query |
+   | Many queries unreached after a model/preset change | Distribution shifted | Review the change; reindex if the model moved |
    | `cache_hit_rate` = 0% after 100+ queries | Queries not repeating (fine) OR cache misconfigured | Only worry if you expected repeats |
 
-7. **Log the run.** Ideally to a persistent `docs/eval-history.md` in the repo (indexed alongside the corpus itself — meta-reflexive but useful):
-   ```markdown
-   ## 2026-08-15
-   - Corpus: 3865 docs / 39241 chunks
-   - MRR@5: 0.78 (▲ +0.03 vs 2026-08-08)
-   - Recall@5: 0.85 (▬)
-   - Precision@5: 0.52 (▬)
-   - Notes: added 200 new ADRs this week; MRR up because ADRs are more targeted.
-   ```
-
-   Then chain to [`rag-index-decisions`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-index-decisions/SKILL.md) to make the log part of the searchable corpus.
+6. **Report honestly.** State that this was an offline smoke check over N curated queries, list unreached docs, and describe what you inspected. Do not present MRR/Recall as quality scores, do not claim regressions or improvements from them, and do not recommend tuning values derived from them.
 
 ---
 
 ## Examples
 
-**Example 1 — Weekly checkup**
-
-User: *"Weekly RAG checkup — how are we doing?"*
-
-Agent:
-```
-get_index_stats() → 3865 docs / 39241 chunks, cache 34%, bge-small-en-v1.5 384D
-Loaded tests/evaluation-queries.json (12 queries)
-evaluate_retrieval(test_queries=<the 12>) →
-  MRR@5: 0.79, Recall@5: 0.83, Precision@5: 0.48
-
-Compared to last week [docs/eval-history.md]:
-  MRR: 0.79 vs 0.77 (▲ +0.02, noise)
-  Recall: 0.83 vs 0.85 (▽ -0.02, noise)
-  Precision: 0.48 vs 0.50 (▽ -0.02, noise)
-
-Reply: "Health check green. All 3 metrics moved within noise (±0.02).
-No action needed.
-
-- Index: 39K chunks, up from 38K last week (organic growth)
-- Cache: 34% hit rate (healthy for a mixed-topic session)
-- Retrieval: MRR 0.79 (top result usually correct), Recall 0.83 (5-of-6
-  expected docs surface in top-5)
-
-Trend log updated: docs/eval-history.md"
-```
-
-**Example 2 — Post-reindex confirmation**
+**Example 1 — Post-reindex confirmation**
 
 User: *"I just did nuclear_rebuild after switching to bge-large. Did anything break?"*
 
 Agent:
 ```
 get_index_stats() → 3865 docs / 39241 chunks, embedding: bge-large-en-v1.5 (1024D)
-evaluate_retrieval(test_queries=<the 12>) →
-  MRR@5: 0.83, Recall@5: 0.88, Precision@5: 0.55
+Loaded tests/evaluation-queries.json (12 cases)
+evaluate_retrieval(test_cases=<the 12>) → evaluation_mode: offline_smoke
+  recall_at_5: 12/12 reached; one doc moved from rank 1 to rank 4 (per_query)
 
-Prior baseline (bge-small): MRR 0.79, Recall 0.83, Precision 0.48
-
-Reply: "Nothing broke. Quality actually IMPROVED across all 3 metrics:
-  MRR@5:       0.79 → 0.83  (▲ +0.04, real signal)
-  Recall@5:    0.83 → 0.88  (▲ +0.05, real signal)
-  Precision@5: 0.48 → 0.55  (▲ +0.07, strong signal)
-
-The bge-large upgrade is worth keeping. Trade-off: index size grew ~2.7×
-(384D → 1024D). Query latency likely up 20-40ms (measure with
-mcp__cti__ or your own timing if it matters).
-
-Updated docs/eval-history.md with the upgrade delta."
+Reply: "Smoke check green: all 12 expected documents are still reachable in
+top-5 after the rebuild. One (docs/adr/0031-retries.md) moved from rank 1 to
+rank 4 — inspected it and it still matches on its own vocabulary, so no
+action needed. This was a reachability check, not a quality measurement."
 ```
 
-**Example 3 — User reports quality issue**
+**Example 2 — User reports a search problem**
 
-User: *"Search feels worse this week. Am I imagining it?"*
+User: *"I can't find the refund policy doc anymore."*
 
 Agent:
 ```
-get_index_stats() → same as last week
-evaluate_retrieval → MRR 0.71 (was 0.79 last week, ▽ -0.08 SIGNAL)
-                    Recall 0.79 (was 0.83, ▽ -0.04, borderline)
-                    Precision 0.42 (was 0.48, ▽ -0.06 SIGNAL)
+evaluate_retrieval(test_cases=[{"query": "refund policy",
+  "expected_filepath": "docs/policies/refunds.md"}])
+→ per_query: found_at_rank: null, top_result: none
 
-Per-query drill: 3 of 12 queries got the WRONG top hit.
-
-Reply: "You are NOT imagining it. Quality dropped meaningfully:
-  MRR@5:       0.79 → 0.71  (▽ -0.08, real regression)
-  Precision@5: 0.48 → 0.42  (▽ -0.06)
-
-Investigation direction:
-1. `git log --since='7 days ago' documents/` — anything indexed that shouldn't
-   have been? Random junk can pollute retrieval.
-2. Check the 3 failing queries — do they all touch a specific category?
-   That suggests a category-specific issue.
-3. If a new large batch was ingested with a different tone (e.g. auto-generated
-   docs), consider a category filter or re-tuning min_score.
-
-Next step: I can run per-category evaluation to isolate the regression."
+Reply: "Confirmed: the refund policy doc did not come back in top-5 for its
+own title query. list_documents() shows it is no longer in the index — the
+last reindex ran before that file was added. Reindexing now."
 ```
 
 ---
 
 ## Edge cases
 
-- **No evaluation set exists** — offer to help build one. Ask the user for 5-10 queries where they know the correct doc. Bootstrap that as `tests/evaluation-queries.json`.
-- **Corpus < 50 docs** — evaluate_retrieval is not very meaningful at this scale. Numbers will jitter. Skip until corpus grows.
+- **No curated set exists** — offer to help build one. Ask the user for 5-10 queries where they know the expected doc, keyed as `query` + `expected_filepath`. Bootstrap that as `tests/evaluation-queries.json`.
+- **Corpus < 50 docs** — reachability checks still work (each case is concrete), but say so: tiny sets say nothing about the corpus in general.
 - **Cache hit rate always 0%** — either no repeat queries (fine, expected for one-shot use) OR `query_cache` is disabled in config. Not necessarily a problem.
-- **Prometheus available** — chain to `/metrics` scrape for latency percentiles: `knowledge_rag_search_latency_seconds` histogram. Combine with retrieval quality for a full picture.
+- **Prometheus available** — chain to `/metrics` scrape for latency percentiles: `knowledge_rag_search_latency_seconds` histogram. Latency and reachability are separate signals; keep them separate in the report.
 
 ---
 
 ## Related skills
 
 - **[`rag-onboard-context`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/foundation/rag-onboard-context/SKILL.md)** — the light-touch version (get_index_stats only, no evaluation).
-- **[`rag-index-decisions`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-index-decisions/SKILL.md)** — after quality tuning, index the decision so next reader knows what changed and why.
-- **[`rag-check-first`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/foundation/rag-check-first/SKILL.md)** — the workhorse that BENEFITS from the quality tracked here.
+- **[`rag-index-decisions`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-index-decisions/SKILL.md)** — after fixing an indexing problem found here, index the decision so next reader knows what changed and why.
+- **[`rag-check-first`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/foundation/rag-check-first/SKILL.md)** — the workhorse whose reachability this skill verifies.

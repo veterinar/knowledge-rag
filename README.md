@@ -211,7 +211,7 @@ Installing knowledge-rag gives your agent 13 MCP tools. It does not tell the age
 | 7 | [`rag-code-review`](skills/workflow/rag-code-review/SKILL.md) | Review consults ADRs / patterns before commenting |
 | 8 | [`rag-index-decisions`](skills/maintenance/rag-index-decisions/SKILL.md) | After a decision, index it back — close the feedback loop |
 | 9 | [`rag-security-first`](skills/domain/rag-security-first/SKILL.md) | Security tasks: MITRE / CVE / runbook first |
-| 10 | [`rag-evaluate-quality`](skills/maintenance/rag-evaluate-quality/SKILL.md) | Weekly checkup — MRR@5 · Recall@5 · Precision@5 |
+| 10 | [`rag-evaluate-quality`](skills/maintenance/rag-evaluate-quality/SKILL.md) | Offline smoke check — expected-doc reachability, not a benchmark |
 
 **Install — pick the shortest path for your machine:**
 
@@ -238,7 +238,7 @@ Once installed, your AI agent gets these 13 tools automatically:
 | `search_knowledge` | Hybrid semantic + BM25 with cross-encoder rerank |
 | `get_document` | Retrieve full content of one document |
 | `search_similar` | Find documents similar to a reference |
-| `evaluate_retrieval` | Measure MRR@5 · Recall@5 · Precision@5 |
+| `evaluate_retrieval` | Offline smoke check — is each expected doc reachable in top-5 (not a benchmark) |
 | `add_document` | Index a new document via MCP |
 | `update_document` | Re-index a changed document |
 | `remove_document` | Drop a document + all its chunks |

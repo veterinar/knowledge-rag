@@ -133,7 +133,7 @@ User: "Yes, do it."
 
 Agent:
 [Writes file, calls add_document, then confirms with a search]
-search_knowledge(query='refresh token rotation') → new ADR appears at score 0.92
+search_knowledge(query='refresh token rotation') → new ADR is now the top hit
 
 "Done. ADR-0045 is indexed and searchable. Next time anyone asks about refresh
 tokens, rag-check-first will surface it immediately."
@@ -206,4 +206,4 @@ Proceed?"
 - **[`rag-troubleshoot`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/workflow/rag-troubleshoot/SKILL.md)** — the natural upstream: after a novel bug fix, index the postmortem.
 - **[`rag-code-review`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/workflow/rag-code-review/SKILL.md)** — the other upstream: after a review surfaces a new pattern, index it.
 - **[`rag-onboard-context`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/foundation/rag-onboard-context/SKILL.md)** — the next session's onboarding will surface the new index; this closes the loop.
-- **[`rag-evaluate-quality`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-evaluate-quality/SKILL.md)** — after significant indexing activity, worth measuring quality delta.
+- **[`rag-evaluate-quality`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-evaluate-quality/SKILL.md)** — after significant indexing activity, run the reachability smoke check.

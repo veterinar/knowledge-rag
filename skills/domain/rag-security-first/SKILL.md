@@ -55,7 +55,7 @@ For security tasks, the corpus is **primary**:
 
 3. **Search the corpus with the security preset in mind:**
    ```
-   search_knowledge(query="<signature> <intent>", max_results=5, min_score=0.15)
+   search_knowledge(query="<signature> <intent>", max_results=5)
    ```
    Example: `search_knowledge(query="LSASS dump credential access detection", max_results=5)`
 
@@ -95,9 +95,9 @@ User: *"We saw process creation of `rundll32.exe comsvcs.dll MiniDump 632 dump.d
 Agent:
 ```
 search_knowledge(query="rundll32 comsvcs MiniDump LSASS credential dump",
-                 max_results=5, min_score=0.15)
-→ 4 hits: mitre-T1003.001-lsass.md (0.94), redteam-cred-dumping.md (0.82),
-          blueteam-lsass-detection.md (0.79), edr-tuning-lsass.md (0.71)
+                 max_results=5)
+→ 4 hits, led by mitre-T1003.001-lsass.md, then redteam-cred-dumping.md,
+          blueteam-lsass-detection.md, edr-tuning-lsass.md
 
 Reply: "Yes, high-confidence malicious [mitre-T1003.001-lsass.md].
 
@@ -128,7 +128,7 @@ Agent:
 ```
 search_knowledge(query="CVE-2024-3400", max_results=5) → 0 hits (specific CVE not indexed)
 search_knowledge(query="PAN-OS GlobalProtect vulnerability", max_results=5) → 2 hits
-  → asset-inventory-perimeter.md (0.68), vuln-response-playbook.md (0.55)
+  → asset-inventory-perimeter.md, vuln-response-playbook.md (rank order)
 
 Reply: "The corpus does not have CVE-2024-3400 specifically indexed. Checking external
 sources... [chains to mcp__cti__vuln_cve(cve_id='CVE-2024-3400')]
@@ -156,8 +156,8 @@ Agent:
 ```
 search_knowledge(query="Kerberoasting SPN request authorized pentest",
                  category="redteam", max_results=5)
-→ 4 hits: kerberoasting-technique.md (0.91), rubeus-usage.md (0.83),
-          post-exploit-cred-cracking.md (0.75), opsec-considerations.md (0.68)
+→ 4 hits (rank order): kerberoasting-technique.md, rubeus-usage.md,
+          post-exploit-cred-cracking.md, opsec-considerations.md
 
 Reply: "**MITRE ATT&CK T1558.003** (Steal or Forge Kerberos Tickets: Kerberoasting)
 [kerberoasting-technique.md].

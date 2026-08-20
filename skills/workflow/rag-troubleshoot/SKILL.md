@@ -47,7 +47,7 @@ Only after those three come back empty does the agent apply general debugging te
 
 2. **First search — exact error signature:**
    ```
-   search_knowledge(query="<exception name> <error keyword>", max_results=5, min_score=0.15)
+   search_knowledge(query="<exception name> <error keyword>", max_results=5)
    ```
    Example: `search_knowledge(query="ConnectionError refused chromadb")`
 
@@ -87,7 +87,7 @@ User: *"Getting `EmbeddingModelLoadError: sticky failure` when starting knowledg
 
 Agent:
 ```
-search_knowledge(query="EmbeddingModelLoadError sticky failure") → 3 hits, top 0.91
+search_knowledge(query="EmbeddingModelLoadError sticky failure") → 3 hits, top snippet answers it
 
 Reply: "This is documented in [CHANGELOG.md#v381]. The `sticky _load_failed` flag was
 added in v3.8.1 as a hotfix — when the ONNX model fails to load, subsequent calls
@@ -108,7 +108,7 @@ User: *"Our search results are empty after nuclear rebuild. What now?"*
 Agent:
 ```
 search_knowledge(query="empty results nuclear rebuild") → 4 hits
-1st hit: docs/reindex-operations.md (0.87)
+1st hit: docs/reindex-operations.md
 
 get_document(filepath="docs/reindex-operations.md")
 → Full runbook including "post-rebuild sanity check" section

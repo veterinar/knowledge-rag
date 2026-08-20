@@ -24,7 +24,7 @@ Hybrid search combining semantic search + BM25 keyword search with cross-encoder
 | `max_results` | int | 5 | Maximum results to return (1-20) |
 | `category` | string | null | Filter by category |
 | `hybrid_alpha` | float | 0.3 | Balance: 0.0 = keyword only, 1.0 = semantic only |
-| `min_score` | float | 0.0 | Minimum relevance score (0.0-1.0) to include a result. Use 0.2-0.4 to cut noise |
+| `min_score` | float | 0.0 | Minimum `query_relative_score` (0.0-1.0) to include a result. The score is min-max normalized within the cohort returned for this one query — not an absolute relevance threshold, not comparable across queries, and no universal cut-off is recommended. Default 0.0 returns all results |
 | `snippet_mode` | bool | true | Truncate content to ~500 chars at natural break points. Adds `content_length` field |
 
 **Returns:**
@@ -36,6 +36,7 @@ Hybrid search combining semantic search + BM25 keyword search with cross-encoder
   "hybrid_alpha": 0.5,
   "result_count": 3,
   "filtered_by_score": 2,
+  "filtered_by_query_relative_score": 2,
   "cache_hit_rate": "0.0%",
   "results": [
     {
@@ -43,9 +44,12 @@ Hybrid search combining semantic search + BM25 keyword search with cross-encoder
       "source": "documents/security/credential-attacks.md",
       "filename": "credential-attacks.md",
       "category": "security",
+      "raw_score": 8.7432,
+      "query_relative_score": 0.9823,
       "score": 0.9823,
+      "score_source": "reranker",
       "raw_rrf_score": 0.016393,
-      "reranker_score": 0.987654,
+      "reranker_score": 8.7432,
       "semantic_rank": 2,
       "bm25_rank": 1,
       "search_method": "hybrid",
@@ -55,6 +59,19 @@ Hybrid search combining semantic search + BM25 keyword search with cross-encoder
   ]
 }
 ```
+
+**Score fields (each result):**
+- `raw_score` — the unrounded effective output of the scorer named by `score_source` (`"reranker"`, `"rrf"`, or `"fts5_bm25"`).
+- `query_relative_score` — 0.0-1.0 min-max normalization of `raw_score` within the cohort returned for THIS query: the cohort's best result maps to 1.0 and its worst to 0.0 (a single-result or uniform cohort maps to 1.0).
+- `score` — legacy alias of `query_relative_score`, kept for backwards compatibility.
+- `score_source` — identity of the scorer that produced the effective `raw_score`.
+
+These fields rank results relative to each other within one query's returned cohort. They are
+not absolute relevance measurements: a 0.7 for one query is not comparable to a 0.7 for another
+query, and no value is by itself evidence that a result is good or bad. `min_score` filters on
+`query_relative_score` only; no universal cut-off is recommended. The envelope's
+`filtered_by_score` (legacy alias) and `filtered_by_query_relative_score` always carry the
+same count.
 
 **Search Method Values:**
 - `hybrid`: Found by both semantic and BM25 search (highest confidence)
@@ -343,9 +360,9 @@ reindex_documents(full_rebuild=True)
 
 ---
 
-#### `evaluate_retrieval` — full example
+#### `evaluate_retrieval` — offline smoke check (expected-document reachability)
 
-Measure retrieval quality against a ground-truth test set. Useful for tuning `hybrid_alpha`, testing query expansion effectiveness, or validating after reindexing.
+Offline reachability check labelled `evaluation_mode: "offline_smoke"` in its payload. NOT a benchmark and NOT a general retrieval-quality measurement: it runs each hand-picked query through the live pipeline and reports whether the expected document appeared in the top-5. Useful after bulk ingestion, reindexing, or `hybrid_alpha` tuning to confirm specific documents are still reachable.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -367,13 +384,12 @@ test_cases = json.dumps([
 evaluate_retrieval(test_cases=test_cases)
 ```
 
-Returns MRR@5 · Recall@5 · Precision@5 aggregated across all test cases, plus a per-query breakdown showing which expected doc was found and at what rank.
+Returns `evaluation_mode` (`"offline_smoke"`), `total_queries`, MRR@5 and Recall@5 computed over that curated set only, plus a per-query breakdown showing which expected doc was found and at what rank.
 
-**Metrics:**
+**Diagnostics (curated set only):**
 - **MRR@5** (Mean Reciprocal Rank): Average of 1/rank for expected documents. 1.0 = always first result.
 - **Recall@5**: Fraction of expected documents found in top 5 results. 1.0 = all found.
-- **Precision@5**: Fraction of top-5 results that are relevant. Higher = less noise.
 
-Interpretation cheat-sheet: **MRR@5 ≥ 0.7 is good**, **≥ 0.8 is excellent**. Any drop of ≥ 0.05 vs prior baseline is a real regression worth investigating.
+These numbers carry no statistical weight: do not quote them as retrieval-quality measurements and do not compare them against universal thresholds — none are published for this tool. Matching is lexical boundary matching on the expected path, not filesystem resolution.
 
 ---

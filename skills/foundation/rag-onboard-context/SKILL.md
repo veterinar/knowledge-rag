@@ -78,7 +78,7 @@ Agent (internal, before answering):
 ```
 get_index_stats() → 12,043 chunks / 3,214 docs, cache hit 0%, model bge-small-en-v1.5
 list_categories() → {development: 1200, security: 800, general: 214, adrs: 45}
-search_knowledge(query="REST endpoint", max_results=3) → 3 hits, top score 0.71
+search_knowledge(query="REST endpoint", max_results=3) → 3 hits, top snippets on-topic
 
 Now I know: this project has ADRs indexed. I should look at those before designing the endpoint.
 
@@ -94,7 +94,7 @@ Agent (internal):
 ```
 get_index_stats() → 45,000 chunks / 5,800 docs
 list_categories() → {redteam: 12000, blueteam: 8000, ctf: 5000, mitre: 4200}
-search_knowledge(query="LSASS credential dump", max_results=5) → 8 hits, top score 0.89
+search_knowledge(query="LSASS credential dump", max_results=5) → 8 hits, top snippets on-topic
 
 Now I know: this is a security-focused RAG. LSASS is well-covered. Full triage is
 going to be corpus-driven.

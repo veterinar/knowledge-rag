@@ -45,19 +45,22 @@ Trigger this skill **before answering** whenever the user asks:
 
 2. **Call `search_knowledge`:**
    ```
-   search_knowledge(query="<extracted keywords>", max_results=5, snippet_mode=true, min_score=0.15)
+   search_knowledge(query="<extracted keywords>", max_results=5, snippet_mode=true)
    ```
    - `snippet_mode=true` keeps token consumption sane
-   - `min_score=0.15` cuts obvious noise (adjust higher for terse corpora)
+   - Results carry `query_relative_score` (and its legacy alias `score`), normalized
+     within THIS query's returned cohort — it ranks the hits against each other and is
+     not comparable across queries. Judge relevance by reading the snippets, not by a
+     score number. Pass `min_score` only as a deliberate, query-calibrated caller choice.
 
-3. **Read the top 3 results.** Pay attention to `search_method` (`hybrid` > `semantic` / `keyword` alone), `score`, and `reranker_score`.
+3. **Read the top 3 results.** Pay attention to `search_method` (`hybrid` > `semantic` / `keyword` alone), `score_source`, and the actual snippet content.
 
 4. **Decide the answer strategy** based on what came back:
 
    | RAG result | What to do |
    |---|---|
-   | ≥1 result with `score > 0.5` matching the intent | Answer **primarily from the RAG content**, quote relevant snippets, cite the source (`path:line`) |
-   | 1–3 results with lower scores (0.2–0.5) | Use as **partial context**, be explicit that the corpus does not cover this in depth, mix with training-data knowledge |
+   | ≥1 result whose snippet clearly matches the intent | Answer **primarily from the RAG content**, quote relevant snippets, cite the source (`path:line`) |
+   | Only loosely related snippets | Use as **partial context**, be explicit that the corpus does not cover this in depth, mix with training-data knowledge |
    | 0 results after 2 attempts with varied phrasing | State it: "Local corpus does not have this. Answering from general knowledge — verify before acting." Optionally chain to `rag-web-fallback` |
 
 5. **If unsure between 2 corpus interpretations**, call `get_document` on the most promising `source` to fetch full context before answering.
@@ -72,8 +75,9 @@ User: *"How do we handle authentication in the payment service?"*
 
 Agent (internal):
 ```
-search_knowledge(query="authentication payment service", max_results=5, min_score=0.15)
-→ 3 hits: ADR-0018-auth.md (0.82), payment-service-design.md (0.71), auth-runbook.md (0.55)
+search_knowledge(query="authentication payment service", max_results=5)
+→ 3 hits: ADR-0018-auth.md (top of this query's cohort), payment-service-design.md,
+          auth-runbook.md
 
 Answer: "Per ADR-0018 (path: docs/adr/0018-auth.md), the payment service
 uses mTLS between services and OAuth2 for user-facing endpoints..."
@@ -86,7 +90,7 @@ User: *"Add a new endpoint for refund cancellation."*
 Agent (internal):
 ```
 search_knowledge(query="refund cancellation endpoint", max_results=5)
-→ 2 hits: refund-service.md (0.68), refunds-api-v2.md (0.61)
+→ 2 hits (rank order): refund-service.md, refunds-api-v2.md
 
 Then: read the top result, model the new endpoint on the existing pattern,
 cite the reference file in the reply.

@@ -27,7 +27,7 @@ npx skills add lyonzin/knowledge-rag
 | 7 | [`rag-code-review`](workflow/rag-code-review/SKILL.md) | 🧠 | Code review consults ADRs / patterns before commenting | `search_knowledge`, `search_similar` |
 | 8 | [`rag-index-decisions`](maintenance/rag-index-decisions/SKILL.md) | 🔁 | After making an architectural decision, index it back | `add_document`, `add_from_url` |
 | 9 | [`rag-security-first`](domain/rag-security-first/SKILL.md) | 🏢 | Security tasks: MITRE / CVE / threat context first | `search_knowledge` (cybersecurity preset) |
-| 10 | [`rag-evaluate-quality`](maintenance/rag-evaluate-quality/SKILL.md) | 🔁 | Periodically measure retrieval quality (MRR / Recall / Precision) | `evaluate_retrieval`, `get_index_stats` |
+| 10 | [`rag-evaluate-quality`](maintenance/rag-evaluate-quality/SKILL.md) | 🔁 | Offline smoke check — are expected docs still reachable in top-5 (MRR/Recall diagnostics only, not a benchmark) | `evaluate_retrieval`, `get_index_stats` |
 
 ---
 
@@ -56,7 +56,7 @@ Understand what the project cares about, review against those standards, cite th
 Load session context, prioritize the security preset, drill down, cite the MITRE technique / runbook.
 
 ### Chain: "Weekly maintenance"
-`rag-evaluate-quality` → (if quality drops) `rag-index-decisions` on new material → `reindex_documents(force=True)`
+`rag-evaluate-quality` → (if expected docs become unreachable) `rag-index-decisions` on the fix → `reindex_documents(force=True)`
 
 ---
 
@@ -92,7 +92,7 @@ See [README.md#manual-install-claude-code](README.md#manual-install-claude-code)
 
 **Standard setup (6 skills):** minimal + `rag-deep-dive` + `rag-web-fallback` + `rag-troubleshoot`. Full daily-work coverage.
 
-**Enterprise setup (all 10):** everything above + `rag-code-review` + `rag-index-decisions` + `rag-security-first` + `rag-evaluate-quality`. Adds review discipline, feedback loop, security emphasis, and quality monitoring.
+**Enterprise setup (all 10):** everything above + `rag-code-review` + `rag-index-decisions` + `rag-security-first` + `rag-evaluate-quality`. Adds review discipline, feedback loop, security emphasis, and smoke-check cadence.
 
 **Domain-specific (pick one):**
 - Security team → `rag-security-first` is mandatory
