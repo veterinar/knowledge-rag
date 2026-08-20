@@ -532,6 +532,41 @@ def _yaml_embedding_has(key: str) -> bool:
     return key in emb
 
 
+class EmbeddingRuntimeContractError(ValueError):
+    """Installed FastEmbed runtime does not match the versioned pins.
+
+    Raised only by the live registry/runtime verification
+    (``Config.require_embedding_runtime_contract`` /
+    ``Config._resolve_embedding_runtime_contract``) for registry,
+    distribution, or declared-value mismatch failures. Malformed STATIC
+    versioned configuration (bad mode, missing artifact/runtime/pooling
+    fields) keeps raising plain ``ValueError`` from ``_validate_index_mode``.
+    Subclasses ``ValueError`` so existing value-error handling still works.
+    """
+
+
+# Exact installed-runtime contract for the ONLY embedding models admitted in
+# versioned mode (aligned with _EMBEDDING_PROFILES). Keys are lowercase
+# canonical registered FastEmbed spellings for case-insensitive lookup;
+# values carry the canonical spelling, the exact expected implementation
+# class family, the registered dimension, and the pooling contract.
+#
+# "cls-or-prepooled" is the exact FastEmbed 0.8.0 OnnxTextEmbedding branch
+# contract — CLS (``embeddings[:, 0]``) for rank-3 sequence output,
+# pass-through for already-pooled rank-2 output, then L2 normalization. It
+# is NOT a claim that a given artifact internally uses CLS; the artifact
+# tree SHA plus installed RECORD/runtime bind the bytes. Registry metadata
+# cannot prove output rank, so no generic per-class pooling claim is made.
+_EMBEDDING_RUNTIME_CONTRACTS: Dict[str, Dict[str, object]] = {
+    entry["model"].lower(): entry
+    for entry in (
+        {"model": "BAAI/bge-small-en-v1.5", "impl": "onnx", "dim": 384, "pooling": "cls-or-prepooled"},
+        {"model": "BAAI/bge-large-en-v1.5", "impl": "onnx", "dim": 1024, "pooling": "cls-or-prepooled"},
+        {"model": "intfloat/multilingual-e5-large", "impl": "pooled", "dim": 1024, "pooling": "mean"},
+    )
+}
+
+
 # ============================================================================
 # CONFIG DATACLASS
 # ============================================================================
@@ -905,6 +940,14 @@ class Config:
     active_generation_receipt: Optional[Dict[str, Any]] = None
     generation_build: bool = False  # True only inside the offline builder process
 
+    # Runtime-only (never YAML): safe reason string when the live installed
+    # FastEmbed runtime contract does not match the declared versioned pins.
+    # Set by _validate_index_mode so Config() construction — and therefore
+    # module import and get_index_stats — SURVIVES runtime drift (the process
+    # degrades to stats-only). Every generation_compatibility() call
+    # re-verifies freshly and raises EmbeddingRuntimeContractError instead.
+    _embedding_runtime_contract_error: Optional[str] = field(init=False, default=None, repr=False, compare=False)
+
     def __post_init__(self):
         """Validate config values and ensure directories exist."""
         self._validate_chunking()
@@ -1203,6 +1246,223 @@ class Config:
         self.documents_dir.mkdir(parents=True, exist_ok=True)
         self.models_cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _resolve_embedding_runtime_contract(self, model_name: str) -> Dict[str, Any]:
+        """Registry-only FastEmbed runtime contract for versioned validation.
+
+        Inspects the installed FastEmbed 0.8.0 ``TextEmbedding`` dispatch
+        registry exactly as upstream defines it: iterate
+        ``EMBEDDINGS_REGISTRY`` (a ``list[Type[TextEmbeddingBase]]`` in
+        dispatch order, never a mapping) calling each implementation's
+        ``_list_supported_models()``. Never constructs ``TextEmbedding``,
+        never reads model files, never touches the network.
+
+        Admits EXACTLY the three project built-ins in
+        ``_EMBEDDING_RUNTIME_CONTRACTS`` (aligned with ``_EMBEDDING_PROFILES``)
+        and requires exactly one installed registry match with the exact
+        canonical registered spelling, the exact expected implementation
+        CLASS IDENTITY (lazily imported from its exact module — never
+        ``__name__``, so a same-name lookalike fails closed), and the exact
+        expected dimension. Every other model/class — including other exact
+        Onnx models, PooledNormalized, Custom, CLIP, Jina, sparse/image/
+        late-interaction — fails closed. Registry metadata cannot prove
+        output rank or pre-pooling semantics, so no generic per-class
+        pooling claim is made; BGE rows carry the honest
+        ``cls-or-prepooled`` FastEmbed 0.8.0 branch contract. Returns the
+        canonical model spelling, installed runtime string
+        (``"fastembed <version>"``), registered dimension, and pooling
+        contract. All failures raise ``EmbeddingRuntimeContractError``.
+        """
+        import importlib.metadata as _importlib_metadata
+
+        try:
+            from fastembed import TextEmbedding as _TextEmbedding
+        except Exception as exc:  # pragma: no cover - fastembed is a hard runtime dep
+            raise EmbeddingRuntimeContractError(
+                f"cannot import fastembed registry to verify embedding runtime contract: {exc}"
+            ) from exc
+
+        model_want = str(model_name or "").strip().lower()
+        if not model_want:
+            raise EmbeddingRuntimeContractError(
+                "models.embedding.model is required to verify the versioned runtime contract"
+            )
+        expected = _EMBEDDING_RUNTIME_CONTRACTS.get(model_want)
+        if expected is None:
+            allowed = ", ".join(sorted(str(e["model"]) for e in _EMBEDDING_RUNTIME_CONTRACTS.values()))
+            raise EmbeddingRuntimeContractError(
+                f"embedding model {str(model_name).strip()!r} is not admitted in versioned mode "
+                f"(supported: {allowed}); no name-table fallback"
+            )
+
+        # matched entries: (exact implementation class, registered dim, exact
+        # registered model spelling). Classification below uses CLASS IDENTITY
+        # against the exact lazily-imported FastEmbed implementation classes —
+        # never ``__name__`` — so a specialized or shadowing same-name class
+        # fails closed.
+        matched: list[tuple[type, Any, str]] = []
+        try:
+            registry = _TextEmbedding.EMBEDDINGS_REGISTRY
+            if isinstance(registry, dict) or not isinstance(registry, (list, tuple)):
+                raise EmbeddingRuntimeContractError(
+                    "fastembed EMBEDDINGS_REGISTRY must be a dispatch-ordered list of implementation classes"
+                )
+            for impl in registry:
+                impl_label = impl.__name__ if isinstance(impl, type) else type(impl).__name__
+                try:
+                    descriptions = impl._list_supported_models()
+                except Exception as exc:
+                    raise EmbeddingRuntimeContractError(
+                        f"failed to list supported models for fastembed implementation {impl_label!r}: {exc}"
+                    ) from exc
+                if isinstance(descriptions, dict):  # pragma: no cover - defensive
+                    descriptions = descriptions.get("models", [])
+                for description in descriptions:
+                    try:
+                        registered = str(getattr(description, "model", "") or "")
+                        dim = getattr(description, "dim", None)
+                    except Exception as exc:
+                        raise EmbeddingRuntimeContractError(
+                            f"unreadable model description in fastembed {impl_label!r}: {exc}"
+                        ) from exc
+                    if registered.strip().lower() == model_want:
+                        matched.append((impl, dim, registered))
+        except EmbeddingRuntimeContractError:
+            raise
+        except Exception as exc:
+            raise EmbeddingRuntimeContractError(f"failed to inspect the fastembed embedding registry: {exc}") from exc
+
+        if not matched:
+            raise EmbeddingRuntimeContractError(
+                f"embedding model {str(model_name).strip()!r} is not registered in the installed "
+                "fastembed runtime registry (versioned mode fails closed; no name-table fallback)"
+            )
+        if len(matched) > 1:
+            impls = ", ".join(sorted({getattr(i, "__name__", str(i)) for i, _, _ in matched}))
+            raise EmbeddingRuntimeContractError(
+                f"embedding model {str(model_name).strip()!r} is registered by multiple fastembed "
+                f"implementations ({impls}); versioned mode cannot prove which one dispatches"
+            )
+
+        impl, dim, registered = matched[0]
+        # Exact canonical registered spelling (case-insensitive user input is
+        # accepted only because the canonical spelling is returned/used).
+        if registered != expected["model"]:
+            raise EmbeddingRuntimeContractError(
+                f"fastembed registers {str(model_name).strip()!r} with non-canonical spelling "
+                f"{registered!r}; expected exactly {expected['model']!r}"
+            )
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim != expected["dim"]:
+            impl_label = getattr(impl, "__name__", str(impl))
+            raise EmbeddingRuntimeContractError(
+                f"fastembed registers dimension {dim!r} for {registered!r} ({impl_label}); "
+                f"versioned mode requires exactly {expected['dim']}"
+            )
+
+        # Exact-class identity: import the two admitted implementation classes
+        # from their exact modules and admit ONLY their exact identities.
+        try:
+            from fastembed.text.onnx_embedding import OnnxTextEmbedding as _ExactOnnxTextEmbedding
+            from fastembed.text.pooled_embedding import PooledEmbedding as _ExactPooledEmbedding
+        except Exception as exc:
+            raise EmbeddingRuntimeContractError(
+                f"cannot import the exact fastembed implementation classes for identity "
+                f"verification; versioned mode fails closed: {exc}"
+            ) from exc
+
+        if expected["impl"] == "onnx":
+            if impl is not _ExactOnnxTextEmbedding:
+                impl_label = getattr(impl, "__name__", str(impl))
+                raise EmbeddingRuntimeContractError(
+                    f"embedding model {registered!r} must dispatch to the exact "
+                    f"fastembed.text.onnx_embedding.OnnxTextEmbedding class; got {impl_label!r} "
+                    "(exact-class identity check failed; a same-name class is not admitted)"
+                )
+        elif expected["impl"] == "pooled":
+            if impl is not _ExactPooledEmbedding:
+                impl_label = getattr(impl, "__name__", str(impl))
+                raise EmbeddingRuntimeContractError(
+                    f"embedding model {registered!r} must dispatch to the exact "
+                    f"fastembed.text.pooled_embedding.PooledEmbedding class; got {impl_label!r} "
+                    "(exact-class identity check failed; a same-name class is not admitted)"
+                )
+        else:  # pragma: no cover - allowlist only carries onnx/pooled
+            raise EmbeddingRuntimeContractError(f"internal error: unknown implementation family {expected['impl']!r}")
+
+        # Distribution identity: the exact production lock is CPU fastembed.
+        # A shadowing fastembed-gpu distribution must never be reported as
+        # CPU ``fastembed <version>``; both installed (or CPU missing) fails.
+        try:
+            version = _importlib_metadata.version("fastembed")
+        except Exception as exc:
+            raise EmbeddingRuntimeContractError(
+                f"fastembed (CPU) distribution metadata unavailable; versioned mode fails closed: {exc}"
+            ) from exc
+        try:
+            _importlib_metadata.version("fastembed-gpu")
+        except _importlib_metadata.PackageNotFoundError:
+            pass
+        except Exception as exc:
+            raise EmbeddingRuntimeContractError(
+                f"cannot determine whether the fastembed-gpu distribution shadows the CPU "
+                f"fastembed pin; versioned mode fails closed: {exc}"
+            ) from exc
+        else:
+            raise EmbeddingRuntimeContractError(
+                "both 'fastembed' and 'fastembed-gpu' distributions are installed; the GPU "
+                "distribution must not shadow the exact CPU fastembed production pin "
+                "(indexing.mode=versioned fails closed)"
+            )
+
+        return {
+            "embedding_model": expected["model"],
+            "runtime_version": f"fastembed {version}",
+            "embedding_dim": int(dim),
+            "pooling": str(expected["pooling"]),
+        }
+
+    def require_embedding_runtime_contract(self) -> Dict[str, Any]:
+        """Freshly verify the declared pins against the installed runtime.
+
+        Re-resolves the live FastEmbed registry/distribution on EVERY call
+        (a cached previous success is never authority), compares the declared
+        ``embedding_runtime_version`` / ``embedding_dim`` /
+        ``embedding_pooling`` (pooling case-insensitively) against the
+        canonical contract, and returns the canonical values. Only
+        ``EmbeddingRuntimeContractError`` is raised for registry,
+        distribution, or mismatch failures. Called by versioned
+        ``_validate_index_mode`` (which stores the safe message instead of
+        raising, so ``Config()`` and module import survive runtime drift)
+        and by ``generation_compatibility()`` (which hard-fails — offline
+        generation must never proceed on an unproven runtime).
+        """
+        contract = self._resolve_embedding_runtime_contract(self.embedding_model)
+        declared_runtime = str(self.embedding_runtime_version or "").strip()
+        if declared_runtime != contract["runtime_version"]:
+            raise EmbeddingRuntimeContractError(
+                f"models.embedding.runtime_version {declared_runtime!r} does not match the "
+                f"installed embedding runtime {contract['runtime_version']!r} "
+                "(indexing.mode=versioned fails closed)"
+            )
+        declared_dim = self.embedding_dim
+        if (
+            isinstance(declared_dim, bool)
+            or not isinstance(declared_dim, int)
+            or declared_dim != contract["embedding_dim"]
+        ):
+            raise EmbeddingRuntimeContractError(
+                f"models.embedding.dimensions {declared_dim!r} does not match the registered "
+                f"dimension {contract['embedding_dim']} for embedding model "
+                f"{str(self.embedding_model).strip()!r} (indexing.mode=versioned fails closed)"
+            )
+        declared_pooling = str(self.embedding_pooling or "").strip().lower()
+        if declared_pooling != contract["pooling"]:
+            raise EmbeddingRuntimeContractError(
+                f"models.embedding.pooling {str(self.embedding_pooling).strip()!r} does not match the "
+                f"proven pooling contract {contract['pooling']!r} for embedding model "
+                f"{str(self.embedding_model).strip()!r} (indexing.mode=versioned fails closed)"
+            )
+        return contract
+
     def _validate_index_mode(self) -> None:
         """Validate ``indexing.mode`` plus the fail-closed versioned inputs.
 
@@ -1235,6 +1495,26 @@ class Config:
             raise ValueError("indexing.mode=versioned requires models.embedding.runtime_version")
         if not str(self.embedding_pooling or "").strip():
             raise ValueError("indexing.mode=versioned requires models.embedding.pooling")
+        # Live registry/runtime verification. Unlike the STATIC checks above,
+        # a live mismatch (installed FastEmbed registry/dimension/pooling/
+        # distribution drift) must NOT abort Config construction: the module
+        # would fail to import and get_index_stats could never report the
+        # degraded state. Store the safe reason instead; generation pinning
+        # and every generation_compatibility() call re-verify freshly and
+        # fail closed via EmbeddingRuntimeContractError.
+        try:
+            contract = self.require_embedding_runtime_contract()
+        except EmbeddingRuntimeContractError as exc:
+            self._embedding_runtime_contract_error = str(exc)
+            return
+        self._embedding_runtime_contract_error = None
+        # Canonicalize ONLY on a proven match: the declared values become the
+        # exact registry/runtime actuals so generation compatibility binds
+        # the real runtime behavior (unproven declarations are never kept).
+        self.embedding_model = contract["embedding_model"]
+        self.embedding_runtime_version = contract["runtime_version"]
+        self.embedding_dim = contract["embedding_dim"]
+        self.embedding_pooling = contract["pooling"]
 
     def _init_generation_runtime_fields(self) -> None:
         """Populate runtime-only generation fields. Performs no I/O."""
@@ -1269,23 +1549,27 @@ class Config:
             raise RuntimeError("generation_compatibility() requires indexing.mode=versioned")
         from mcp_server.generations import digest_tree
 
+        # Fresh live verification on EVERY call — a startup-time success is
+        # never authority for the offline builder or for serving drift
+        # rechecks (the installed runtime may have changed since Config()).
+        # Raises EmbeddingRuntimeContractError on any drift so generation
+        # building/pinning fails closed; compatibility below is built from
+        # the canonical returned actuals, not the declared YAML values.
+        contract = self.require_embedding_runtime_contract()
         artifact_path = Path(self.embedding_artifact_path).expanduser()
         artifact_sha, _entries = digest_tree(artifact_path)
         # Attribute names vary across config revisions — resolve defensively;
         # the receipt validator rejects anything invalid downstream.
-        dimension = getattr(self, "embedding_dim", None)
-        if dimension is None:
-            dimension = getattr(self, "embedding_dimension", None)
         collection = getattr(self, "collection_name", None) or getattr(self, "collection", None)
         return {
             "collection_name": collection,
-            "embedding_model": self.embedding_model,
-            "embedding_dimension": dimension,
+            "embedding_model": contract["embedding_model"],
+            "embedding_dimension": contract["embedding_dim"],
             "query_prefix": getattr(self, "query_prefix", ""),
             "passage_prefix": getattr(self, "passage_prefix", ""),
             "model_artifact_sha256": artifact_sha,
-            "runtime_version": self.embedding_runtime_version,
-            "pooling": self.embedding_pooling,
+            "runtime_version": contract["runtime_version"],
+            "pooling": contract["pooling"],
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
             # Reranker binding (P0 #9/A): enabled flag + logical model name +

@@ -21,6 +21,9 @@ never leak state into other test modules.
 
 from __future__ import annotations
 
+import importlib.metadata
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -239,3 +242,273 @@ class TestPrefixApplication:
         spy.embed.assert_called_once()
         (called_texts,) = spy.embed.call_args.args
         assert called_texts is raw, "empty prefix must be identity, not a copy"
+
+
+# ---------------------------------------------------------------------------
+# Versioned runtime-contract resolver (registry-only; no model/network)
+# Deterministic fakes: stub modules in ``sys.modules`` (the registry plus the
+# two admitted exact implementation submodules, exposing the SAME class
+# objects the registry lists) are inspected instead of the real ones —
+# class-identity checks stay hermetic and no model is ever constructed or
+# contacted.
+# ---------------------------------------------------------------------------
+
+
+class OnnxTextEmbedding:
+    @staticmethod
+    def _list_supported_models():
+        return [
+            SimpleNamespace(model="BAAI/bge-small-en-v1.5", dim=384),
+            SimpleNamespace(model="BAAI/bge-large-en-v1.5", dim=1024),
+            # Non-project exact Onnx model: registered but NOT admitted.
+            SimpleNamespace(model="BAAI/bge-base-en-v1.5", dim=768),
+        ]
+
+
+class PooledEmbedding:
+    @staticmethod
+    def _list_supported_models():
+        return [SimpleNamespace(model="intfloat/multilingual-e5-large", dim=1024)]
+
+
+class PooledNormalizedEmbedding:
+    @staticmethod
+    def _list_supported_models():
+        return [SimpleNamespace(model="intfloat/multilingual-e5-base", dim=768)]
+
+
+class CustomTextEmbedding:
+    @staticmethod
+    def _list_supported_models():
+        return [SimpleNamespace(model="org/custom-model", dim=64)]
+
+
+def _install_fake_fastembed(monkeypatch: pytest.MonkeyPatch, registry) -> None:
+    for name, module in {
+        "fastembed": SimpleNamespace(TextEmbedding=SimpleNamespace(EMBEDDINGS_REGISTRY=registry)),
+        "fastembed.text.onnx_embedding": SimpleNamespace(OnnxTextEmbedding=OnnxTextEmbedding),
+        "fastembed.text.pooled_embedding": SimpleNamespace(PooledEmbedding=PooledEmbedding),
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    real_version = importlib.metadata.version
+
+    def _fake_version(name):
+        if name == "fastembed":
+            return "0.8.0"
+        if name == "fastembed-gpu":
+            raise importlib.metadata.PackageNotFoundError("fastembed-gpu")
+        return real_version(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", _fake_version)
+
+
+def _resolver(monkeypatch: pytest.MonkeyPatch, registry):
+    _install_fake_fastembed(monkeypatch, registry)
+    return cfg_module.Config.__new__(cfg_module.Config)
+
+
+def _resolve_contract(resolver, model: str) -> dict:
+    # Declared values match the allowlist expectation so only the registry
+    # side determines admission in rejection tests.
+    if model == "BAAI/bge-small-en-v1.5":
+        resolver.embedding_model, resolver.embedding_dim = model, 384
+        resolver.embedding_runtime_version, resolver.embedding_pooling = "fastembed 0.8.0", "cls-or-prepooled"
+    elif model == "BAAI/bge-large-en-v1.5":
+        resolver.embedding_model, resolver.embedding_dim = model, 1024
+        resolver.embedding_runtime_version, resolver.embedding_pooling = "fastembed 0.8.0", "cls-or-prepooled"
+    elif model == "intfloat/multilingual-e5-large":
+        resolver.embedding_model, resolver.embedding_dim = model, 1024
+        resolver.embedding_runtime_version, resolver.embedding_pooling = "fastembed 0.8.0", "mean"
+    else:
+        resolver.embedding_model = model
+        resolver.embedding_dim, resolver.embedding_runtime_version = 384, "fastembed 0.8.0"
+        resolver.embedding_pooling = "cls-or-prepooled"
+    return resolver._resolve_embedding_runtime_contract(model)
+
+
+@pytest.mark.parametrize(
+    "model,dim,pooling",
+    [
+        ("BAAI/bge-small-en-v1.5", 384, "cls-or-prepooled"),
+        ("BAAI/bge-large-en-v1.5", 1024, "cls-or-prepooled"),
+        ("intfloat/multilingual-e5-large", 1024, "mean"),
+    ],
+)
+def test_builtin_actual_contracts_from_registry(monkeypatch: pytest.MonkeyPatch, model, dim, pooling) -> None:
+    """The three built-ins resolve to their exact allowlist contracts."""
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+    contract = _resolve_contract(resolver, model)
+    assert contract == {
+        "embedding_model": model,
+        "runtime_version": "fastembed 0.8.0",
+        "embedding_dim": dim,
+        "pooling": pooling,
+    }
+
+
+def test_model_match_is_case_insensitive_returning_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+    contract = _resolve_contract(resolver, "baai/bge-small-en-v1.5")
+    assert contract["embedding_model"] == "BAAI/bge-small-en-v1.5"
+    assert contract["embedding_dim"] == 384
+    assert contract["pooling"] == "cls-or-prepooled"
+
+
+def test_non_project_onnx_model_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exact OnnxTextEmbedding model outside the allowlist fails closed."""
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="not admitted"):
+        _resolve_contract(resolver, "BAAI/bge-base-en-v1.5")
+
+
+def test_custom_text_embedding_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CustomTextEmbedding is not admitted even for its own registered model."""
+    resolver = _resolver(monkeypatch, [CustomTextEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="not admitted"):
+        _resolve_contract(resolver, "org/custom-model")
+
+
+def test_pooled_normalized_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PooledNormalizedEmbedding models are not admitted in versioned mode."""
+    resolver = _resolver(monkeypatch, [PooledNormalizedEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="not admitted"):
+        _resolve_contract(resolver, "intfloat/multilingual-e5-base")
+
+
+def test_wrong_exact_class_for_allowed_name_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An allowed name registered by the WRONG exact class fails closed."""
+
+    class OtherOnnxTextEmbedding:  # exact name, different class object
+        @staticmethod
+        def _list_supported_models():
+            return [SimpleNamespace(model="BAAI/bge-small-en-v1.5", dim=384)]
+
+    resolver = _resolver(monkeypatch, [OtherOnnxTextEmbedding, PooledEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="exact.*OnnxTextEmbedding"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_same_name_lookalike_for_allowed_name_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A same-name lookalike class is not admitted for an ALLOWED model."""
+
+    class OnnxTextEmbedding:  # noqa: A001 - deliberately shadows for identity proof
+        @staticmethod
+        def _list_supported_models():
+            return [SimpleNamespace(model="BAAI/bge-small-en-v1.5", dim=384)]
+
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="exact-class identity"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_registry_dimension_drift_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An allowed model whose REGISTERED dim drifted fails closed."""
+
+    class DriftedOnnx:
+        __name__ = "OnnxTextEmbedding"
+
+        @staticmethod
+        def _list_supported_models():
+            return [SimpleNamespace(model="BAAI/bge-small-en-v1.5", dim=999)]
+
+    resolver = _resolver(monkeypatch, [DriftedOnnx, PooledEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="requires exactly 384"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_duplicate_registration_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    class PooledEmbeddingToo:
+        @staticmethod
+        def _list_supported_models():
+            return [SimpleNamespace(model="BAAI/bge-small-en-v1.5", dim=384)]
+
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbeddingToo])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="multiple fastembed implementations"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_non_canonical_registered_spelling_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RenamedOnnx:
+        __name__ = "OnnxTextEmbedding"
+
+        @staticmethod
+        def _list_supported_models():
+            return [SimpleNamespace(model="baai/bge-small-en-v1.5", dim=384)]  # non-canonical case
+
+    resolver = _resolver(monkeypatch, [RenamedOnnx, PooledEmbedding])
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="non-canonical spelling"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_mapping_registry_shape_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolver = _resolver(monkeypatch, {"OnnxTextEmbedding": OnnxTextEmbedding})
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="dispatch-ordered list"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_missing_distribution_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+    _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")  # baseline resolves
+
+    def _missing(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", _missing)
+    with pytest.raises(
+        cfg_module.EmbeddingRuntimeContractError, match=r"fastembed \(CPU\) distribution metadata unavailable"
+    ):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_both_fastembed_and_fastembed_gpu_installed_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shadowing GPU distribution must never be reported as CPU fastembed."""
+    resolver = _resolver(monkeypatch, [OnnxTextEmbedding, PooledEmbedding])
+
+    def _both_installed(name):
+        if name in ("fastembed", "fastembed-gpu"):
+            return "0.8.0"
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", _both_installed)
+    with pytest.raises(cfg_module.EmbeddingRuntimeContractError, match="fastembed-gpu"):
+        _resolve_contract(resolver, "BAAI/bge-small-en-v1.5")
+
+
+def test_support_allowlist_agrees_with_embedding_profiles() -> None:
+    """The runtime-contract allowlist must mirror _EMBEDDING_PROFILES exactly."""
+    profiles = {
+        str(profile["model"]): profile["dimensions"]
+        for name, profile in cfg_module._EMBEDDING_PROFILES.items()
+        if name != "custom"
+    }
+    allowlist = {str(entry["model"]): entry["dim"] for entry in cfg_module._EMBEDDING_RUNTIME_CONTRACTS.values()}
+    assert allowlist == profiles
+
+
+def test_real_installed_registry_canary_for_three_builtins() -> None:
+    """Registry-only canary against the ACTUAL installed FastEmbed.
+
+    Walks the real ``TextEmbedding.EMBEDDINGS_REGISTRY`` metadata only —
+    no TextEmbedding construction, no model download, no network — and
+    asserts each admitted built-in is registered by the expected exact
+    implementation class with the expected dimension.
+    """
+    from fastembed import TextEmbedding
+    from fastembed.text.onnx_embedding import OnnxTextEmbedding
+    from fastembed.text.pooled_embedding import PooledEmbedding
+
+    expected_classes = {
+        "BAAI/bge-small-en-v1.5": (OnnxTextEmbedding, 384),
+        "BAAI/bge-large-en-v1.5": (OnnxTextEmbedding, 1024),
+        "intfloat/multilingual-e5-large": (PooledEmbedding, 1024),
+    }
+    found: dict = {}
+    for impl in TextEmbedding.EMBEDDINGS_REGISTRY:
+        for description in impl._list_supported_models():
+            name = str(getattr(description, "model", ""))
+            if name in expected_classes:
+                found[name] = (impl, getattr(description, "dim", None))
+    for name, (cls, dim) in expected_classes.items():
+        assert name in found, f"{name} missing from the installed fastembed registry"
+        assert found[name][0] is cls, f"{name} registered by unexpected implementation {found[name][0]!r}"
+        assert found[name][1] == dim, f"{name} registered dimension drifted: {found[name][1]!r}"

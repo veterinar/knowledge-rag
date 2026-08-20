@@ -148,7 +148,7 @@ and the add/update/remove tools are **not used** in that mode.
 | Mutations | live via MCP tools / watcher | offline only: `knowledge-rag-generation build` |
 | Serving | reads + writes | **query-only**; the process pins ONE verified generation for its lifetime |
 | Reindex recovery | smart/nuclear rebuild | never; build a new generation instead |
-| Watcher | auto-reindex on change (`advanced.watch_for_changes`, `advanced.watch_debounce_seconds`) | **disabled** (no hot reload, no auto-index, no repair) |
+| Watcher | auto-reindex on change (`advanced.watch_for_changes`, `advanced.watch_debounce_seconds`; config.yaml is the sole default/validation owner — the server passes the debounce field directly) | **disabled** (no hot reload, no auto-index, no repair) |
 
 ### Acceptance contract
 
@@ -161,6 +161,28 @@ Versioned serving is admitted only when all of the following remain true:
   runtime RECORD aggregate, canonical dependency lock, model artifacts and
   effective model configuration, chunking, generation identity, and the
   Chroma/FTS artifact and row counts/digests;
+- the declared embedding `runtime_version`, `dimensions`, and `pooling` are
+  verified against the **installed FastEmbed registry** at startup
+  (registry-only lookup — no model construction, artifact download, or
+  network). Versioned mode admits EXACTLY three models:
+  `BAAI/bge-small-en-v1.5` (384, `cls-or-prepooled` via the exact
+  `fastembed.text.onnx_embedding.OnnxTextEmbedding` class),
+  `BAAI/bge-large-en-v1.5` (1024, `cls-or-prepooled`, same exact class),
+  and `intfloat/multilingual-e5-large` (1024, `mean`, via the exact
+  `fastembed.text.pooled_embedding.PooledEmbedding` class). `cls-or-prepooled`
+  is the exact FastEmbed 0.8.0 branch contract (CLS for rank-3 sequence
+  output, pass-through for already-pooled rank-2 output) — not a claim about
+  a given artifact's internals. Every other model or class — including other
+  exact Onnx models, PooledNormalized, and Custom — fails closed. The runtime
+  string must equal `fastembed <installed CPU version>` exactly, and a
+  shadowing `fastembed-gpu` distribution is rejected. Unknown models,
+  duplicate registrations, non-canonical spellings, registry dimension
+  drift, and missing distribution metadata all fail closed. A mismatch
+  degrades serving to stats-only (`restart_required_environment_changed`,
+  retrieval blocked, no raw exception text) instead of aborting startup;
+  on match, the canonical actuals are stored and sealed into the receipt's
+  compatibility object. Generations sealed with the older generic `cls`
+  pooling value must be rebuilt offline;
 - every retrieval path checks freshness before cache/backend access and again
   before serving a materialized result; any mismatch returns
   `retrieval_blocked` and never serves a stale cache entry;

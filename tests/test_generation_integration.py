@@ -468,6 +468,87 @@ class TestLegacyModeUnchanged:
 
 
 class TestPinDegradesNeverAborts:
+    def test_runtime_contract_drift_degrades_safe_and_blocks_retrieval(
+        self, monkeypatch, tmp_path: Path, store: GenerationStore
+    ):
+        """Installed-runtime contract drift: safe stats-only, never a crash.
+
+        The initial generation_compatibility() verification raises the typed
+        EmbeddingRuntimeContractError; _pin_versioned_generation must map it
+        to DRIFT_REASON_ENVIRONMENT_CHANGED with an EMPTY safe detail (no raw
+        exception text, no paths), return None, leave stats available and
+        ready:false, and keep every retrieval path blocked.
+        """
+        from mcp_server.config import EmbeddingRuntimeContractError as _ContractError
+
+        cfg = _make_versioned_config(monkeypatch, tmp_path)
+        publish_generation(store, "gen-a")
+        bomb_orchestrator(monkeypatch)
+
+        def _drifted(*_args, **_kwargs):
+            raise _ContractError("models.embedding.pooling 'cls' mismatch /secret-path /tmp/x")
+
+        monkeypatch.setattr(cfg, "generation_compatibility", _drifted)
+        current = srv._pin_versioned_generation()
+        assert current is None
+        pin_failure = getattr(cfg, "_pin_failure", None)
+        assert pin_failure is not None
+        assert pin_failure["reason"] == srv.DRIFT_REASON_ENVIRONMENT_CHANGED
+        assert pin_failure["detail"] == {}
+        # Stats remains available, ready:false, safe reason, nothing leaked.
+        payload = json.loads(srv.get_index_stats())
+        raw = json.dumps(payload)
+        assert payload["status"] == "success"
+        assert payload["stats"]["index_mode"] == "versioned"
+        assert payload["stats"]["ready"] is False
+        assert payload["stats"]["reason"] == srv.DRIFT_REASON_ENVIRONMENT_CHANGED
+        assert "secret-path" not in raw
+        assert str(tmp_path) not in raw
+        assert "mismatch" not in raw
+        assert "Traceback" not in raw
+        # Retrieval stays blocked (degraded, unpinned).
+        envelope = json.loads(srv._versioned_read_only_error("search") or "{}")
+        assert envelope["error"] == "offline_generation_required"
+        assert envelope["restart_required"] is True
+
+    def test_snapshot_runtime_contract_drift_degrades_after_pin(
+        self, monkeypatch, tmp_path: Path, store: GenerationStore
+    ):
+        """TOCTOU: runtime drift at the post-bind snapshot also degrades safely."""
+        from mcp_server.config import EmbeddingRuntimeContractError as _ContractError
+
+        cfg = _make_versioned_config(monkeypatch, tmp_path)
+        synthetic_pin_seams(monkeypatch)
+        publish_generation(store, "gen-a")
+        real_digests = srv._retrieval_environment_digests
+
+        # Deterministic call counter: the FIRST environment-digest call (inside
+        # _verify_pinned_environment) must SUCCEED with the real result; only
+        # the SECOND call — the post-bind snapshot in _pin_versioned_generation
+        # — raises the typed contract error, so the snapshot catch is what the
+        # test actually exercises.
+        calls: list = []
+
+        def _drift_on_second_call():
+            calls.append(1)
+            if len(calls) == 1:
+                return real_digests()
+            raise _ContractError("fastembed registry changed under the pinned process")
+
+        monkeypatch.setattr(srv, "_retrieval_environment_digests", _drift_on_second_call)
+        assert srv._pin_versioned_generation() is None
+        # Both calls occurred: the first succeeded during environment
+        # verification, the second raised at the post-bind snapshot.
+        assert len(calls) == 2
+        pin_failure = getattr(cfg, "_pin_failure", None)
+        assert pin_failure is not None
+        assert pin_failure["reason"] == srv.DRIFT_REASON_ENVIRONMENT_CHANGED
+        assert pin_failure["detail"] == {}
+        payload = json.loads(srv.get_index_stats())
+        assert payload["stats"]["ready"] is False
+        assert payload["stats"]["reason"] == srv.DRIFT_REASON_ENVIRONMENT_CHANGED
+        assert "registry changed" not in json.dumps(payload)
+
     def test_missing_store_degrades_without_creating_anything(self, monkeypatch, tmp_path: Path):
         cfg = _make_versioned_config(monkeypatch, tmp_path)
         bomb_orchestrator(monkeypatch)
