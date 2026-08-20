@@ -92,7 +92,7 @@ See [README.md#manual-install-claude-code](README.md#manual-install-claude-code)
 
 **Standard setup (6 skills):** minimal + `rag-deep-dive` + `rag-web-fallback` + `rag-troubleshoot`. Full daily-work coverage.
 
-**Enterprise setup (all 10):** everything above + `rag-code-review` + `rag-index-decisions` + `rag-security-first` + `rag-evaluate-quality`. Adds review discipline, feedback loop, security emphasis, and quality monitoring.
+**Enterprise setup (all 10):** everything above + `rag-code-review` + `rag-index-decisions` + `rag-security-first` + `rag-evaluate-quality`. Adds review discipline, feedback loop, security emphasis, and smoke-check cadence.
 
 **Domain-specific (pick one):**
 - Security team → `rag-security-first` is mandatory

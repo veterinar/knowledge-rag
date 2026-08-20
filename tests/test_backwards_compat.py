@@ -405,6 +405,7 @@ _STALE_SKILL_PATTERNS = (
     re.compile(r"expected_docs"),
     re.compile(r"\bMRR@?5?\s*[<>]\s*0\.\d+"),
     re.compile(r"quality report"),
+    re.compile(r"quality\s+delta", re.IGNORECASE),
 )
 
 
@@ -434,6 +435,7 @@ def test_public_skill_guides_follow_query_relative_scoring_contract():
         and '"expected_filepath"' in smoke_text
         and "query" in smoke_text
         and "not a benchmark" in catalog_text
+        and "quality monitoring" not in catalog_text.lower()
     ), (
         "the smoke-check skill and its catalog label must describe offline_smoke reachability with the expected_filepath schema"
     )

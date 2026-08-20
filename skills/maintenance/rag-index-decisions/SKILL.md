@@ -206,4 +206,4 @@ Proceed?"
 - **[`rag-troubleshoot`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/workflow/rag-troubleshoot/SKILL.md)** — the natural upstream: after a novel bug fix, index the postmortem.
 - **[`rag-code-review`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/workflow/rag-code-review/SKILL.md)** — the other upstream: after a review surfaces a new pattern, index it.
 - **[`rag-onboard-context`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/foundation/rag-onboard-context/SKILL.md)** — the next session's onboarding will surface the new index; this closes the loop.
-- **[`rag-evaluate-quality`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-evaluate-quality/SKILL.md)** — after significant indexing activity, worth measuring quality delta.
+- **[`rag-evaluate-quality`](https://github.com/lyonzin/knowledge-rag/blob/master/skills/maintenance/rag-evaluate-quality/SKILL.md)** — after significant indexing activity, run the reachability smoke check.
