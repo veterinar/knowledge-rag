@@ -38,17 +38,20 @@ No network, no models, no Chroma/FTS server dependencies: everything runs on
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import packaging.requirements
 import pytest
 
+import mcp_server
 from mcp_server import generation_cli as gcli
 from mcp_server import generations as gens
 from mcp_server import server as srv
@@ -585,6 +588,235 @@ class TestVersionedMutatorsRefuseBeforeOrchestrator:
         assert envelope["error"] == "offline_generation_required"
         assert envelope["restart_required"] is True
         assert "knowledge-rag-generation build" in envelope["message"]
+
+
+# ============================================================================
+# 4b. Versioned read-only registration surface (tools/list filtering)
+# ============================================================================
+
+
+def fresh_tool_server() -> srv.MCPServer:
+    """Fresh MCPServer carrying the module's real tool names.
+
+    Built through the same public ``add_tool`` path production uses; the
+    module-global ``srv.mcp`` registry is never touched, so these tests
+    stay order-independent and leave no global registry state behind.
+    """
+    server = srv.MCPServer("knowledge-rag-test", version="test")
+    for name in (
+        "search_knowledge",
+        "get_document",
+        "reindex_documents",
+        "get_reindex_status",
+        "list_categories",
+        "list_documents",
+        "get_index_stats",
+        "add_document",
+        "update_document",
+        "remove_document",
+        "add_from_url",
+        "search_similar",
+        "evaluate_retrieval",
+    ):
+        server.add_tool(getattr(srv, name), name=name)
+    return server
+
+
+def registered_tool_names(server) -> set[str]:
+    """Tool names via the PUBLIC async ``list_tools()``, drained synchronously."""
+    return {tool.name for tool in asyncio.run(server.list_tools())}
+
+
+class TestVersionedReadOnlyToolSurface:
+    MUTATORS = {
+        "add_document",
+        "add_from_url",
+        "reindex_documents",
+        "remove_document",
+        "update_document",
+    }
+    READ_TOOLS = {
+        "search_knowledge",
+        "get_document",
+        "get_reindex_status",
+        "list_categories",
+        "list_documents",
+        "get_index_stats",
+        "search_similar",
+        "evaluate_retrieval",
+    }
+
+    def test_versioned_removes_exactly_the_five_mutators_and_keeps_reads(
+        self, monkeypatch, tmp_path: Path
+    ):
+        _make_versioned_config(monkeypatch, tmp_path)
+        server = fresh_tool_server()
+        before = registered_tool_names(server)
+        assert self.MUTATORS <= before
+        assert self.READ_TOOLS <= before
+
+        removed = srv._apply_versioned_read_only_tools(server)
+
+        assert sorted(removed) == sorted(self.MUTATORS)
+        assert registered_tool_names(server) == before - self.MUTATORS
+        # Read surface — including get_index_stats — stays registered.
+        assert self.READ_TOOLS <= registered_tool_names(server)
+
+    def test_legacy_mode_tool_list_is_unchanged(self, monkeypatch):
+        monkeypatch.setattr(srv.config, "index_mode", "legacy")
+        server = fresh_tool_server()
+        before = registered_tool_names(server)
+
+        assert srv._apply_versioned_read_only_tools(server) == []
+
+        assert registered_tool_names(server) == before
+        assert self.MUTATORS <= registered_tool_names(server)
+
+    def test_repeated_policy_application_is_safe(self, monkeypatch, tmp_path: Path):
+        _make_versioned_config(monkeypatch, tmp_path)
+        server = fresh_tool_server()
+        first = srv._apply_versioned_read_only_tools(server)
+        after_first = registered_tool_names(server)
+
+        second = srv._apply_versioned_read_only_tools(server)
+
+        assert sorted(first) == sorted(self.MUTATORS)
+        assert second == []  # idempotent: nothing left to remove, no raise
+        assert registered_tool_names(server) == after_first
+
+    def test_degraded_versioned_startup_cannot_readvertise_mutators(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Missing store: the pin fails into the stable degraded stats-only
+        # state (never aborts) — the registration policy still applies, so
+        # even a degraded startup advertises only the read-only surface.
+        cfg = _make_versioned_config(monkeypatch, tmp_path)
+        bomb_orchestrator(monkeypatch)
+        assert srv._pin_versioned_generation() is None
+        assert cfg._pin_failure is not None
+
+        server = fresh_tool_server()
+        removed = srv._apply_versioned_read_only_tools(server)
+
+        assert sorted(removed) == sorted(self.MUTATORS)
+        names = registered_tool_names(server)
+        assert not (self.MUTATORS & names)
+        assert "get_index_stats" in names
+
+    def test_degraded_get_reindex_status_returns_clean_gate_before_orchestrator(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Degraded versioned serving: get_reindex_status must return the
+        # stable retrieval_blocked envelope from the MCP-boundary gate —
+        # BEFORE get_orchestrator(). The bomb is the proof: constructing an
+        # orchestrator (opening any Chroma/FTS handle) fails the test.
+        cfg = _make_versioned_config(monkeypatch, tmp_path)
+        bomb_orchestrator(monkeypatch)
+        assert srv._pin_versioned_generation() is None
+        assert cfg._pin_failure["reason"] == srv.DRIFT_REASON_POINTER_INVALID
+        payload = json.loads(srv.get_reindex_status())
+        assert payload["status"] == "error"
+        assert payload["error"] == "retrieval_blocked"
+        assert payload["reason"] == srv.DRIFT_REASON_POINTER_INVALID
+        assert payload["restart_required"] is True
+
+    def test_degraded_main_restores_stdout_before_serve_and_blocks_all_side_channels(
+        self, monkeypatch, tmp_path: Path, capsys
+    ):
+        """Regression: degraded versioned main() enters _serve_with_lifecycle
+        with ``sys.stdout is _original_stdout`` — the stdio JSON-RPC stream is
+        the ONLY channel that can serve degraded get_index_stats — without
+        constructing an orchestrator or running preflight, with the five
+        mutators absent and get_index_stats registered."""
+        cfg = _make_versioned_config(monkeypatch, tmp_path)
+        bomb_orchestrator(monkeypatch)  # any orchestrator path fails the test
+
+        import mcp_server.preflight as preflight
+
+        def _no_preflight():
+            raise AssertionError("preflight must not run in degraded mode")
+
+        monkeypatch.setattr(preflight, "run_preflight", _no_preflight)
+
+        # The REAL registry still advertises the mutators before main():
+        # main() itself must apply the registration policy and then drive
+        # the missing-store degraded pin — never pre-run here.
+        assert self.MUTATORS <= registered_tool_names(srv.mcp)
+
+        serve_handoffs: list = []
+
+        class _ServeHandoff(BaseException):
+            """Stops main() at the exact serve boundary (never caught)."""
+
+        def _fake_serve(transport, observer, watcher):
+            # Snapshot ALL contract state AT the hand-off boundary: the
+            # stdout identity and the advertised surface right now.
+            serve_handoffs.append(
+                (transport, sys.stdout is mcp_server._original_stdout, registered_tool_names(srv.mcp))
+            )
+            raise _ServeHandoff  # stop before any real transport runs
+
+        monkeypatch.setattr(srv, "_serve_with_lifecycle", _fake_serve)
+
+        # main() does ``from .instance_lock import single_instance_lock`` at
+        # call time — patch the SOURCE module so the import binds our noop.
+        import contextlib
+
+        @contextlib.contextmanager
+        def _noop_lock():
+            yield
+
+        import mcp_server.instance_lock as instance_lock
+
+        monkeypatch.setattr(instance_lock, "single_instance_lock", _noop_lock)
+        monkeypatch.setattr(srv, "_resolve_transport_cli", lambda: "stdio")
+
+        import mcp_server.logging_config as logging_config
+
+        monkeypatch.setattr(logging_config, "setup_logging", lambda **kw: None)
+
+        # After stdout restoration every human log must go to stderr; pin the
+        # default so bare print() can never re-corrupt the JSON-RPC stream.
+        import builtins
+
+        real_print = builtins.print
+
+        def _stderr_only_print(*args, **kwargs):
+            kwargs.setdefault("file", sys.stderr)
+            return real_print(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "print", _stderr_only_print)
+
+        stdout_before = sys.stdout
+        # Drain captured pre-main output: only main()'s own bytes can
+        # invalidate the final stdout assertion below.
+        capsys.readouterr()
+        try:
+            with pytest.raises(_ServeHandoff):
+                srv.main()
+        finally:
+            # Restore global stdout + module registry state no matter what.
+            sys.stdout = stdout_before
+            for name in self.MUTATORS:
+                srv.mcp.add_tool(getattr(srv, name), name=name)
+
+        # main() drove the real degraded pin itself: missing store -> stable
+        # failure recorded, never aborts.
+        assert cfg._pin_failure is not None
+
+        # Exactly one degraded serve hand-off, on stdio, with the ORIGINAL
+        # stdout restored — the JSON-RPC channel is intact at the boundary —
+        # and the read-only surface contract held on the REAL registry.
+        transport_out, stdout_ok, names_at_serve = serve_handoffs[0]
+        assert len(serve_handoffs) == 1
+        assert transport_out == "stdio"
+        assert stdout_ok is True
+        assert not (self.MUTATORS & names_at_serve)
+        assert "get_index_stats" in names_at_serve
+        # Human logs stayed on stderr; stdout carries no banner text.
+        _out, err = capsys.readouterr()
+        assert "DEGRADED stats-only" in err
+        assert "DEGRADED stats-only" not in _out
 
 
 # ============================================================================

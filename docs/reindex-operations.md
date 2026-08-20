@@ -150,32 +150,62 @@ and the add/update/remove tools are **not used** in that mode.
 | Reindex recovery | smart/nuclear rebuild | never; build a new generation instead |
 | Watcher | auto-reindex on change (`advanced.watch_for_changes`, `advanced.watch_debounce_seconds`) | **disabled** (no hot reload, no auto-index, no repair) |
 
+### Acceptance contract
+
+Versioned serving is admitted only when all of the following remain true:
+
+- the controlling corpus identity is the SHA-256 of the sorted
+  `relative POSIX path + file SHA-256` manifest selected with the same rules
+  as ingestion; Vault `HEAD` is provenance only;
+- the receipt binds the secret-free retrieval configuration, installed
+  runtime RECORD aggregate, canonical dependency lock, model artifacts and
+  effective model configuration, chunking, generation identity, and the
+  Chroma/FTS artifact and row counts/digests;
+- every retrieval path checks freshness before cache/backend access and again
+  before serving a materialized result; any mismatch returns
+  `retrieval_blocked` and never serves a stale cache entry;
+- `tools/list` in versioned mode contains no mutating tools. Direct in-process
+  calls retain a defense-in-depth `offline_generation_required` refusal;
+- `get_index_stats` remains available in healthy and degraded mode. The
+  **degraded** process returns the full stable additive envelope
+  (`index_mode`, `ready`, `reason`, `detail`, `checked_at`, `generation`,
+  `restart_required`, `runtime_mutations`, `watcher`) with `ready: false`,
+  `restart_required: true`, and sanitized `reason`/`detail` — no base
+  orchestrator index stats are included (no orchestrator exists and no
+  Chroma/FTS handle is opened). The **healthy** versioned process returns
+  those additive fields plus the full orchestrator index stats;
+- QMD refresh, deployment and live generation activation are outside this
+  repository acceptance contract.
+
 ### Server startup (versioned)
 
 1. The server verifies the `current` pointer and the full receipt of the
-   generation it names — **fail-closed**: a missing, corrupt, or
-   compatibility-mismatched `current` aborts startup *before* preflight,
-   before any Chroma/SQLite handle opens, and **creates nothing**.
-2. On success it binds the sealed generation's directories (Chroma, corpus,
-   FTS5, metadata) and opens every artifact **read-only**.
-3. Every mutating MCP tool (`add_document`, `update_document`,
-   `remove_document`, `add_from_url`, `reindex_documents`) returns a stable
-   `offline_generation_required` error envelope (`restart_required: true`)
-   **before** touching the filesystem or network.
-4. If the pointer is later switched underneath a running server (build/
-   activate/rollback from another process), the server keeps serving its
-   pinned generation and surfaces `restart_required` — it never switches
-   open handles mid-flight.
+   generation it names before preflight and before any Chroma/SQLite handle
+   opens. A missing, corrupt, incompatible, or stale generation starts a
+   **degraded stats-only process**: retrieval is blocked, nothing is created,
+   and `get_index_stats` reports the sanitized reason.
+2. On success it binds the sealed corpus, FTS5 and metadata artifacts. FTS5 is
+   opened through SQLite `mode=ro`; Chroma is opened only from a
+   receipt-verified, process-local disposable copy because Chroma's
+   `PersistentClient` requires a writable store. The published Chroma tree is
+   never opened by the serving client.
+3. Mutating MCP tools (`add_document`, `update_document`, `remove_document`,
+   `add_from_url`, `reindex_documents`) are removed from the advertised
+   versioned tool surface. Their Python callables still return the stable
+   `offline_generation_required` envelope before filesystem or network work.
+4. If `current`, the live corpus, config, code/runtime evidence, models or
+   either backend changes underneath a running server, all retrieval is
+   blocked with `restart_required`; the process never rebinds or serves the
+   old cached result. `get_index_stats` remains available.
 
 ### Immutability boundary (honest scope)
 
 Sealed Chroma/FTS/corpus artifacts are immutable **at the application
-boundary**: the serving process opens them read-only, refuses every write
-path, and the receipt's digests are re-verified so any tampering is detected
-and fails closed. This is not an OS-level enforcement claim — a process that
-deliberately bypasses the application could still modify the bytes. The
-defense is detection (digest verification) plus refusal (read-only handles),
-not kernel-level write protection.
+boundary**: the server refuses every write path, FTS5 uses a read-only handle,
+and Chroma uses only a verified disposable copy. Receipt and backend evidence
+are rechecked on every access, so published-byte drift fails closed. This is
+not an OS-level enforcement claim — the deployment must still mount or
+permission the published generation read-only against unrelated processes.
 
 ### Operations
 
@@ -214,13 +244,12 @@ knowledge-rag-generation rollback <generation_id>
 
 ### Compatibility pins
 
-A generation records the exact 10-field compatibility object (collection name,
-embedding model/dimension/prefixes, `model_artifact_sha256`,
-`runtime_version`, `pooling`, chunk size/overlap). A server whose effective
-pins differ cannot serve or activate that generation — this is what makes a
-model swap an explicit build-then-switch operation instead of a silent
-corruption vector. Set the pins under `models.embedding` in `config.yaml`
-(see `config.example.yaml`).
+A generation records the exact 13-field compatibility object: collection;
+embedding model, dimension, query/passage prefixes, artifact digest, runtime
+version and actual pooling; chunk size/overlap; and reranker enabled state,
+logical model and artifact digest. A server whose effective pins differ cannot
+serve or activate that generation. Set the pins under `models.embedding` and,
+when enabled, `models.reranker` in `config.yaml` (see `config.example.yaml`).
 
 ### Dependency evidence (requirements.lock)
 

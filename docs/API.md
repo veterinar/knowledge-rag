@@ -150,6 +150,21 @@ List all indexed documents, optionally filtered by category.
 
 Get statistics about the knowledge base index.
 
+In versioned mode this is the diagnostic exemption to the retrieval gate, and its
+payload depends on serving health:
+
+- **Degraded stats-only startup** (missing/corrupt/stale/unverifiable `current`
+  generation): returns the full stable additive envelope — `index_mode`,
+  `ready: false`, sanitized `reason`, sanitized digest `detail`, `checked_at`,
+  nullable `generation`, `restart_required: true`, `runtime_mutations`, and
+  `watcher`. Base index statistics are absent until the process is healthy: no
+  orchestrator is constructed and no Chroma/FTS handle is opened — this is the
+  only tool call the degraded process can answer.
+- **Healthy versioned serving**: returns the full statistics payload above,
+  augmented with the stable additive fields `index_mode`, `ready`, nullable
+  `reason`, sanitized `detail`, `checked_at`, nullable `generation`,
+  `restart_required`, `runtime_mutations`, and `watcher`.
+
 **Returns:**
 
 ```json
@@ -172,7 +187,23 @@ Get statistics about the knowledge base index.
       "hits": 45,
       "misses": 23,
       "hit_rate": "66.2%"
-    }
+    },
+    "index_mode": "versioned",
+    "ready": true,
+    "reason": null,
+    "detail": {},
+    "checked_at": "2026-08-20T12:00:00Z",
+    "generation": {
+      "generation_id": "gen-a",
+      "receipt_sha256": "…",
+      "schema_version": 3,
+      "servable": true,
+      "created_at": "2026-08-19T09:30:00Z",
+      "backends": {"chroma": {"row_count": 9256}, "fts5": {"row_count": 9256}}
+    },
+    "restart_required": false,
+    "runtime_mutations": "disabled",
+    "watcher": "disabled"
   }
 }
 ```
@@ -180,6 +211,11 @@ Get statistics about the knowledge base index.
 ---
 
 ### Document Management
+
+These tools are legacy-mode tools. They are not advertised by `tools/list`
+when `indexing.mode: versioned`; generations are built offline with
+`knowledge-rag-generation build`. A direct in-process call in versioned mode
+returns `offline_generation_required` before filesystem or network access.
 
 #### `add_document`
 
@@ -341,4 +377,3 @@ Returns MRR@5 · Recall@5 · Precision@5 aggregated across all test cases, plus 
 Interpretation cheat-sheet: **MRR@5 ≥ 0.7 is good**, **≥ 0.8 is excellent**. Any drop of ≥ 0.05 vs prior baseline is a real regression worth investigating.
 
 ---
-
