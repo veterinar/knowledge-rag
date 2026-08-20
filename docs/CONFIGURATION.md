@@ -203,7 +203,11 @@ For `.md` files, chunking splits at `##` and `###` header boundaries first. Sect
 | `models.reranker.model` | `Xenova/ms-marco-MiniLM-L-6-v2` | Reranker model |
 | `models.reranker.top_k_multiplier` | 3 | Fetch N*multiplier candidates for reranking |
 
-If the reranker model is not available locally and the machine cannot download it, search now falls back to the RRF order from hybrid semantic+BM25 retrieval. This keeps `search_knowledge` available offline, but result ordering may be less precise for ambiguous queries until the reranker model is cached.
+In legacy mode, an unavailable reranker can fall back to RRF order. In
+versioned mode the configured reranker is part of the receipt identity: when
+enabled it requires an exact local artifact, and missing, changed, or unloadable
+bytes block retrieval instead of changing ranking silently. Disable it
+explicitly before building a generation if RRF-only ordering is intended.
 
 **Embedding model options** (fastest → most accurate):
 - `BAAI/bge-small-en-v1.5` — 384D, ~33MB (default)

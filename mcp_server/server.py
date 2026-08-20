@@ -5307,6 +5307,44 @@ mcp = MCPServer(
     version=__version__,
 )
 
+#: Mutating tools that must NOT be advertised while serving a sealed
+#: generation (``indexing.mode=versioned``). Registration filtering is
+#: ADDITIONAL defense on top of the per-tool fail-closed guards: the
+#: underlying callables stay importable and keep refusing direct calls.
+_VERSIONED_MUTATOR_TOOLS: Tuple[str, ...] = (
+    "add_document",
+    "add_from_url",
+    "reindex_documents",
+    "remove_document",
+    "update_document",
+)
+
+
+def _apply_versioned_read_only_tools(server: MCPServer) -> List[str]:
+    """Apply the versioned read-only registration policy to ``server``.
+
+    Removes the five mutating tools from the advertised tools/list so a
+    versioned process exposes only the read-only surface. No-op in legacy
+    mode. Idempotent and process-local: names already absent are skipped,
+    nothing outside ``server``'s tool registry is touched, and only the
+    public ``MCPServer.remove_tool`` API is used (never private registry
+    internals). Returns the names actually removed, in canonical order.
+    """
+    if not _versioned_mode():
+        return []
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    removed: List[str] = []
+    for name in _VERSIONED_MUTATOR_TOOLS:
+        try:
+            server.remove_tool(name)
+        except ToolError:
+            continue  # already absent — repeated application is safe
+        removed.append(name)
+    return removed
+
+
 _orchestrator: Optional[KnowledgeOrchestrator] = None
 _orchestrator_lock = threading.Lock()
 
@@ -5665,6 +5703,9 @@ def get_reindex_status() -> str:
     Usage: Call repeatedly after reindex_documents() to monitor progress. When reindex.active
     becomes false, the operation is complete. Use get_index_stats() for full index health metrics.
     """
+    gate = _retrieval_gate_json("get_reindex_status")
+    if gate is not None:
+        return gate
     orchestrator = get_orchestrator()
     status = orchestrator.get_reindex_status()
     return json.dumps({"status": "success", "reindex": status}, indent=2)
@@ -6302,6 +6343,20 @@ def _serve_with_lifecycle(transport: str, observer, watcher) -> None:
         _stop_watcher_stack(observer, watcher)
 
 
+def _restore_stdout_for_serving() -> None:
+    """Restore the REAL stdout for MCP JSON-RPC immediately before serving.
+
+    Package import points ``sys.stdout`` at stderr so bare ``print()`` during
+    startup cannot corrupt the stdio JSON-RPC stream. EVERY serving path —
+    healthy AND degraded stats-only — must call this exactly once right
+    before its ``_serve_with_lifecycle`` hand-off; anything printed after it
+    must pass ``file=sys.stderr`` explicitly.
+    """
+    from . import _original_stdout
+
+    sys.stdout = _original_stdout
+
+
 def _resolve_transport_cli() -> str:
     """Config transport, overridden by --transport / --transport= CLI args."""
     transport = config.transport
@@ -6340,6 +6395,15 @@ def main():
     # reason and the server starts stats-only (only get_index_stats works).
     pinned_generation = None
     if _versioned_mode():
+        # Read-only serving surface: filter the mutators out of tools/list
+        # BEFORE pinning — a missing/corrupt/stale ``current`` (degraded
+        # stats-only startup) must also advertise only the read tools.
+        removed_tools = _apply_versioned_read_only_tools(mcp)
+        if removed_tools:
+            print(
+                f"[SERVER] Versioned read-only mode: mutators not advertised: {', '.join(removed_tools)}",
+                file=sys.stderr,
+            )
         pinned_generation = _pin_versioned_generation()
 
     try:
@@ -6360,7 +6424,15 @@ def main():
                     # preflight, no migration, no watcher. get_index_stats
                     # reports the sanitized reason; every other tool returns
                     # retrieval_blocked.
-                    print("[SERVER] Starting in DEGRADED stats-only mode (get_index_stats only; retrieval blocked)")
+                    print(
+                        "[SERVER] Starting in DEGRADED stats-only mode (get_index_stats only; retrieval blocked)",
+                        file=sys.stderr,
+                    )
+                    # Same stdout contract as the healthy path: the stdio
+                    # JSON-RPC stream (which serves degraded get_index_stats)
+                    # needs the ORIGINAL stdout back before the transport
+                    # takes over.
+                    _restore_stdout_for_serving()
                     _serve_with_lifecycle(_resolve_transport_cli(), None, None)
                     return
                 # Healthy versioned serving: generation verified and pinned
@@ -6441,9 +6513,7 @@ def main():
                     start_metrics_server(config.metrics_port)
 
                 # Restore real stdout for MCP JSON-RPC, keep print() going to stderr
-                from . import _original_stdout
-
-                sys.stdout = _original_stdout
+                _restore_stdout_for_serving()
 
                 # Parse --transport CLI override
                 transport = config.transport
