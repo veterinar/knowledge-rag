@@ -646,9 +646,7 @@ class TestVersionedReadOnlyToolSurface:
         "evaluate_retrieval",
     }
 
-    def test_versioned_removes_exactly_the_five_mutators_and_keeps_reads(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_versioned_removes_exactly_the_five_mutators_and_keeps_reads(self, monkeypatch, tmp_path: Path):
         _make_versioned_config(monkeypatch, tmp_path)
         server = fresh_tool_server()
         before = registered_tool_names(server)
@@ -684,9 +682,7 @@ class TestVersionedReadOnlyToolSurface:
         assert second == []  # idempotent: nothing left to remove, no raise
         assert registered_tool_names(server) == after_first
 
-    def test_degraded_versioned_startup_cannot_readvertise_mutators(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_degraded_versioned_startup_cannot_readvertise_mutators(self, monkeypatch, tmp_path: Path):
         # Missing store: the pin fails into the stable degraded stats-only
         # state (never aborts) — the registration policy still applies, so
         # even a degraded startup advertises only the read-only surface.
@@ -703,9 +699,7 @@ class TestVersionedReadOnlyToolSurface:
         assert not (self.MUTATORS & names)
         assert "get_index_stats" in names
 
-    def test_degraded_get_reindex_status_returns_clean_gate_before_orchestrator(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_degraded_get_reindex_status_returns_clean_gate_before_orchestrator(self, monkeypatch, tmp_path: Path):
         # Degraded versioned serving: get_reindex_status must return the
         # stable retrieval_blocked envelope from the MCP-boundary gate —
         # BEFORE get_orchestrator(). The bomb is the proof: constructing an

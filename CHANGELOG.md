@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Unreleased
 
+- **fix(server)** — versioned MCP startup now exposes a strictly read-only tool surface, preserves safe stats-only diagnostics when generation pinning fails, and blocks other retrieval-status reads before orchestrator construction.
 - **fix(retrieval)** — versioned Chroma serving now attaches the pinned FastEmbed embedding function, preventing semantic text queries from falling back to Chroma's default model/cache under no-egress runtime policy.
 
 ### v4.9.1 (2026-08-15) — Physically read-only versioned serving
