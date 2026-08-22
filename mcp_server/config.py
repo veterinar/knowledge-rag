@@ -2,6 +2,8 @@
 
 import math
 import os
+import re
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -568,6 +570,82 @@ _EMBEDDING_RUNTIME_CONTRACTS: Dict[str, Dict[str, object]] = {
 
 
 # ============================================================================
+# BEARER TOKEN FILE (runtime credential boundary)
+# ============================================================================
+# One reusable validator shared by the server config and the bundled client.
+# It reads the credential exactly once per call via os.open with O_NOFOLLOW
+# (where supported) and fails closed on anything but an owner-only regular
+# file. Every rejection raises ValueError with FIXED safe text — the path and
+# the token bytes must never appear in an error, log, or repr.
+
+# 512-byte token + one optional terminal LF; one extra byte detects overlong
+# content without reading the whole file.
+_BEARER_TOKEN_MAX_READ = 514
+_TOKEN68_RE = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
+
+def read_bearer_token_file(path) -> str:
+    """Read and validate a bearer-token credential file; return the token.
+
+    Contract (docs/acceptance/bearer-auth-runtime.v1.md): ``path`` must be an
+    absolute path to a regular non-symlink file owned by the current user with
+    no group/world permission bits. Its UTF-8 content is one token of 32–512
+    bytes plus at most one terminal LF, matching the RFC 6750 token68
+    grammar: one or more characters from ``A-Z a-z 0-9 - . _ ~ + /``
+    followed only by zero or more trailing ``=``. Non-ASCII, embedded ``=``,
+    colons, embedded whitespace, NUL, invalid
+    UTF-8, empty/short/overlong content, symlinks, non-regular files, missing
+    files, and insecure owner or mode are all rejected with ValueError
+    carrying only fixed safe text.
+    """
+    if not isinstance(path, str) or not path or not os.path.isabs(path):
+        raise ValueError("bearer token file is unavailable") from None
+    try:
+        pre = os.lstat(path)
+    except OSError:
+        raise ValueError("bearer token file is unavailable") from None
+    if not stat.S_ISREG(pre.st_mode):
+        raise ValueError("bearer token file is unavailable") from None
+    flags = os.O_RDONLY
+    for opt in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC"):
+        flags |= getattr(os, opt, 0)
+    fd = None
+    raw = None
+    failed = False
+    try:
+        fd = os.open(path, flags)
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or st.st_mode & 0o077
+            or (st.st_dev, st.st_ino) != (pre.st_dev, pre.st_ino)
+        ):
+            raise ValueError("bearer token file is unavailable")
+        raw = os.read(fd, _BEARER_TOKEN_MAX_READ)
+    except (OSError, ValueError):
+        failed = True
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                failed = True
+    if failed or raw is None:
+        raise ValueError("bearer token file is unavailable") from None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("bearer token file is unavailable") from None
+    if text.endswith("\n"):
+        text = text[:-1]
+    # RFC 6750 token68: token chars, then only trailing '=' padding.
+    if _TOKEN68_RE.fullmatch(text) is None or not 32 <= len(text) <= 512:
+        raise ValueError("bearer token file is unavailable") from None
+    return text
+
+
+# ============================================================================
 # CONFIG DATACLASS
 # ============================================================================
 
@@ -820,10 +898,26 @@ class Config:
     transport: str = field(default_factory=lambda: _get("server", "transport", "stdio"))
     server_host: str = field(default_factory=lambda: _get("server", "host", "127.0.0.1"))
     server_port: int = field(default_factory=lambda: _get("server", "port", 8179))
+    # Resolved credential (runtime-only once a token file is configured).
+    # repr/compare omit it so the token never reaches logs or equality checks.
     auth_bearer_token: str = field(
         default_factory=lambda: (
             _get("server", "auth", {}).get("bearer_token", "") if isinstance(_get("server", "auth", {}), dict) else ""
-        )
+        ),
+        repr=False,
+        compare=False,
+    )
+    # Preferred production form (docs/acceptance/bearer-auth-runtime.v1.md):
+    # an absolute path to an owner-only regular file holding the credential.
+    auth_bearer_token_file: Optional[str] = field(
+        default_factory=lambda: (
+            _get("server", "auth", {}).get("bearer_token_file")
+            if isinstance(_get("server", "auth", {}), dict)
+            else None
+        ),
+        # repr omits the absolute runtime path (mirror of auth_bearer_token);
+        # compare behaviour is unchanged.
+        repr=False,
     )
     rate_limit_enabled: bool = field(
         default_factory=lambda: (
@@ -959,6 +1053,7 @@ class Config:
         self._validate_embedding_types()
         self._normalize_gpu_mode()
         self._validate_server_transport()
+        self._validate_auth()
         self._validate_advanced()
         self._validate_supported_formats()
         self._validate_lists_and_maps()
@@ -1112,6 +1207,27 @@ class Config:
             self.log_level = self.log_level.upper()
         if not isinstance(self.rate_limit_burst, int) or self.rate_limit_burst < 0:
             self.rate_limit_burst = 10
+
+    def _validate_auth(self) -> None:
+        """Resolve the bearer credential: legacy inline OR owner-only file.
+
+        Both set simultaneously is a hard error; a configured file resolves
+        through ``read_bearer_token_file`` (fail closed). The legacy inline
+        token keeps its prior behaviour unchanged.
+        """
+        token = self.auth_bearer_token
+        token_file = self.auth_bearer_token_file
+        if not isinstance(token, str):
+            raise ValueError("server.auth.bearer_token must be a string")
+        if token_file is not None and not isinstance(token_file, str):
+            raise ValueError("server.auth.bearer_token_file must be a string")
+        if token and token_file is not None:
+            raise ValueError("server.auth.bearer_token and server.auth.bearer_token_file are mutually exclusive")
+        if token_file is not None:
+            # Truthiness is not enough: an explicitly configured but empty
+            # path (templating/LaunchAgent substitution failure) must fail
+            # closed through the validator, not silently disable auth.
+            self.auth_bearer_token = read_bearer_token_file(token_file)
 
     def _validate_advanced(self) -> None:
         """v4.9.0 — type-check watcher fields; debounce must be finite and > 0."""

@@ -14,6 +14,7 @@ user sees plain terminal output. Модель только выбирает го
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -29,6 +30,10 @@ from collections import namedtuple
 # session.initialize() dies on it, inside the transport's anyio task group, so
 # the real cause reaches the terminal only as "unhandled errors in a TaskGroup".
 from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
+
+from mcp_server.config import read_bearer_token_file
 
 DEFAULT_URL = "http://127.0.0.1:8179/mcp"  # local knowledge-rag endpoint (task order, 2026-08-14)
 
@@ -157,10 +162,29 @@ async def _fetch_full_document(client, item: dict, cache: dict) -> str:
     return content
 
 
-async def _search(url: str, query: str, limit: int, method: str) -> dict:
-    """Search, then attach full documents to top results in the same MCP session."""
+async def _search(url: str, query: str, limit: int, method: str, token: str = "") -> dict:
+    """Search, then attach full documents to top results in the same MCP session.
+
+    With a resolved bearer token the pinned streamable-HTTP transport is built
+    explicitly around the MCP-standard authenticated HTTP client (the token
+    goes only into the Authorization header, never the URL). Without one, the
+    legacy Client(url) path is preserved byte-for-behaviour.
+    """
     arguments = {"query": query, "max_results": limit, **_METHOD_PARAMS[method]}
-    async with Client(url) as client:  # mode="auto": negotiates the server's protocol era
+    async with contextlib.AsyncExitStack() as stack:
+        if token:
+            # create_mcp_http_client is an async-context-manager factory whose
+            # __aenter__ yields the configured AsyncClient; entering it on the
+            # stack FIRST makes it close LAST (LIFO), after Client — the
+            # transport does not close a caller-supplied client, so it must
+            # be closed exactly once, by us.
+            http_client = await stack.enter_async_context(
+                create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
+            )
+            transport = streamable_http_client(url, http_client=http_client)
+            client = await stack.enter_async_context(Client(transport, cache=None))
+        else:
+            client = await stack.enter_async_context(Client(url))  # mode="auto"
         payload = _tool_payload(await client.call_tool("search_knowledge", arguments))
         if payload.get("status") == "success":
             cache = {}
@@ -463,6 +487,7 @@ def main() -> int:
         ),
         epilog=(
             "Переменные окружения: KNOWLEDGE_RAG_MCP_URL (адрес MCP, иначе " + DEFAULT_URL + "), "
+            "KNOWLEDGE_RAG_BEARER_TOKEN_FILE (файл токена, только абсолютный путь), "
             "VAULT_RAG_HERMES_BIN, VAULT_RAG_HERMES_PROVIDER, VAULT_RAG_HERMES_MODEL, VAULT_RAG_HERMES_HOME."
         ),
     )
@@ -480,14 +505,41 @@ def main() -> int:
     if not query:
         parser.error("запрос не может быть пустым")
     url = os.environ.get("KNOWLEDGE_RAG_MCP_URL") or DEFAULT_URL
+    # Absent env var keeps the legacy unauthenticated path; an *empty* value
+    # (templating/substitution failure) must fail closed instead of silently
+    # sending an unauthenticated request (acceptance: nothing is served or
+    # sent when the credential file reference is empty or malformed).
+    raw_token_file = os.environ.get("KNOWLEDGE_RAG_BEARER_TOKEN_FILE")
+    if raw_token_file is not None and not raw_token_file:
+        print(
+            "KNOWLEDGE_RAG_BEARER_TOKEN_FILE: файл токена отсутствует, недоступен или недопустим.",
+            file=sys.stderr,
+        )
+        return 2
+    token_file = raw_token_file or ""
+    if token_file:
+        try:
+            token = read_bearer_token_file(token_file)
+        except ValueError:
+            # Fixed text only: the token-file path and its contents must never
+            # reach the terminal, and no traceback may escape main().
+            print(
+                "KNOWLEDGE_RAG_BEARER_TOKEN_FILE: файл токена отсутствует, недоступен или недопустим.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        token = ""
 
     try:
-        payload = asyncio.run(_search(url, _retrieval_query(query), args.limit, args.method))
+        payload = asyncio.run(_search(url, _retrieval_query(query), args.limit, args.method, token))
     except KeyboardInterrupt:
         print("Прервано пользователем.", file=sys.stderr)
         return 130
-    except Exception as exc:  # noqa: BLE001 — terminal tool: one concise line, nonzero exit
-        print(f"Ошибка обращения к MCP-серверу {url}: {exc}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 — fixed text only, never the credential
+        # No URL, exception type/text, or traceback: a lower layer may embed
+        # request/header material, so the terminal gets one fixed line.
+        print("Ошибка обращения к MCP-серверу.", file=sys.stderr)
         return 2
 
     status = payload.get("status")

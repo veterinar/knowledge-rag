@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **feat(auth)** — HTTP runtimes and the bundled `vault-rag` client can load a static bearer token from an owner-only absolute file (`server.auth.bearer_token_file` / `KNOWLEDGE_RAG_BEARER_TOKEN_FILE`): the file must be an owner-permission-only regular file (no symlinks, FIFOs, group/world bits) holding valid token68 bytes; unsafe files fail closed, and client errors do not expose credentials, paths, URLs, or raw exceptions.
 - fix(runtime): optional `threads` setting is passed unchanged to FastEmbed and
   binds ONNX intra/inter threads; the value is included in retrieval/model
   identity, and omission preserves existing behavior.
