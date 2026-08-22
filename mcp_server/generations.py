@@ -827,6 +827,7 @@ _RETRIEVAL_YAML_KEYS: Tuple[Tuple[str, ...], ...] = (
     ("models", "embedding", "runtime_version"),
     ("models", "embedding", "pooling"),
     ("models", "embedding", "gpu"),
+    ("models", "embedding", "threads"),
     ("models", "reranker", "enabled"),
     ("models", "reranker", "model"),
     ("models", "reranker", "top_k_multiplier"),
@@ -885,6 +886,7 @@ RETRIEVAL_CONFIG_FIELDS: Tuple[str, ...] = (
     "query_expansion_groups",
     "embedding_runtime_version",
     "embedding_pooling",
+    "embedding_threads",
     "hybrid_alpha",
     "similarity_threshold",
     "min_score",
@@ -1762,6 +1764,7 @@ def model_config_identity(cfg: Any) -> str:
             "reranker_model": compat.get("reranker_model"),
             "reranker_artifact_sha256": compat.get("reranker_artifact_sha256"),
             "gpu_mode": getattr(cfg, "gpu_mode", None),
+            "embedding_threads": getattr(cfg, "embedding_threads", None),
         }
     )
 

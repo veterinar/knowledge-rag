@@ -41,6 +41,7 @@ import os
 import re
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1543,3 +1544,25 @@ def test_backend_generation_ids_required_and_bound(store):
         )
     store.abort_build("g1")
     assert not (store.root / ".building-g1").exists()
+
+
+def test_embedding_threads_change_retrieval_and_model_config_identities(monkeypatch):
+    import mcp_server.config as config_module
+
+    yaml_value = {"threads": 2}
+    monkeypatch.setattr(
+        config_module,
+        "_load_yaml_config",
+        lambda: {"models": {"embedding": {"threads": yaml_value["threads"]}}},
+    )
+    cfg = SimpleNamespace(
+        index_mode="legacy",
+        gpu_mode="false",
+        embedding_threads=2,
+        generation_compatibility=lambda: dict(COMPAT),
+    )
+    before = (gens.retrieval_config_digest(cfg), gens.model_config_identity(cfg))
+    cfg.embedding_threads = 4
+    yaml_value["threads"] = 4
+    after = (gens.retrieval_config_digest(cfg), gens.model_config_identity(cfg))
+    assert before[0] != after[0] and before[1] != after[1]

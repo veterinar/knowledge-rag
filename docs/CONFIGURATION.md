@@ -61,6 +61,7 @@ models:
     model: "BAAI/bge-small-en-v1.5"   # ONNX, ~33MB, auto-downloaded
     dimensions: 384
     gpu: false                         # Set true + pip install knowledge-rag[gpu]
+    # threads: 2                         # Optional FastEmbed/ONNX CPU thread count
   reranker:
     enabled: true                      # Falls back to RRF if model is unavailable
     model: "Xenova/ms-marco-MiniLM-L-6-v2"
@@ -369,3 +370,8 @@ perf-gate adjudication documented in ADR-004 and ADR-009. Full user guide
 in [`docs/features/fts5_fast_path.md`](docs/features/fts5_fast_path.md).
 
 ---
+The optional `threads` setting is an integer in the range 1..64 that controls the
+FastEmbed/ONNX CPU session thread count. Omitting it preserves the FastEmbed
+default. Because the value is part of the retrieval/model identity, changing it
+requires rebuilding versioned generations to avoid drift; no universal value is
+recommended.
