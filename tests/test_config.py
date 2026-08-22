@@ -1,13 +1,14 @@
 """Tests for configuration integrity."""
 
 import importlib.metadata
+import os
 import sys
 from types import SimpleNamespace
 
 import pytest
 
 import mcp_server.config as config_module
-from mcp_server.config import _merge_query_expansion_sources, config
+from mcp_server.config import _merge_query_expansion_sources, config, read_bearer_token_file
 
 
 def test_no_ollama_references():
@@ -363,3 +364,105 @@ def test_embedding_threads_invalid_values_raise(value):
     cfg.embedding_threads = value
     with pytest.raises(ValueError, match="models.embedding.threads"):
         cfg._validate_embedding_types()
+
+
+# ── Bearer-token-file configuration (docs/acceptance/bearer-auth-runtime.v1.md) ──
+
+# Distinctive fake bytes; never a real credential.
+_TOKEN = "fake-owner-only-token-0123456789abcdef"
+
+
+def _write_token_file(tmp_path, data, mode=0o600, name="token"):
+    path = tmp_path / name
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    path.write_bytes(data)
+    os.chmod(path, mode)
+    return path
+
+
+def test_config_loads_bearer_token_file_and_repr_omits_token(monkeypatch, tmp_path):
+    """Black-box: YAML bearer_token_file resolves auth_bearer_token; repr omits it."""
+    path = _write_token_file(tmp_path, _TOKEN + "\n")
+    cfg = _build_config(monkeypatch, tmp_path, {"server": {"auth": {"bearer_token_file": str(path)}}})
+    assert cfg.auth_bearer_token == _TOKEN
+    assert _TOKEN not in repr(cfg)
+    assert str(path) not in repr(cfg)
+
+
+def test_config_rejects_inline_token_plus_token_file(monkeypatch, tmp_path):
+    """server.auth.bearer_token and bearer_token_file are mutually exclusive."""
+    path = _write_token_file(tmp_path, _TOKEN)
+    payload = {"server": {"auth": {"bearer_token": "legacy-inline-token", "bearer_token_file": str(path)}}}
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _build_config(monkeypatch, tmp_path, payload)
+
+
+def test_config_empty_token_file_fails_closed(monkeypatch, tmp_path):
+    """An explicitly empty bearer_token_file must not silently disable auth.
+
+    Truthiness checks treat ``bearer_token_file: ""`` as "unset" and leave
+    ``auth_bearer_token`` empty, so the HTTP transport starts unguarded. The
+    acceptance contract (docs/acceptance/bearer-auth-runtime.v1.md) requires
+    a missing/empty/malformed file reference to fail closed.
+    """
+    payload = {"server": {"auth": {"bearer_token_file": ""}}}
+    with pytest.raises(ValueError, match="bearer token file is unavailable"):
+        _build_config(monkeypatch, tmp_path, payload)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["valid_exact", "valid_lf", "relative", "symlink", "fifo", "group_bits", "world_bits", "whitespace", "invalid_utf8", "short", "overlong", "non_ascii", "invalid_token68"],
+)
+def test_bearer_token_file_validator(tmp_path, kind):
+    """Exact owner-only regular file passes; representative unsafe cases fail closed.
+
+    Rejection errors carry only fixed safe text: neither the token bytes nor
+    the offending path may appear.
+    """
+    if kind == "valid_exact":
+        path = _write_token_file(tmp_path, _TOKEN)
+        assert read_bearer_token_file(str(path)) == _TOKEN
+        return
+    if kind == "valid_lf":
+        path = _write_token_file(tmp_path, _TOKEN + "\n", mode=0o400)
+        assert read_bearer_token_file(str(path)) == _TOKEN
+        return
+    if kind == "symlink":
+        # A symlink to a perfectly valid owner-only file must still be refused:
+        # handle it before the tuple unpack below (its case value is not a pair).
+        target = _write_token_file(tmp_path, _TOKEN)
+        link = tmp_path / "link"
+        link.symlink_to(target)
+        with pytest.raises(ValueError) as excinfo:
+            read_bearer_token_file(str(link))
+    elif kind == "fifo":
+        path = tmp_path / "fifo"
+        os.mkfifo(path)
+        with pytest.raises(ValueError) as excinfo:
+            read_bearer_token_file(str(path))
+    else:
+        cases = {
+            "relative": "token.txt",  # never created; the path itself must be refused
+            "group_bits": (_TOKEN, 0o640),
+            "world_bits": (_TOKEN, 0o604),
+            "whitespace": (_TOKEN + " " + _TOKEN, 0o600),
+            "invalid_utf8": (b"\xff" * 40, 0o600),
+            "short": ("x" * 31, 0o600),
+            "overlong": ("x" * 513, 0o600),
+            "non_ascii": ("я" * 32, 0o600),
+            "invalid_token68": (_TOKEN + ":", 0o600),
+        }
+        if kind == "relative":
+            with pytest.raises(ValueError) as excinfo:
+                read_bearer_token_file(cases[kind])
+        else:
+            data, mode = cases[kind]
+            path = _write_token_file(tmp_path, data, mode=mode)
+            with pytest.raises(ValueError) as excinfo:
+                read_bearer_token_file(str(path))
+    message = str(excinfo.value)
+    assert _TOKEN not in message
+    assert "token.txt" not in message and "link" not in message and "token" != message
+    assert str(tmp_path) not in message

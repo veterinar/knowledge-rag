@@ -474,9 +474,19 @@ server:
   host: "127.0.0.1"
   port: 8179
 
-  # Auth: optional bearer token validation (SSE/HTTP only)
+  # Auth: optional bearer token validation (SSE/HTTP only).
+  # Exactly ONE of bearer_token / bearer_token_file may be set.
+  #
+  # bearer_token_file is the PREFERRED production form: an absolute path to a
+  # regular non-symlink file owned by you, with no group/world permission
+  # bits (mode 0400/0600 in a 0700 directory), containing one 32–512-byte
+  # ASCII RFC 6750 token68 value (A-Z a-z 0-9 - . _ ~ + / plus optional
+  # trailing = padding) and at most one terminal LF. Keep the file outside
+  # Git/repositories. bearer_token (inline) remains supported for legacy
+  # deployments but must never hold a real credential in a committed config.
   auth:
     bearer_token: ""
+    # bearer_token_file: "/absolute/owner-only/path/to/token-file"
 
   # Rate limiting: optional per-client request throttling
   rate_limit:
