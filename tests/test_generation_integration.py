@@ -103,6 +103,7 @@ def model_config_digest_for(compat: dict, gpu_mode: str = "auto") -> str:
             "reranker_model": compat["reranker_model"],
             "reranker_artifact_sha256": compat["reranker_artifact_sha256"],
             "gpu_mode": gpu_mode,
+            "embedding_threads": None,
         }
     )
 
