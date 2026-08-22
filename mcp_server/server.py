@@ -65,6 +65,7 @@ from watchdog.observers import Observer
 # Local imports
 from . import __version__
 from .config import EmbeddingRuntimeContractError, config
+from .freshness import FreshnessProbeError, capture_freshness_fingerprint
 from .fts5_index import Fts5LexicalIndex, Fts5NotReadyError, capture_chunk_rows, compute_rows_digest
 from .generations import (
     FTS_ARTIFACT,
@@ -1649,6 +1650,7 @@ def _pin_versioned_generation() -> Any:
     installed RECORD digest, dependency-lock digest) and the Chroma/FTS row
     universes, then snapshots them for the per-access recheck.
     """
+    _reset_freshness_gate_cache()
     expected = None
     if config.active_generation_id and config.active_receipt_sha256:
         expected = {
@@ -1965,8 +1967,102 @@ def _model_config_identity() -> str:
     return gens.model_config_identity(config)
 
 
+def _reset_freshness_gate_cache() -> None:
+    """Clear the accepted freshness fingerprint (never called under the gate lock)."""
+    global _accepted_freshness_fingerprint
+    with _freshness_gate_lock:
+        _accepted_freshness_fingerprint = None
+
+
+_freshness_gate_lock = threading.Lock()
+_accepted_freshness_fingerprint: Optional[str] = None
+
+
 def _versioned_stale_state() -> Optional[_IndexStaleError]:
-    """Current staleness of the pinned generation, or None when healthy.
+    """Freshness gate: warm invalidation-bound fast path around the full proof.
+
+    Ordering (acceptance doc, "Ordering and concurrency"):
+
+    1. Capture fingerprint A outside the gate lock.
+    2. Under the lock, recheck pin state and recapture A_locked (concurrent
+       waiters must re-evaluate after acquiring the lock).
+    3. If A_locked equals the accepted fingerprint: healthy, no full proof.
+    4. Otherwise run the COMPLETE proof unchanged
+       (:func:`_versioned_stale_state_full`).
+    5. On a stale full result, clear the accepted fingerprint and return it.
+    6. Capture fingerprint B; cache only when the proof is GREEN and
+       A_locked == B. On drift between A_locked and B, clear and return a
+       sanitized environment-changed state.
+
+    No TTL: elapsed time alone never authorizes reuse. Any probe failure
+    fails closed (freshness_probe) and clears the cache. Legacy mode is a
+    no-op, exactly as before.
+    """
+    global _accepted_freshness_fingerprint
+    if not _versioned_read_only():
+        return None
+    pin_failure = getattr(config, "_pin_failure", None)
+    if pin_failure:
+        return _IndexStaleError(
+            pin_failure.get("reason", DRIFT_REASON_POINTER_INVALID), pin_failure.get("detail") or {}
+        )
+    if not getattr(config, "active_generation_id", None):
+        return _IndexStaleError(DRIFT_REASON_POINTER_MISSING, {})
+    try:
+        fingerprint_a = capture_freshness_fingerprint(config)
+    except FreshnessProbeError:
+        _reset_freshness_gate_cache()
+        return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_probe"})
+    except Exception:
+        _reset_freshness_gate_cache()
+        return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_probe"})
+    with _freshness_gate_lock:
+        # Recheck after acquiring the lock: pin state may have changed while
+        # a concurrent gate run populated or cleared the accepted fingerprint.
+        pin_failure = getattr(config, "_pin_failure", None)
+        if pin_failure:
+            _accepted_freshness_fingerprint = None
+            return _IndexStaleError(
+                pin_failure.get("reason", DRIFT_REASON_POINTER_INVALID), pin_failure.get("detail") or {}
+            )
+        if not getattr(config, "active_generation_id", None):
+            _accepted_freshness_fingerprint = None
+            return _IndexStaleError(DRIFT_REASON_POINTER_MISSING, {})
+        try:
+            fingerprint_a_locked = capture_freshness_fingerprint(config)
+        except FreshnessProbeError:
+            _accepted_freshness_fingerprint = None
+            return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_probe"})
+        except Exception:
+            _accepted_freshness_fingerprint = None
+            return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_probe"})
+        if (
+            _accepted_freshness_fingerprint is not None
+            and fingerprint_a == fingerprint_a_locked
+            and fingerprint_a_locked == _accepted_freshness_fingerprint
+        ):
+            return None
+        stale = _versioned_stale_state_full()
+        if stale is not None:
+            _accepted_freshness_fingerprint = None
+            return stale
+        try:
+            fingerprint_b = capture_freshness_fingerprint(config)
+        except FreshnessProbeError:
+            _accepted_freshness_fingerprint = None
+            return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_probe"})
+        except Exception:
+            _accepted_freshness_fingerprint = None
+            return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_probe"})
+        if fingerprint_a_locked == fingerprint_b:
+            _accepted_freshness_fingerprint = fingerprint_b
+            return None
+        _accepted_freshness_fingerprint = None
+        return _IndexStaleError(DRIFT_REASON_ENVIRONMENT_CHANGED, {"field": "freshness_changed_during_verification"})
+
+
+def _versioned_stale_state_full() -> Optional[_IndexStaleError]:
+    """COMPLETE content-bound freshness proof (the authoritative slow path).
 
     Per-access recheck (P0 #8/#9), ordered cheap-to-expensive:
 
@@ -2187,8 +2283,10 @@ def _gate_still_valid() -> bool:
     if the pointer/receipt, live corpus, retrieval config, model bytes, or
     backend evidence moved while the query ran, the result is discarded and
     the caller surfaces ``restart_required`` — a result computed against a
-    superseded generation is never served. This is the FULL gate (same
-    checks as ``_retrieval_gate``), not pointer identity alone.
+    superseded generation is never served. This gate takes a fresh
+    invalidation fingerprint first (see ``_versioned_stale_state``) and
+    falls back to the authoritative complete proof on any change — the
+    same checks as ``_retrieval_gate``, not pointer identity alone.
     """
     if not _versioned_read_only():
         return True
