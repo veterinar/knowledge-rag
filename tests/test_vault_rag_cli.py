@@ -251,7 +251,9 @@ def test_main_invalid_token_file_refuses_sanitized_exit_2(monkeypatch, tmp_path)
     assert _FAKE_TOKEN not in out
     assert _FAKE_TOKEN not in err
     # One concise fixed refusal line, not a raw exception text.
-    assert err.getvalue().strip() == "KNOWLEDGE_RAG_BEARER_TOKEN_FILE: файл токена отсутствует, недоступен или недопустим."
+    assert (
+        err.getvalue().strip() == "KNOWLEDGE_RAG_BEARER_TOKEN_FILE: файл токена отсутствует, недоступен или недопустим."
+    )
 
 
 def test_main_empty_env_token_file_fails_closed(monkeypatch):
@@ -271,7 +273,9 @@ def test_main_empty_env_token_file_fails_closed(monkeypatch):
         code = cli.main()
     assert code == 2
     assert "Traceback" not in err
-    assert err.getvalue().strip() == "KNOWLEDGE_RAG_BEARER_TOKEN_FILE: файл токена отсутствует, недоступен или недопустим."
+    assert (
+        err.getvalue().strip() == "KNOWLEDGE_RAG_BEARER_TOKEN_FILE: файл токена отсутствует, недоступен или недопустим."
+    )
 
 
 def test_main_search_exception_leaks_nothing(monkeypatch):

@@ -413,7 +413,21 @@ def test_config_empty_token_file_fails_closed(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "kind",
-    ["valid_exact", "valid_lf", "relative", "symlink", "fifo", "group_bits", "world_bits", "whitespace", "invalid_utf8", "short", "overlong", "non_ascii", "invalid_token68"],
+    [
+        "valid_exact",
+        "valid_lf",
+        "relative",
+        "symlink",
+        "fifo",
+        "group_bits",
+        "world_bits",
+        "whitespace",
+        "invalid_utf8",
+        "short",
+        "overlong",
+        "non_ascii",
+        "invalid_token68",
+    ],
 )
 def test_bearer_token_file_validator(tmp_path, kind):
     """Exact owner-only regular file passes; representative unsafe cases fail closed.
