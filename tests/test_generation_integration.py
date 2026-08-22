@@ -44,6 +44,7 @@ import inspect
 import json
 import re
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -428,6 +429,45 @@ def synthetic_pin_seams(monkeypatch):
         },
     )
     monkeypatch.setattr(srv, "_verify_pinned_backends", lambda current: None)
+
+    def _synthetic_freshness_fingerprint(cfg):
+        rows = []
+        for label, root in (
+            ("data", Path(cfg.data_dir)),
+            ("source", Path(cfg.source_documents_dir)),
+        ):
+            for entry in (root, *sorted(root.rglob("*"))):
+                st = entry.lstat()
+                if entry == root:
+                    rel = "."
+                else:
+                    rel = entry.relative_to(root).as_posix()
+                if stat.S_ISDIR(st.st_mode):
+                    kind = "dir"
+                elif stat.S_ISREG(st.st_mode):
+                    kind = "file"
+                else:
+                    kind = "?"
+                rows.append(
+                    [
+                        label,
+                        rel,
+                        kind,
+                        st.st_mode,
+                        st.st_size,
+                        st.st_mtime_ns,
+                        st.st_ctime_ns,
+                    ]
+                )
+        return STABLE_DIGEST(
+            {
+                "rows": rows,
+                "active_generation_id": cfg.active_generation_id,
+                "active_receipt_sha256": cfg.active_receipt_sha256,
+            }
+        )
+
+    monkeypatch.setattr(srv, "capture_freshness_fingerprint", _synthetic_freshness_fingerprint, raising=False)
 
 
 def corpus_entries_for(source: Path) -> list:
@@ -975,6 +1015,110 @@ class TestReadGates:
         live = Path(cfg.source_documents_dir)
         (live / "new-file.md").write_text("# drifted\n")
         assert srv._gate_still_valid() is False
+
+    def test_unchanged_fingerprint_reuses_full_proof(self, monkeypatch, tmp_path: Path, store: GenerationStore):
+        self._pinned(monkeypatch, tmp_path, store)
+        state = {"value": "fingerprint-v1"}
+        monkeypatch.setattr(srv, "capture_freshness_fingerprint", lambda *a, **k: state["value"], raising=False)
+        calls = []
+
+        def verify_backends(_current):
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(srv, "_verify_pinned_backends", verify_backends, raising=False)
+        assert srv._gate_still_valid() is True
+        assert srv._gate_still_valid() is True
+        assert len(calls) == 1
+        # Changing the captured fingerprint value -> re-verify.
+        state["value"] = "fingerprint-v2"
+        assert srv._gate_still_valid() is True
+        assert len(calls) == 2
+
+    def test_fingerprint_change_during_full_proof_fails_closed(
+        self, monkeypatch, tmp_path: Path, store: GenerationStore
+    ):
+        self._pinned(monkeypatch, tmp_path, store)
+        values = iter(["A", "A", "B"])
+        monkeypatch.setattr(srv, "capture_freshness_fingerprint", lambda *a, **k: next(values), raising=False)
+        calls = []
+
+        def verify_backends(_current):
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(srv, "_verify_pinned_backends", verify_backends, raising=False)
+        stale = srv._versioned_stale_state()
+        assert stale.reason == srv.DRIFT_REASON_ENVIRONMENT_CHANGED
+        assert stale.detail == {"field": "freshness_changed_during_verification"}
+        assert len(calls) == 1
+        monkeypatch.setattr(srv, "capture_freshness_fingerprint", lambda *a, **k: "C", raising=False)
+        assert srv._gate_still_valid() is True
+        assert len(calls) == 2
+
+    def test_fingerprint_probe_error_is_sanitized(self, monkeypatch, tmp_path: Path, store: GenerationStore):
+        self._pinned(monkeypatch, tmp_path, store)
+
+        def boom(*a, **k):
+            raise RuntimeError("leak sensitive-marker and private/path")
+
+        monkeypatch.setattr(srv, "capture_freshness_fingerprint", boom, raising=False)
+        stale = srv._versioned_stale_state()
+        assert stale.reason == srv.DRIFT_REASON_ENVIRONMENT_CHANGED
+        assert stale.detail == {"field": "freshness_probe"}
+        rendered = json.dumps({"reason": stale.reason, "detail": stale.detail})
+        assert "sensitive-marker" not in rendered
+        assert "private/path" not in rendered
+
+    def test_real_fingerprint_composes_with_warm_gate(self, monkeypatch, tmp_path: Path):
+        """Gate composition proof closing the P1 gap: the REAL fingerprint.
+
+        ``_versioned_stale_state`` runs the real ``capture_freshness_fingerprint``
+        over the complete temporary fixture built by the sibling module
+        ``test_freshness_fastpath`` (pytest's prepend import mode puts this
+        tests/ directory on sys.path).  Only ``_versioned_stale_state_full``
+        is stubbed healthy behind a call counter — no real backend is
+        constructed and no model is loaded.  Proves: first call executes the
+        full proof; an unchanged second call reuses it; pointer, receipt and
+        sealed-artifact mutations each force a fresh full proof.
+        """
+        # Local import: sibling test module (tests/ is on sys.path in pytest's
+        # prepend import mode; importing at module scope would be equivalent).
+        from test_freshness_fastpath import build_freshness_fixture, rewrite_same_size
+
+        cfg, paths = build_freshness_fixture(monkeypatch, tmp_path)
+        # Safe patch/reset of the gate's module-global config and accepted
+        # fingerprint cache; monkeypatch restores both on teardown.
+        monkeypatch.setattr(srv, "config", cfg)
+        monkeypatch.setattr(srv, "_accepted_freshness_fingerprint", None, raising=False)
+        calls = []
+
+        def healthy_full():
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(srv, "_versioned_stale_state_full", healthy_full, raising=False)
+
+        # 1. First call: nothing accepted yet -> the complete proof runs once
+        #    and the real fingerprint is cached (GREEN and A_locked == B).
+        assert srv._versioned_stale_state() is None
+        assert len(calls) == 1
+        assert srv._accepted_freshness_fingerprint is not None
+        # 2. Unchanged fixture: the warm fast path reuses the accepted proof.
+        assert srv._versioned_stale_state() is None
+        assert len(calls) == 1
+        # 3. Pointer mutation (same-size rewrite) invalidates -> second proof.
+        rewrite_same_size(paths["pointer"])
+        assert srv._versioned_stale_state() is None
+        assert len(calls) == 2
+        # 4. Receipt mutation -> third full proof.
+        rewrite_same_size(paths["receipt"])
+        assert srv._versioned_stale_state() is None
+        assert len(calls) == 3
+        # 5. Sealed artifact mutation -> fourth full proof.
+        rewrite_same_size(paths["sealed_file_artifact"])
+        assert srv._versioned_stale_state() is None
+        assert len(calls) == 4
 
 
 class TestPostExecutionDiscard:
