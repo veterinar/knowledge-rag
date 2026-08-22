@@ -214,6 +214,24 @@ def test_embed_dim_mismatch_raises():
             emb(["text"])
 
 
+@pytest.mark.parametrize(("embedding_threads", "expected"), [(2, 2), (None, None)])
+def test_forced_cpu_load_passes_threads_to_text_embedding(monkeypatch, embedding_threads, expected):
+    """models.embedding.threads, when set, must reach TextEmbedding as threads=...;
+    when unset the kwarg must be omitted entirely (provider default applies)."""
+    import mcp_server.server as server_module
+
+    monkeypatch.setattr(server_module.config, "embedding_threads", embedding_threads, raising=False)
+    with patch("mcp_server.server.TextEmbedding", return_value=_fake_model_returning(384)) as mock_te:
+        emb = _make_embedder()
+        emb._load_forced_cpu()
+        assert mock_te.call_count == 1
+        kwargs = mock_te.call_args.kwargs
+        if expected is None:
+            assert "threads" not in kwargs
+        else:
+            assert kwargs["threads"] == expected
+
+
 def test_empty_input_does_not_trigger_load_or_raise():
     """Empty input must short-circuit before model load (cheap no-op)."""
     with patch("mcp_server.server.TextEmbedding", side_effect=FileNotFoundError("would crash")) as mock_te:

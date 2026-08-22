@@ -220,6 +220,12 @@ models:
     # Full setup guide + troubleshooting: docs/gpu-setup.md
     gpu: "auto"
 
+    # Optional: integer 1..64 controlling FastEmbed/ONNX CPU session threads.
+    # Omitted (commented out) preserves the FastEmbed default. Changing this value
+    # requires rebuilding versioned generations to avoid retrieval/model drift.
+    # No universal value is recommended; tune for your hardware.
+    # threads: 2
+
     # ─────────────────────────────────────────────────────────────────────
     # Versioned-generation compatibility pins (only used when
     # indexing.mode: "versioned" — see the INDEXING section below).

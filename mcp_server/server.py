@@ -652,6 +652,9 @@ class FastEmbedEmbeddings:
         """
         kwargs = dict(self._init_kwargs)
         kwargs["providers"] = providers
+        embedding_threads = getattr(config, "embedding_threads", None)
+        if embedding_threads is not None:
+            kwargs["threads"] = embedding_threads
         if _versioned_mode():
             from . import generations as gens
 

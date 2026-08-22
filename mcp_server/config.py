@@ -648,6 +648,9 @@ class Config:
             else 384
         )
     )
+    embedding_threads: Optional[int] = field(
+        default_factory=lambda: _get_nested("models", "embedding", "threads", None)
+    )
     # GPU acceleration mode (v4.8.0+): "auto" (default) | "true" | "false".
     # Legacy YAML `gpu: true/false` (bool) is normalized to string in __post_init__.
     #   "auto"  — probe CUDA at startup; use if ready, fall back to CPU otherwise
@@ -1052,6 +1055,10 @@ class Config:
         if not isinstance(self.passage_prefix, str):
             print(f"[WARN] passage_prefix={self.passage_prefix!r} invalid, using ''")
             self.passage_prefix = ""
+
+        value = self.embedding_threads
+        if value is not None and (type(value) is not int or not 1 <= value <= 64):
+            raise ValueError("models.embedding.threads must be an integer from 1 through 64 or null")
 
         if not isinstance(self.embedding_dim, int) or self.embedding_dim < 1:
             self.embedding_dim = 384

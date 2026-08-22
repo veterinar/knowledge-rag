@@ -345,3 +345,21 @@ def test_static_versioned_misconfiguration_still_hard_fails(monkeypatch, tmp_pat
     )
     with pytest.raises(ValueError, match="runtime_version"):
         config_module.Config()
+
+
+@pytest.mark.parametrize("value", [None, 1, 64])
+def test_embedding_threads_valid_values_pass_and_are_preserved(value):
+    """Valid models.embedding.threads values survive validation unchanged."""
+    cfg = config_module.Config()
+    cfg.embedding_threads = value
+    cfg._validate_embedding_types()
+    assert cfg.embedding_threads == value
+
+
+@pytest.mark.parametrize("value", [True, 0, 65, "2"])
+def test_embedding_threads_invalid_values_raise(value):
+    """Out-of-range or non-int models.embedding.threads must hard-fail."""
+    cfg = config_module.Config()
+    cfg.embedding_threads = value
+    with pytest.raises(ValueError, match="models.embedding.threads"):
+        cfg._validate_embedding_types()
