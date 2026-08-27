@@ -188,7 +188,7 @@ def build_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> dict[
             "skipped": skipped,
             "snapshot_sha256": snapshot_sha,
         }
-    manifest = {
+    manifest: dict[str, object] = {
         "source_commit": source_commit,
         "excluded": sorted(EXCLUDED_BASES & set(load_manifest(snapshot_dir))),
         "bases": per_base,
