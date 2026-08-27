@@ -49,7 +49,7 @@ REQUIRED_ARG_NAMES = ("--snapshot-dir", "--out", "--source-commit")
 
 # Компонент пути (ключ базы, id записи): только безопасные имена файлов —
 # ревью R1 27.08 нашло traversal через id вида "../../evil" (fail-closed).
-SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def ensure_safe_component(kind: str, value: str) -> str:

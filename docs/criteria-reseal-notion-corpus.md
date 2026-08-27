@@ -46,7 +46,13 @@ recall («migration/IaC is at least HIGH»). Не PRIVILEGED: механика �
   байтами build-config. Формула исправлена этой спекой.
 - Механика поколений: content-addressed каталог `<ver>-<commit>` (venv,
   build-config, data, models_cache, policy, releases с deployment-receipt,
-  build-requirements.lock), физически write-denied после запечатывания;
+  build-requirements.lock); write-deny после запечатывания — свойство
+  sandbox-профиля СЕРВИСА (serve.sb) плюс content-bound freshness-сверка
+  как детектор дрифта, а НЕ права файловой системы: посторонний same-UID
+  процесс каталог поколения мутировать может, и это ловится сверкой при
+  обращении, не запретом записи. (Уточнено 28.08 проверочной кампанией:
+  touch-проба внутри активного поколения удалась; первая редакция этой
+  строки говорила «физически write-denied» — проза была сильнее байтов.)
   plist `com.vetclub.knowledge-rag` указывает точный каталог; откат = plist
   на предыдущее поколение (`4.9.1-37d19fe` сохранён как откатный).
 - Бенчмарк-обязанность канона §4: авторизованный refresh закрывается только

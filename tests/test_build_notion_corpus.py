@@ -201,12 +201,13 @@ def test_t8_canary_missing_and_empty_body(tmp_path):
     assert ei.value.code == 4
 
 
-def test_t9_traversal_id_fail_closed(tmp_path):
+@pytest.mark.parametrize("bad_id", ["../../evil-record", "trailing\n"])
+def test_t9_traversal_id_fail_closed(tmp_path, bad_id):
     # Devin R1: traversal через id записи. Целостность должна ПРОЙТИ
     # (sha256 в manifest.json пересчитан) — красным обязан стать unsafe-гейт.
     snap = make_snapshot(tmp_path)
     rows = json.loads((snap / "pravila.json").read_text(encoding="utf-8"))
-    rows[0]["id"] = "../../evil-record"
+    rows[0]["id"] = bad_id
     new_sha = _write_db(snap, "pravila", rows)
     manifest = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
     manifest["databases"]["pravila"]["sha256"] = new_sha
