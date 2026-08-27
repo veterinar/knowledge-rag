@@ -1,0 +1,34 @@
+[
+  {
+    "query": "азотемия ХБП креатинин почки",
+    "expected_filepath": "vault-vet/vet-biohimia-azotemia-and-ckd.md"
+  },
+  {
+    "query": "референсные интервалы ASVCP руководство",
+    "expected_filepath": "vault-vet/asvcp-reference-interval-guidelines.md"
+  },
+  {
+    "query": "цитология гистопатология градация опухоли архитектура ткани",
+    "expected_filepath": "vault-vet/vet-book-cytology-passport.md"
+  },
+  {
+    "query": "печёночные ферменты АЛТ ЩФ",
+    "expected_filepath": "vault-vet/vet-biohimia-liver-enzymes.md"
+  },
+  {
+    "query": "имя берётся из источника а не сверяется эхо",
+    "expected_filepath": "notion-vet/pravila/3bd1809f-0de4-8101-97ea-db2f5d413248.md"
+  },
+  {
+    "query": "цитология не ставит трёх диагнозов гранулёма гиперплазия",
+    "expected_filepath": "notion-vet/razbory/3bd1809f-0de4-8103-be8a-d31699996d4c.md"
+  },
+  {
+    "query": "кунеальная бурса асептический бурсит лошадь",
+    "expected_filepath": "notion-vet/venom-terminy/3bd1809f-0de4-811e-8deb-ef7db3b981d6.md"
+  },
+  {
+    "query": "связи между главами не держат имя возбудителя расходится",
+    "expected_filepath": "notion-vet/istochniki/3bd1809f-0de4-8116-b397-fd66e5590bc4.md"
+  }
+]
