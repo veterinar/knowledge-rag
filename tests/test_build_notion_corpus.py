@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 spec = importlib.util.spec_from_file_location(
-    "build_notion_corpus",
-    Path(__file__).resolve().parents[1] / "scripts" / "build_notion_corpus.py")
+    "build_notion_corpus", Path(__file__).resolve().parents[1] / "scripts" / "build_notion_corpus.py"
+)
 bnc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bnc)
 
@@ -85,13 +85,11 @@ def make_snapshot(tmp_path: Path) -> Path:
 
 
 def _run_build(snap: Path, out: Path):
-    return bnc.main(["--snapshot-dir", str(snap), "--out", str(out),
-                     "--source-commit", SOURCE_COMMIT])
+    return bnc.main(["--snapshot-dir", str(snap), "--out", str(out), "--source-commit", SOURCE_COMMIT])
 
 
 def _run_check(snap: Path, out: Path):
-    return bnc.main(["--snapshot-dir", str(snap), "--out", str(out),
-                     "--source-commit", SOURCE_COMMIT, "--check"])
+    return bnc.main(["--snapshot-dir", str(snap), "--out", str(out), "--source-commit", SOURCE_COMMIT, "--check"])
 
 
 def _out_manifest(out: Path) -> dict:
@@ -143,8 +141,7 @@ def test_t4_determinism(tmp_path):
     assert _run_build(snap, out2) == 0
 
     def tree(out):
-        return {p.relative_to(out).as_posix(): bnc.sha256_file(p)
-                for p in out.rglob("*") if p.is_file()}
+        return {p.relative_to(out).as_posix(): bnc.sha256_file(p) for p in out.rglob("*") if p.is_file()}
 
     assert set(tree(out1)) == set(tree(out2))
     assert tree(out1) == tree(out2)
@@ -213,8 +210,7 @@ def test_t9_traversal_id_fail_closed(tmp_path):
     new_sha = _write_db(snap, "pravila", rows)
     manifest = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
     manifest["databases"]["pravila"]["sha256"] = new_sha
-    (snap / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (snap / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     out = tmp_path / "out"
     with pytest.raises(SystemExit) as ei:

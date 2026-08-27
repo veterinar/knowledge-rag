@@ -28,6 +28,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import cast
 
 # Базы координации VetPilot — не знания, в корпус не входят (владелец
 # разделил площадки); попадают в выходной манифест списком "excluded".
@@ -54,10 +55,10 @@ SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 def ensure_safe_component(kind: str, value: str) -> str:
     """Fail-closed: компонент пути обязан быть безопасным именем файла."""
     if not value or "/" in value or not SAFE_COMPONENT.match(value):
-        print(f"unsafe: {kind} {value!r} не является безопасным именем файла",
-              file=sys.stderr)
+        print(f"unsafe: {kind} {value!r} не является безопасным именем файла", file=sys.stderr)
         raise SystemExit(2)
     return value
+
 
 def sha256_file(path: Path) -> str:
     """sha256 байтов файла."""
@@ -68,7 +69,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_manifest(snapshot_dir: Path) -> dict:
+def load_manifest(snapshot_dir: Path) -> dict[str, dict[str, object]]:
     """Прочитать manifest.json; без обёртки "databases" весь объект — карта баз."""
     raw = (snapshot_dir / MANIFEST_NAME).read_text(encoding="utf-8")
     data = json.loads(raw)
@@ -80,9 +81,9 @@ def load_manifest(snapshot_dir: Path) -> dict:
     return databases
 
 
-def verify_snapshot(snapshot_dir: Path, databases: dict) -> dict:
+def verify_snapshot(snapshot_dir: Path, databases: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
     """N1: сверка sha256 каждой невыключенной базы ДО разбора (fail-closed)."""
-    verified: dict[str, dict] = {}
+    verified: dict[str, dict[str, object]] = {}
     for key, meta in databases.items():
         if key in EXCLUDED_BASES:
             continue
@@ -112,8 +113,13 @@ def scalar_value(value: object) -> str | None:
     return None
 
 
-def render_record(base_key: str, meta: dict, record: dict,
-                  source_commit: str, snapshot_sha: str) -> str | None:
+def render_record(
+    base_key: str,
+    meta: dict[str, object],
+    record: dict[str, object],
+    source_commit: str,
+    snapshot_sha: str,
+) -> str | None:
     """Markdown одной записи; None, если записей без текста для тела — skip."""
     lines = ["---"]
     lines.append(f"notion_id: {record.get('id', '')}")
@@ -150,18 +156,18 @@ def render_record(base_key: str, meta: dict, record: dict,
     return "\n".join(lines) + "\n"
 
 
-def build_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> dict:
+def build_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> dict[str, object]:
     """Сборка корпуса в out_dir (уже временный); возвращает выходной манифест."""
     databases = verify_snapshot(snapshot_dir, load_manifest(snapshot_dir))
     files: dict[str, str] = {}
-    per_base: dict[str, dict] = {}
+    per_base: dict[str, dict[str, object]] = {}
     for key, meta in databases.items():
         rows = json.loads((snapshot_dir / f"{key}.json").read_text(encoding="utf-8"))
         if not isinstance(rows, list):
             raise ValueError(f"{key}.json: ожидан список записей")
         base_dir = out_dir / key
         base_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_sha = meta["sha256"]
+        snapshot_sha = cast(str, meta["sha256"])
         files_out = 0
         skipped = 0
         for record in rows:
@@ -201,10 +207,12 @@ def check_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> None:
         fresh = Path(tmp) / "corpus"
         fresh.mkdir()
         manifest = build_corpus(snapshot_dir, fresh, source_commit)
-        expected = {p.relative_to(fresh).as_posix()
-                    for p in fresh.rglob("*") if p.is_file()}
-        actual = {p.relative_to(out_dir).as_posix()
-                  for p in out_dir.rglob("*") if p.is_file()} if out_dir.is_dir() else set()
+        expected = {p.relative_to(fresh).as_posix() for p in fresh.rglob("*") if p.is_file()}
+        actual = (
+            {p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file()}
+            if out_dir.is_dir()
+            else set()
+        )
         mismatch = False
         for rel in sorted(expected - actual):
             print(f"check: отсутствует файл {rel}", file=sys.stderr)
@@ -219,8 +227,7 @@ def check_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> None:
     probe_canary(snapshot_dir, out_dir, manifest, source_commit)
 
 
-def probe_canary(snapshot_dir: Path, out_dir: Path, manifest: dict,
-                 source_commit: str) -> None:
+def probe_canary(snapshot_dir: Path, out_dir: Path, manifest: dict[str, object], source_commit: str) -> None:
     """Зонд: свежейшая запись «pravila» обязана существовать с непустым телом."""
     rows = json.loads((snapshot_dir / "pravila.json").read_text(encoding="utf-8"))
     dated = [r for r in rows if isinstance(r.get("Дата"), str) and r["Дата"]]
@@ -239,17 +246,13 @@ def probe_canary(snapshot_dir: Path, out_dir: Path, manifest: dict,
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Сборка knowledge-rag корпуса из снимка Notion (см. докстринг)."
+    parser = argparse.ArgumentParser(description="Сборка knowledge-rag корпуса из снимка Notion (см. докстринг).")
+    parser.add_argument(
+        "--snapshot-dir", required=True, type=Path, help="каталог со снимком: manifest.json + <база>.json"
     )
-    parser.add_argument("--snapshot-dir", required=True, type=Path,
-                        help="каталог со снимком: manifest.json + <база>.json")
-    parser.add_argument("--out", required=True, type=Path,
-                        help="каталог корпуса (целевой или проверяемый при --check)")
-    parser.add_argument("--source-commit", required=True,
-                        help="hex sha git-коммита снимка (провенанс)")
-    parser.add_argument("--check", action="store_true",
-                        help="не писать: пересобрать и сравнить с --out")
+    parser.add_argument("--out", required=True, type=Path, help="каталог корпуса (целевой или проверяемый при --check)")
+    parser.add_argument("--source-commit", required=True, help="hex sha git-коммита снимка (провенанс)")
+    parser.add_argument("--check", action="store_true", help="не писать: пересобрать и сравнить с --out")
     return parser.parse_args(argv)
 
 
@@ -276,10 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — понятная строка вместо трейсбека
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
-    total = sum(b["files_out"] for b in manifest["bases"].values())
-    skipped = sum(b["skipped"] for b in manifest["bases"].values())
-    print(f"corpus: {total} файлов, пропущено записей: {skipped}, "
-          f"баз: {len(manifest['bases'])}, исключено: {len(manifest['excluded'])}")
+    bases = cast(dict[str, dict[str, object]], manifest["bases"])
+    total = sum(cast(int, b["files_out"]) for b in bases.values())
+    skipped = sum(cast(int, b["skipped"]) for b in bases.values())
+    print(
+        f"corpus: {total} файлов, пропущено записей: {skipped}, "
+        f"баз: {len(bases)}, исключено: {len(cast(list[str], manifest['excluded']))}"
+    )
     return 0
 
 

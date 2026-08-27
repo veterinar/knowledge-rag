@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **feat(scripts)** — `scripts/build_notion_corpus.py`: one-way bridge from a
+  git Notion snapshot (`manifest.json` + per-base JSON, produced by the
+  external exporter) to a markdown corpus subtree (`notion-vet/`): manifest
+  sha256 integrity is verified before parsing (fail-closed), builds are
+  atomic (staging + same-volume rename) and byte-deterministic, output
+  carries its own manifest with provenance (`source_commit`,
+  `snapshot_sha256`), `--check` rebuilds and compares byte-for-byte plus a
+  freshest-rule canary, and path components (base keys, record ids) are
+  validated against a safe-filename pattern. Coordination bases are
+  excluded; nothing ever writes back to Notion.
 - **feat(auth)** — HTTP runtimes and the bundled `vault-rag` client can load a static bearer token from an owner-only absolute file (`server.auth.bearer_token_file` / `KNOWLEDGE_RAG_BEARER_TOKEN_FILE`): the file must be an owner-permission-only regular file (no symlinks, FIFOs, group/world bits) holding valid token68 bytes; unsafe files fail closed, and client errors do not expose credentials, paths, URLs, or raw exceptions.
 - fix(runtime): optional `threads` setting is passed unchanged to FastEmbed and
   binds ONNX intra/inter threads; the value is included in retrieval/model
