@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(scripts)** — `build_notion_corpus.py`: `SAFE_COMPONENT` now anchors
+  with `\Z` instead of `$` (Python `$` also matches before a trailing
+  newline, so a record id like `"x\n"` slipped past the unsafe-name gate;
+  no traversal was possible — slashes and `..` were already rejected).
+  T9 is parametrized with the trailing-newline case (red on the old
+  pattern).
 - **docs(runbooks)** — reseal runbook for the Vault+Notion corpus generation:
   event-driven cadence (no invented calendar interval), staged-corpus
   procedure summary, permanent smoke set `reseal-smoke-cases.v1.json`
