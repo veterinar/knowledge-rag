@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **docs(runbooks)** — reseal runbook for the Vault+Notion corpus generation:
+  event-driven cadence (no invented calendar interval), staged-corpus
+  procedure summary, permanent smoke set `reseal-smoke-cases.v1.json`
+  (8 cases across both surfaces; baseline MRR@5=0.8125, Recall@5=1.0 on
+  `gen-c3d7dd…` with a reproduced RED probe), the executed reseal criteria
+  recorded in `docs/criteria-reseal-notion-corpus.md`, and a TROUBLESHOOTING
+  entry for the flaky chroma WAL/SHM sidecar sweep at build time (exit 14;
+  retry is the fix, weakening the sweep is not).
 - **feat(scripts)** — `scripts/build_notion_corpus.py`: one-way bridge from a
   git Notion snapshot (`manifest.json` + per-base JSON, produced by the
   external exporter) to a markdown corpus subtree (`notion-vet/`): manifest

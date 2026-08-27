@@ -133,4 +133,18 @@ Common issues:
 - Firewall blocking the port
 - Server started with a different host/port than configured in the MCP client
 
+### Versioned build fails with exit 14 (sidecar sweep) right after a green population
+
+Known flake (observed 2026-08-27, macOS, chromadb pinned by the generation
+lockfile): the isolated child population finishes green, but the sqlite
+WAL/SHM sidecar files under the child's chroma directory survive the close —
+the finalizer is flaky, not deterministic — and the post-population sidecar
+sweep correctly refuses to seal (exit 14).
+
+This is the guard working, not the guard broken: a generation must be sealed
+from quiescent bytes only. Re-run the build; the second attempt has come back
+clean. Do not weaken or skip the sweep to "fix" this, and do not delete the
+sidecars by hand inside a candidate generation — a hand-mutated candidate is
+a new candidate.
+
 ---
