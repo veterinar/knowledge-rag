@@ -135,16 +135,23 @@ Common issues:
 
 ### Versioned build fails with exit 14 (sidecar sweep) right after a green population
 
-Known flake (observed 2026-08-27, macOS, chromadb pinned by the generation
-lockfile): the isolated child population finishes green, but the sqlite
-WAL/SHM sidecar files under the child's chroma directory survive the close —
-the finalizer is flaky, not deterministic — and the post-population sidecar
-sweep correctly refuses to seal (exit 14).
+Fixed as of `eb672a84` (2026-08-28). The cause was located in the pinned
+chromadb bytes: `client.close()` only decrements the `SharedSystemClient`
+refcount and can orphan the sqlite connection, so WAL/SHM sidecars under the
+child's chroma directory survived the close nondeterministically and the
+post-population sweep correctly refused to seal (exit 14). Before the fix the
+build was 0/3 green on the same inputs; with it, 1/1.
 
-This is the guard working, not the guard broken: a generation must be sealed
-from quiescent bytes only. Re-run the build; the second attempt has come back
-clean. Do not weaken or skip the sweep to "fix" this, and do not delete the
-sidecars by hand inside a candidate generation — a hand-mutated candidate is
-a new candidate.
+Since that commit the child runs a deterministic teardown before the sweep
+(`_teardown_chroma_sqlite_sidecars`: gc pass, `PRAGMA
+wal_checkpoint(TRUNCATE)` with a 0.2 s connect timeout, bounded wait ≤5 s).
+"Re-run the build" is no longer the remedy: on `eb672a84` or later an exit 14
+means the sweep found a real holder — a live process keeping the sqlite file
+open. Find it (`lsof <db path>`) instead of re-running blind.
+
+The guard itself is unchanged and the old advice about it stands: a
+generation must be sealed from quiescent bytes only. Do not weaken or skip
+the sweep, and do not delete the sidecars by hand inside a candidate
+generation — a hand-mutated candidate is a new candidate.
 
 ---
