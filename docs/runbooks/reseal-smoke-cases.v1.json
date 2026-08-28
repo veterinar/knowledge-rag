@@ -21,6 +21,10 @@
   },
   {
     "query": "цитология не ставит трёх диагнозов гранулёма гиперплазия",
+    "expected_filepath": "notion-vet/istochniki/3bd1809f-0de4-819e-9089-dfe665be2dc4.md"
+  },
+  {
+    "query": "градация опухоли гранулёма гиперплазия зависят от архитектуры ткани не отдельных клеток",
     "expected_filepath": "notion-vet/razbory/3bd1809f-0de4-8103-be8a-d31699996d4c.md"
   },
   {

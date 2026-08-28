@@ -832,6 +832,12 @@ class CrossEncoderReranker:
         self.model_name = model or config.reranker_model
         self._model = None  # Lazy init
         self._load_failed = False
+        # The exception that caused a load failure (None when _load_failed was
+        # set by the versioned gate's deterministic-disable path). In enabled
+        # versioned mode a recorded load failure must re-raise the typed
+        # RerankerUnavailableError on EVERY subsequent call — stickiness must
+        # never degrade an enabled reranker into silent RRF order.
+        self._load_failure: Optional[Exception] = None
 
     def _ensure_model(self) -> bool:
         """Lazy initialization of cross-encoder model.
@@ -841,6 +847,14 @@ class CrossEncoderReranker:
         (fail-closed, P0 #9) instead of degrading to RRF order.
         """
         if self._load_failed:
+            # Enabled versioned mode is fail-closed on EVERY call: a recorded
+            # load failure re-raises the typed error instead of letting the
+            # sticky flag silently degrade the reranker to RRF order.
+            if self._load_failure is not None and _versioned_mode() and config.reranker_enabled:
+                raise RerankerUnavailableError(
+                    "versioned reranker load failed (enabled in config, "
+                    f"previous failure): {self._load_failure}"
+                ) from self._load_failure
             return False
         if self._model is None:
             if _versioned_mode() and not _versioned_reranker_gate():
@@ -872,6 +886,7 @@ class CrossEncoderReranker:
                 print("[INFO] Reranker model loaded successfully")
             except Exception as e:
                 self._load_failed = True
+                self._load_failure = e
                 if _versioned_mode() and config.reranker_enabled:
                     raise RerankerUnavailableError(f"versioned reranker load failed (enabled in config): {e}") from e
                 print(f"[WARN] Reranker unavailable, using RRF order: {e}")
