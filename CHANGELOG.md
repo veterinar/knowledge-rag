@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(ci)** — perf regression gate: sub-floor microbenchmark pairs (both
+  medians < 1.0 ms) are reported as `[INFO] sub-floor microbenchmarks
+  (noise-dominated, not gated)` instead of failing the gate; measured
+  runner noise on sub-ms benches is ±30–36% (two false reds in two days)
+  while multi-ms benches are stable. A pair crossing the floor is still
+  gated; the ±10% threshold for gated pairs is unchanged; the summary now
+  prints both bounds.
 - **fix(generation)** — deterministic chroma teardown squeeze in the offline
   build child: after `orch.close(strict=True)` and before the sidecar sweep,
   `gc.collect()` + (if WAL/SHM sidecars persist) a short-lived
