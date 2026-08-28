@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(generation)** — deterministic chroma teardown squeeze in the offline
+  build child: after `orch.close(strict=True)` and before the sidecar sweep,
+  `gc.collect()` + (if WAL/SHM sidecars persist) a short-lived
+  `sqlite3.connect(..., timeout=0.2)` issuing `PRAGMA wal_checkpoint(TRUNCATE)`
+  + a bounded <=5 s wait. The sweep and its exit 14 stay byte-identical — the
+  gate is not weakened; the squeeze only makes handle teardown deterministic
+  (3/3 builds on a 204-doc corpus previously lost the GC race).
+  `clear_system_cache` deliberately not used: in pinned chromadb 1.5.9 it
+  swaps the cache without `system.stop()`, orphaning the live System.
 - **fix(scripts)** — `build_notion_corpus.py`: `SAFE_COMPONENT` now anchors
   with `\Z` instead of `$` (Python `$` also matches before a trailing
   newline, so a record id like `"x\n"` slipped past the unsafe-name gate;
