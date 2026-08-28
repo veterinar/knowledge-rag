@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **docs(criteria)** — claim-ledger pilot: sidecar `claim-ledger.v1` contract
+  (per-claim versioned evidence `repo://`/`vault://`/`runtime-receipt://`/
+  `web-snapshot://`, deterministic `current|stale|unresolved`, `verified`
+  reserved-unreachable) and the retrieval-contract change it implies: a
+  fragment whose sidecar carries a non-current claim stays in retrieval but
+  forbids confident synthesis. Pilot scope: one Claude-zone note, 3-5
+  author-written claims, one RED; no kr code changes, no Vault-wide format.
 - **data(runbooks)** — reseal smoke case #10: the first pages corpus document
   (`notion-vet/pages/skhema-vetpilot.md`, snapshot 5608864f, manifest v2).
   Two-sided: measured MISS on gen-c8602b9d before the reseal, HIT on
