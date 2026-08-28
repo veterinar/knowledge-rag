@@ -29,6 +29,13 @@ from typing import Any
 REGRESSION_THRESHOLD = 0.10  # 10%
 BYPASS_LABEL = "skip-perf-gate"
 
+# Sub-floor microbenchmarks are noise-dominated: measured runner noise on
+# sub-millisecond benches is ±30–36%, while multi-ms benches are stable to
+# units of percent. Pairs where BOTH medians are below this floor are
+# reported, never gated. pytest-benchmark JSON stats are in seconds.
+MICRO_FLOOR_MS = 1.0
+_MICRO_FLOOR_S = MICRO_FLOOR_MS / 1000.0
+
 
 def _load(path: Path) -> dict[str, dict[str, Any]]:
     """Return mapping of bench name -> stats dict."""
@@ -76,6 +83,7 @@ def main() -> int:
 
     regressions: list[tuple[str, float, float, float]] = []
     improvements: list[tuple[str, float]] = []
+    sub_floor: list[tuple[str, float, float, float]] = []
 
     for name in common:
         m_median = master[name]["median"]
@@ -83,18 +91,26 @@ def main() -> int:
         if m_median <= 0:
             continue
         delta = (b_median - m_median) / m_median
-        if delta > args.threshold:
+        if m_median < _MICRO_FLOOR_S and b_median < _MICRO_FLOOR_S:
+            sub_floor.append((name, m_median, b_median, delta))
+        elif delta > args.threshold:
             regressions.append((name, m_median, b_median, delta))
         elif delta < -args.threshold:
             improvements.append((name, delta))
 
     print(f"\nBenchmarks compared: {len(common)}")
-    print(f"Threshold: ±{args.threshold * 100:.0f}%\n")
+    print(f"Threshold: ±{args.threshold * 100:.0f}%; micro-floor: {MICRO_FLOOR_MS} ms\n")
 
     if improvements:
         print("Improvements (faster, no action needed):")
         for name, delta in improvements:
             print(f"  ✓ {name}  {_format_delta(delta)}")
+        print()
+
+    if sub_floor:
+        print("[INFO] sub-floor microbenchmarks (noise-dominated, not gated):")
+        for name, m, b, delta in sub_floor:
+            print(f"  ~ {name}  median {m * 1000:.2f} -> {b * 1000:.2f} ms  ({_format_delta(delta)})")
         print()
 
     if regressions:
