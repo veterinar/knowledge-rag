@@ -34,5 +34,9 @@
   {
     "query": "bfcache pageshow пять защит браузерные тесты app.js",
     "expected_filepath": "notion-vet/razbory/3c01809f-0de4-818e-8447-ffcc6e56975c.md"
+  },
+  {
+    "query": "extract_document CellEvidence observation_id детерминированное извлечение схема",
+    "expected_filepath": "notion-vet/pages/skhema-vetpilot.md"
   }
 ]

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **data(runbooks)** — reseal smoke case #10: the first pages corpus document
+  (`notion-vet/pages/skhema-vetpilot.md`, snapshot 5608864f, manifest v2).
+  Two-sided: measured MISS on gen-c8602b9d before the reseal, HIT on
+  gen-6e37626c after; query anchors taken from the live page.
 - **feat(scripts)** — `build_notion_corpus.py`: support Notion snapshot pages
   alongside databases (manifest key `"pages"`, files `pages/<slug>.md` from
   the external exporter; snapshot schema `vetclub.notion-export.v2`). New
