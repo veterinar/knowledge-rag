@@ -99,3 +99,10 @@ manifest-форматы и Tool Plane не меняются (не-цели вл�
 
 Обязательный ledger для всего Vault; production-rollout; ретроспективные
 массовые claims; OpenWiki runtime; Tool Plane write-инструменты; verified.
+
+## Дельта исполнения (замечена до реализации, формат уточнён)
+
+Sidecar — `<note-basename>.claims.md` (json в едином fenced-блоке ```json),
+а не `.claims.json`: политика guarded writer покрывает только `**/*.md`
+(policy.json, замерено байтами) — расширение политики на .json было бы
+владельческим актом вне границ пилота. Чекер парсит первый json-фенс файла.
