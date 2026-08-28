@@ -81,6 +81,41 @@ def load_manifest(snapshot_dir: Path) -> dict[str, dict[str, object]]:
     return databases
 
 
+def load_pages(snapshot_dir: Path) -> dict[str, dict[str, object]]:
+    """Карта страниц из "pages" манифеста; {} без ключа (плоский манифест
+    ключа pages не несёт — обёртки, в отличие от баз, нет)."""
+    raw = (snapshot_dir / MANIFEST_NAME).read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"{MANIFEST_NAME}: ожидан объект, получен {type(data).__name__}")
+    pages = data.get("pages", {})
+    if not isinstance(pages, dict):
+        raise ValueError(f"{MANIFEST_NAME}: 'pages' должен быть объектом")
+    return pages
+
+
+def verify_pages(snapshot_dir: Path, pages: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    """N1-страницы: unsafe-гейт slug + сверка sha256 до использования (fail-closed)."""
+    verified: dict[str, dict[str, object]] = {}
+    for slug, meta in pages.items():
+        ensure_safe_component("страница", slug)
+        if not isinstance(meta, dict) or "sha256" not in meta:
+            raise ValueError(f"{MANIFEST_NAME}: страница {slug!r} без sha256")
+        if not isinstance(meta["sha256"], str):
+            raise ValueError(f"{MANIFEST_NAME}: страница {slug!r}: sha256 обязан быть строкой")
+        page_path = snapshot_dir / "pages" / f"{slug}.md"
+        actual = sha256_file(page_path) if page_path.is_file() else "<отсутствует>"
+        expected = meta["sha256"]
+        if actual != expected:
+            print(
+                f"integrity: страница {slug}: sha256 ожидаем {expected}, факт {actual}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        verified[slug] = meta
+    return verified
+
+
 def verify_snapshot(snapshot_dir: Path, databases: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
     """N1: сверка sha256 каждой невыключенной базы ДО разбора (fail-closed)."""
     verified: dict[str, dict[str, object]] = {}
@@ -159,6 +194,7 @@ def render_record(
 def build_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> dict[str, object]:
     """Сборка корпуса в out_dir (уже временный); возвращает выходной манифест."""
     databases = verify_snapshot(snapshot_dir, load_manifest(snapshot_dir))
+    pages_manifest = verify_pages(snapshot_dir, load_pages(snapshot_dir))
     files: dict[str, str] = {}
     per_base: dict[str, dict[str, object]] = {}
     for key, meta in databases.items():
@@ -188,12 +224,52 @@ def build_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> dict[
             "skipped": skipped,
             "snapshot_sha256": snapshot_sha,
         }
+    pages_out: dict[str, dict[str, str]] = {}
+    if pages_manifest:
+        pages_dir = out_dir / "pages"
+        pages_dir.mkdir(parents=True, exist_ok=True)
+    for slug, meta in pages_manifest.items():
+        snapshot_sha = cast(str, meta["sha256"])
+        body = (snapshot_dir / "pages" / f"{slug}.md").read_bytes()
+        # вторая проверка целостности: файл мог измениться между verify и
+        # этим чтением — пересчитываем sha по прочитанным байтам (fail-closed)
+        actual_sha = hashlib.sha256(body).hexdigest()
+        if actual_sha != snapshot_sha:
+            print(
+                f"integrity: страница {slug}: sha256 ожидаем {snapshot_sha}, факт {actual_sha}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        page_id = ensure_safe_component("page_id страницы", str(meta.get("page_id", "")))
+        title = meta.get("title", "")
+        if not isinstance(title, str) or not title or "\n" in title or "\r" in title:
+            raise ValueError(
+                f"{MANIFEST_NAME}: страница {slug!r}: title обязан быть непустой однострочной строкой"
+            )
+        front = (
+            "---\n"
+            f"notion_page_id: {page_id}\n"
+            f"page: {slug}\n"
+            f"title: {title}\n"
+            f"source_commit: {source_commit}\n"
+            f"snapshot_sha256: {snapshot_sha}\n"
+            "---\n"
+        ).encode("utf-8")
+        rel = f"pages/{slug}.md"
+        (out_dir / rel).write_bytes(front + body)
+        files[rel] = sha256_file(out_dir / rel)
+        pages_out[slug] = {"snapshot_sha256": snapshot_sha, "file": rel}
     manifest: dict[str, object] = {
         "source_commit": source_commit,
         "excluded": sorted(EXCLUDED_BASES & set(load_manifest(snapshot_dir))),
         "bases": per_base,
         "files": dict(sorted(files.items())),
     }
+    # обратная совместимость: ключ "pages" — только когда страницы есть;
+    # прежний мост (без страниц) ключ не писал, снимок без страниц обязан
+    # давать байт-идентичный манифест
+    if pages_out:
+        manifest["pages"] = pages_out
     (out_dir / OUT_MANIFEST_NAME).write_text(
         json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -282,9 +358,11 @@ def main(argv: list[str] | None = None) -> int:
     bases = cast(dict[str, dict[str, object]], manifest["bases"])
     total = sum(cast(int, b["files_out"]) for b in bases.values())
     skipped = sum(cast(int, b["skipped"]) for b in bases.values())
+    pages_count = len(cast(dict[str, object], manifest.get("pages", {})))
     print(
         f"corpus: {total} файлов, пропущено записей: {skipped}, "
-        f"баз: {len(bases)}, исключено: {len(cast(list[str], manifest['excluded']))}"
+        f"баз: {len(bases)}, исключено: {len(cast(list[str], manifest['excluded']))}, "
+        f"страниц: {pages_count}"
     )
     return 0
 
