@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **docs(troubleshooting)** — the exit-14 sidecar-sweep entry no longer calls
+  the failure a flake with "re-run the build" as the remedy: since `eb672a84`
+  the build child tears chroma sqlite sidecars down deterministically, so an
+  exit 14 on that commit or later means a real live holder of the sqlite
+  file (find it with `lsof`), not a lost GC race. The sweep-is-the-guard
+  advice is unchanged.
 - **fix(ci)** — perf regression gate: sub-floor microbenchmark pairs (both
   medians < 1.0 ms) are reported as `[INFO] sub-floor microbenchmarks
   (noise-dominated, not gated)` instead of failing the gate; measured
