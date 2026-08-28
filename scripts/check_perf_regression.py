@@ -133,7 +133,9 @@ def main() -> int:
         print()
 
     if memory_mb:
-        print("[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):")
+        print(
+            "[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):"
+        )
         for name, m, b, delta in memory_mb:
             print(f"  ~ {name}  median {m:.2f} -> {b:.2f} s  ({_format_delta(delta)})")
         print()

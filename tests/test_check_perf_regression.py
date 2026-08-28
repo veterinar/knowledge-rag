@@ -103,7 +103,10 @@ def test_c1_memory_mb_pair_not_gated_with_info(monkeypatch, capsys, tmp_path):
     assert code == 0
     assert "[FAIL]" not in err
     assert "[OK] No benchmarks regressed beyond threshold." in out
-    assert "[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):" in out
+    assert (
+        "[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):"
+        in out
+    )
     assert "test_bench_orchestrator_idle_rss" in out
     assert "0.10 -> 0.14 s" in out
     assert "+40.0%" in out
