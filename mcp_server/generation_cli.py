@@ -174,6 +174,78 @@ def _sha256_file_str(path: Path) -> str:
 # Isolated child population (all writer handles die with the child)
 # ---------------------------------------------------------------------------
 
+_CHROMA_SQLITE_SIDECAR_NAMES = ("chroma_db/chroma.sqlite3-wal", "chroma_db/chroma.sqlite3-shm")
+
+
+def _teardown_chroma_sqlite_sidecars(
+    staging: Path,
+    timeout: float = 5.0,
+    poll_interval: float = 0.1,
+) -> Dict[str, Any]:
+    """Deterministic chroma teardown squeeze (runs in the population child).
+
+    Called AFTER ``orch.close(strict=True)`` and BEFORE the sidecar sweep.
+    Sequence (criteria kr-teardown-fix):
+
+    1. ``gc.collect()`` — drop any lingering SharedSystemClient references so
+       the shared System's sqlite connections can actually die;
+    2. if the chroma WAL/SHM sidecars still exist, a short-lived
+       ``sqlite3.connect`` on the staging chroma db issues
+       ``PRAGMA wal_checkpoint(TRUNCATE)`` and closes. Population is
+       complete, so there are no writers; if some foreign connection is
+       still alive the connect attempt hits its 0.2 s busy timeout, the
+       checkpoint is not taken, and the squeeze yields (the sweep then
+       honestly fails the build with exit 14);
+    3. bounded wait (<= ``timeout`` seconds, ~``poll_interval`` step) for the
+       sidecars to disappear; on disappearance — proceed immediately.
+
+    ``clear_system_cache`` is deliberately NOT used: in pinned chromadb
+    1.5.9 it swaps the cache for an empty dict WITHOUT ``system.stop()``,
+    orphaning a live System and making teardown worse
+    (see ``shared_system_client.py:126-129``).
+
+    Returns ``{"cleared": bool, "remaining": [...], "waited_s": float}``;
+    ``cleared=False`` means the sidecars survived and the sweep is expected
+    to fail the build — this function never weakens the gate itself.
+    """
+    import gc
+    import sqlite3
+
+    sidecar_paths = [staging / name for name in _CHROMA_SQLITE_SIDECAR_NAMES]
+
+    def _remaining() -> List[str]:
+        return [p.name for p in sidecar_paths if p.exists()]
+
+    gc.collect()
+
+    if _remaining():
+        db_path = staging / "chroma_db" / "chroma.sqlite3"
+        if db_path.exists():
+            try:
+                # timeout=0.2: never wait out a foreign holder's transaction
+                # (default 5s busy timeout would stall the squeeze); busy
+                # yields after 0.2 s, only the bounded-wait loop waits (P3).
+                conn = sqlite3.connect(str(db_path), timeout=0.2)
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                # Busy/locked foreign connection: yield silently — the sweep
+                # remains the honest gate and fails the build (exit 14).
+                pass
+
+    started = time.monotonic()
+    deadline = started + timeout
+    while True:
+        remaining = _remaining()
+        if not remaining:
+            return {"cleared": True, "remaining": [], "waited_s": round(time.monotonic() - started, 3)}
+        if time.monotonic() >= deadline:
+            return {"cleared": False, "remaining": remaining, "waited_s": round(time.monotonic() - started, 3)}
+        time.sleep(poll_interval)
+
+
 _CHILD_SCRIPT = r"""
 import json
 import sys
@@ -244,6 +316,15 @@ finally:
 # the offending file for the operator. The sweep rejects EVERY canonical
 # suffix generations.py enforces (-wal/-shm/-journal and .wal/.shm/.journal),
 # including names like chroma.sqlite3-wal.
+from mcp_server.generation_cli import _teardown_chroma_sqlite_sidecars
+
+_squeeze = _teardown_chroma_sqlite_sidecars(STAGING)
+if not _squeeze["cleared"]:
+    print(
+        f"[CHILD] chroma sidecar squeeze yielded: {_squeeze['remaining']} "
+        f"(waited {_squeeze['waited_s']}s)",
+        file=sys.stderr,
+    )
 _SQLITE_SIDECAR_SUFFIXES = ("-", ".")
 sidecars = [
     str(p.relative_to(STAGING))
