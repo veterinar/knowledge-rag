@@ -30,5 +30,9 @@
   {
     "query": "связи между главами не держат имя возбудителя расходится",
     "expected_filepath": "notion-vet/istochniki/3bd1809f-0de4-8116-b397-fd66e5590bc4.md"
+  },
+  {
+    "query": "bfcache pageshow пять защит браузерные тесты app.js",
+    "expected_filepath": "notion-vet/razbory/3c01809f-0de4-818e-8447-ffcc6e56975c.md"
   }
 ]
