@@ -92,6 +92,31 @@ def _run_check(snap: Path, out: Path):
     return bnc.main(["--snapshot-dir", str(snap), "--out", str(out), "--source-commit", SOURCE_COMMIT, "--check"])
 
 
+def make_snapshot_with_pages(tmp_path: Path, pages: dict) -> Path:
+    """Обёртка над make_snapshot: добавляет "pages" в manifest.json и
+    пишет pages/<slug>.md с реальными sha256 (make_snapshot не трогаем)."""
+    snap = make_snapshot(tmp_path)
+    pages_dir = snap / "pages"
+    pages_dir.mkdir()
+    manifest = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
+    entries = {}
+    for slug, meta in pages.items():
+        data = meta["content"].encode("utf-8")
+        (pages_dir / f"{slug}.md").write_bytes(data)
+        entries[slug] = {
+            "title": meta.get("title", f"# {slug}"),
+            "page_id": meta["page_id"],
+            "blocks": meta.get("blocks", 1),
+            "sha256": _sha256_bytes(data),
+        }
+    manifest["pages"] = entries
+    (snap / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return snap
+
+
+PAGE_BODY = "# Руководство клуба\n\nОбщие правила общения.\n"
+
+
 def _out_manifest(out: Path) -> dict:
     return json.loads((out / "corpus-manifest.json").read_text(encoding="utf-8"))
 
@@ -219,3 +244,118 @@ def test_t9_traversal_id_fail_closed(tmp_path, bad_id):
     assert ei.value.code == 2  # unsafe-гейт, а не integrity
     assert not out.exists()
     assert not list(tmp_path.rglob("evil-record.md"))
+
+
+def test_t10_snapshot_without_pages_leaves_no_pages_trace(tmp_path):
+    # B1: снимок БЕЗ "pages" не оставляет следов pages: ни каталога
+    # out/pages, ни ключа "pages" в выходном манифесте (обратная
+    # совместимость с корпусами, собранными прежним мостом).
+    snap = make_snapshot(tmp_path)
+    out = tmp_path / "out"
+    assert _run_build(snap, out) == 0
+    assert not (out / "pages").exists()
+    assert "pages" not in _out_manifest(out)
+
+
+def test_t11_page_build_content_and_manifest(tmp_path):
+    snap = make_snapshot_with_pages(
+        tmp_path,
+        {"rukovodstvo": {"title": "Руководство клуба", "page_id": "abc123", "content": PAGE_BODY}},
+    )
+    out = tmp_path / "out"
+    assert _run_build(snap, out) == 0
+    page = out / "pages" / "rukovodstvo.md"
+    assert page.is_file()
+    text = page.read_text(encoding="utf-8")
+    assert "notion_page_id: abc123" in text
+    assert "page: rukovodstvo" in text
+    assert "title: Руководство клуба" in text
+    assert f"source_commit: {SOURCE_COMMIT}" in text
+    snapshot_sha = hashlib.sha256((snap / "pages" / "rukovodstvo.md").read_bytes()).hexdigest()
+    assert f"snapshot_sha256: {snapshot_sha}" in text
+    # тело после frontmatter — байт-в-байт телу из снимка
+    body = text.split("---", 2)[2]
+    assert body.lstrip("\n") == PAGE_BODY
+    assert body.encode("utf-8") == b"\n" + PAGE_BODY.encode("utf-8")
+    man = _out_manifest(out)
+    assert "pages/rukovodstvo.md" in man["files"]
+    assert man["files"]["pages/rukovodstvo.md"] == hashlib.sha256(page.read_bytes()).hexdigest()
+    assert man["pages"]["rukovodstvo"] == {"snapshot_sha256": snapshot_sha, "file": "pages/rukovodstvo.md"}
+
+
+def test_t12_page_tampered_byte_fail_closed(tmp_path):
+    # подмена одного байта pages/<slug>.md при старом манифестном sha → 2
+    # ДО записи наружного --out (staging обрезается атомарностью переноса)
+    snap = make_snapshot_with_pages(
+        tmp_path,
+        {"rukovodstvo": {"title": "Руководство клуба", "page_id": "abc123", "content": PAGE_BODY}},
+    )
+    target = snap / "pages" / "rukovodstvo.md"
+    data = bytearray(target.read_bytes())
+    data[0] = data[0] ^ 0x01
+    target.write_bytes(bytes(data))
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as ei:
+        _run_build(snap, out)
+    assert ei.value.code == 2
+    assert not out.exists()
+
+
+def test_t13_page_missing_file_fail_closed(tmp_path):
+    # манифест обещает страницу, файла нет → SystemExit(2)
+    snap = make_snapshot_with_pages(
+        tmp_path,
+        {"rukovodstvo": {"title": "Руководство клуба", "page_id": "abc123", "content": PAGE_BODY}},
+    )
+    (snap / "pages" / "rukovodstvo.md").unlink()
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as ei:
+        _run_build(snap, out)
+    assert ei.value.code == 2
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("bad_slug", ["../../evil-page", "trailing\n"])
+def test_t14_page_slug_traversal_fail_closed(tmp_path, bad_slug):
+    # unsafe-гейт обязан срабатывать ДО integrity-чтения файла, поэтому файл
+    # для этого кейса не пишем вовсе — в манифесте синтаксически честный
+    # hex-sha, красным становится именно unsafe-гейт
+    snap = make_snapshot(tmp_path)
+    manifest = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
+    manifest["pages"] = {bad_slug: {"title": "T", "page_id": "hex", "blocks": 1, "sha256": "a" * 64}}
+    (snap / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as ei:
+        _run_build(snap, out)
+    assert ei.value.code == 2  # unsafe-гейт, а не integrity
+    assert not out.exists()
+    assert not list(tmp_path.rglob("evil-page*"))
+    assert not list(tmp_path.rglob("*trailing*"))
+
+
+def test_t15_check_green_then_red_on_corrupted_page(tmp_path):
+    snap = make_snapshot_with_pages(
+        tmp_path,
+        {"rukovodstvo": {"title": "Руководство клуба", "page_id": "abc123", "content": PAGE_BODY}},
+    )
+    out = tmp_path / "out"
+    assert _run_build(snap, out) == 0
+    assert _run_check(snap, out) == 0
+    target = out / "pages" / "rukovodstvo.md"
+    data = bytearray(target.read_bytes())
+    data[-2] = data[-2] ^ 0x01  # портим байт тела корпусного файла
+    target.write_bytes(bytes(data))
+    with pytest.raises(SystemExit) as ei:
+        _run_check(snap, out)
+    assert ei.value.code == 3
+
+
+def test_t16_page_title_newline_fail_closed(tmp_path):
+    # title с \n в манифесте — инъекция во frontmatter, rc 2
+    snap = make_snapshot_with_pages(
+        tmp_path,
+        {"rukovodstvo": {"title": "Заголовок\nподделка: true", "page_id": "abc123", "content": PAGE_BODY}},
+    )
+    out = tmp_path / "out"
+    assert _run_build(snap, out) == 2  # ValueError пойман в main → rc 2
+    assert not out.exists()

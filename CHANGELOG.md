@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **feat(scripts)** — `build_notion_corpus.py`: support Notion snapshot pages
+  alongside databases (manifest key `"pages"`, files `pages/<slug>.md` from
+  the external exporter; snapshot schema `vetclub.notion-export.v2`). New
+  `load_pages()` + `verify_pages()`: per-page slug passes the same
+  safe-filename gate as record ids and each file's sha256 is checked against
+  the manifest before parsing (fail-closed, exit 2 — exactly like databases).
+  Each corpus page `out/pages/<slug>.md` is frontmatter (notion_page_id,
+  page, title, source_commit, snapshot_sha256) followed by the snapshot
+  bytes verbatim; files count in the shared `"files"` map plus a new
+  `"pages"` manifest section, and the summary line gains `, страниц: P`.
+  Snapshots without `"pages"` carry no `"pages"` manifest key at all —
+  byte-identical to corpora built by the previous pages-less bridge.
+  `--check` unchanged — rglob byte-comparison already covers pages. Tests
+  T10–T16 (no-pages trace, content, tamper, missing file, slug traversal,
+  check green/red on a page, newline title fail-closed).
 - **docs(troubleshooting)** — the exit-14 sidecar-sweep entry no longer calls
   the failure a flake with "re-run the build" as the remedy: since `eb672a84`
   the build child tears chroma sqlite sidecars down deterministically, so an
