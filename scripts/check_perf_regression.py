@@ -36,15 +36,17 @@ BYPASS_LABEL = "skip-perf-gate"
 MICRO_FLOOR_MS = 1.0
 _MICRO_FLOOR_S = MICRO_FLOOR_MS / 1000.0
 
-# Memory-delta benchmarks report RSS delta in MEGABYTES (after - before from
-# _real_rss_mb() in bench/test_bench_memory.py), not wall time in seconds.
-# Reading their medians as seconds is a categorical units error: the floor
-# never sees them and the relative ±10% gate fires on GC noise. Both values
-# are already guarded by absolute asserts in the benches themselves
-# (<50 MB / <80 MB) and by Pillar 3 — Memory baseline, so the relative gate
-# adds nothing here. Names come from the bench file; basis:
+# Both memory benches come from bench/test_bench_memory.py; their median in
+# bench-JSON is the wall-time of measure() in SECONDS (perf_counter; the
+# returned MB delta never lands in the JSON, extra_info is empty). Wall-time
+# of an RSS measurement with two gc.collect runs swings ±14–36% on no-op
+# diffs and is NOT the subject of those benches — the subject (RSS) is
+# guarded by their own absolute asserts (<50 MB / <80 MB) and Pillar 3.
+# Hence these pairs are excluded from the relative time gate. (The
+# m_median <= 0 continue above is unreachable for wall-time medians.)
+# Names come from the bench file; basis:
 # docs/criteria-perf-gate-memory-units.md.
-MEMORY_MB_BENCHES = {
+MEMORY_BENCH_NAMES = {
     "test_bench_orchestrator_idle_rss",
     "test_bench_query_cache_5000_entries",
 }
@@ -105,7 +107,7 @@ def main() -> int:
         if m_median <= 0:
             continue
         delta = (b_median - m_median) / m_median
-        if name in MEMORY_MB_BENCHES:
+        if name in MEMORY_BENCH_NAMES:
             memory_mb.append((name, m_median, b_median, delta))
         elif m_median < _MICRO_FLOOR_S and b_median < _MICRO_FLOOR_S:
             sub_floor.append((name, m_median, b_median, delta))
@@ -116,7 +118,7 @@ def main() -> int:
 
     print(f"\nBenchmarks compared: {len(common)}")
     print(f"Threshold: ±{args.threshold * 100:.0f}%; micro-floor: {MICRO_FLOOR_MS} ms")
-    print(f"Memory-delta pairs excluded from gate: {len(memory_mb)}\n")
+    print(f"Memory-bench wall-time pairs excluded from gate: {len(memory_mb)}\n")
 
     if improvements:
         print("Improvements (faster, no action needed):")
@@ -131,9 +133,9 @@ def main() -> int:
         print()
 
     if memory_mb:
-        print("[INFO] memory-delta benchmarks (MB, gated by their own asserts + Pillar 3):")
+        print("[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):")
         for name, m, b, delta in memory_mb:
-            print(f"  ~ {name}  median {m:.2f} -> {b:.2f} MB  ({_format_delta(delta)})")
+            print(f"  ~ {name}  median {m:.2f} -> {b:.2f} s  ({_format_delta(delta)})")
         print()
 
     if regressions:
