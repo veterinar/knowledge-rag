@@ -86,3 +86,68 @@ def test_c1_floor_boundary_is_gated(monkeypatch, capsys, tmp_path):
 def test_c2_summary_prints_threshold_and_floor(monkeypatch, capsys, tmp_path):
     _, out, _ = _run(monkeypatch, capsys, tmp_path, {"b": 0.006}, {"b": 0.006})
     assert "Threshold: ±10%; micro-floor: 1.0 ms" in out
+
+
+# --- критерии 1–2: RSS-бенчи (дельты в МБ) вне относительного гейта ---
+
+
+def test_c1_memory_mb_pair_not_gated_with_info(monkeypatch, capsys, tmp_path):
+    # (0.10 -> 0.14 «s» wall-time, +40%) — имя из MEMORY_BENCH_NAMES: нет fail, есть info
+    code, out, err = _run(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        {"test_bench_orchestrator_idle_rss": 0.10},
+        {"test_bench_orchestrator_idle_rss": 0.14},
+    )
+    assert code == 0
+    assert "[FAIL]" not in err
+    assert "[OK] No benchmarks regressed beyond threshold." in out
+    assert (
+        "[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):"
+        in out
+    )
+    assert "test_bench_orchestrator_idle_rss" in out
+    assert "0.10 -> 0.14 s" in out
+    assert "+40.0%" in out
+
+
+def test_c1_second_memory_mb_name_also_excluded(monkeypatch, capsys, tmp_path):
+    # второе имя набора, +30% — тоже info, не fail
+    code, out, err = _run(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        {"test_bench_query_cache_5000_entries": 0.20},
+        {"test_bench_query_cache_5000_entries": 0.26},
+    )
+    assert code == 0
+    assert "[FAIL]" not in err
+    assert "test_bench_query_cache_5000_entries" in out
+    assert "0.20 -> 0.26 s" in out
+
+
+def test_c1_non_memory_pair_above_threshold_still_fails(monkeypatch, capsys, tmp_path):
+    # имя вне набора, +16% — fail как раньше
+    code, _, err = _run(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        {"time_bench": 0.006},
+        {"time_bench": 0.00696},
+    )
+    assert code == 1
+    assert "[FAIL] Performance regressions detected:" in err
+    assert "time_bench" in err
+    assert "memory-delta" not in err
+
+
+def test_c2_summary_prints_memory_excluded_count(monkeypatch, capsys, tmp_path):
+    _, out, _ = _run(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        {"test_bench_orchestrator_idle_rss": 0.10, "test_bench_query_cache_5000_entries": 0.20},
+        {"test_bench_orchestrator_idle_rss": 0.10, "test_bench_query_cache_5000_entries": 0.20},
+    )
+    assert "Memory-bench wall-time pairs excluded from gate: 2" in out

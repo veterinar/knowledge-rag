@@ -243,9 +243,7 @@ def build_corpus(snapshot_dir: Path, out_dir: Path, source_commit: str) -> dict[
         page_id = ensure_safe_component("page_id страницы", str(meta.get("page_id", "")))
         title = meta.get("title", "")
         if not isinstance(title, str) or not title or "\n" in title or "\r" in title:
-            raise ValueError(
-                f"{MANIFEST_NAME}: страница {slug!r}: title обязан быть непустой однострочной строкой"
-            )
+            raise ValueError(f"{MANIFEST_NAME}: страница {slug!r}: title обязан быть непустой однострочной строкой")
         front = (
             "---\n"
             f"notion_page_id: {page_id}\n"

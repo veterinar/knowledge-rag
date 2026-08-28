@@ -36,6 +36,21 @@ BYPASS_LABEL = "skip-perf-gate"
 MICRO_FLOOR_MS = 1.0
 _MICRO_FLOOR_S = MICRO_FLOOR_MS / 1000.0
 
+# Both memory benches come from bench/test_bench_memory.py; their median in
+# bench-JSON is the wall-time of measure() in SECONDS (perf_counter; the
+# returned MB delta never lands in the JSON, extra_info is empty). Wall-time
+# of an RSS measurement with two gc.collect runs swings ±14–36% on no-op
+# diffs and is NOT the subject of those benches — the subject (RSS) is
+# guarded by their own absolute asserts (<50 MB / <80 MB) and Pillar 3.
+# Hence these pairs are excluded from the relative time gate. (The
+# m_median <= 0 continue above is unreachable for wall-time medians.)
+# Names come from the bench file; basis:
+# docs/criteria-perf-gate-memory-units.md.
+MEMORY_BENCH_NAMES = {
+    "test_bench_orchestrator_idle_rss",
+    "test_bench_query_cache_5000_entries",
+}
+
 
 def _load(path: Path) -> dict[str, dict[str, Any]]:
     """Return mapping of bench name -> stats dict."""
@@ -84,6 +99,7 @@ def main() -> int:
     regressions: list[tuple[str, float, float, float]] = []
     improvements: list[tuple[str, float]] = []
     sub_floor: list[tuple[str, float, float, float]] = []
+    memory_mb: list[tuple[str, float, float, float]] = []
 
     for name in common:
         m_median = master[name]["median"]
@@ -91,7 +107,9 @@ def main() -> int:
         if m_median <= 0:
             continue
         delta = (b_median - m_median) / m_median
-        if m_median < _MICRO_FLOOR_S and b_median < _MICRO_FLOOR_S:
+        if name in MEMORY_BENCH_NAMES:
+            memory_mb.append((name, m_median, b_median, delta))
+        elif m_median < _MICRO_FLOOR_S and b_median < _MICRO_FLOOR_S:
             sub_floor.append((name, m_median, b_median, delta))
         elif delta > args.threshold:
             regressions.append((name, m_median, b_median, delta))
@@ -99,7 +117,8 @@ def main() -> int:
             improvements.append((name, delta))
 
     print(f"\nBenchmarks compared: {len(common)}")
-    print(f"Threshold: ±{args.threshold * 100:.0f}%; micro-floor: {MICRO_FLOOR_MS} ms\n")
+    print(f"Threshold: ±{args.threshold * 100:.0f}%; micro-floor: {MICRO_FLOOR_MS} ms")
+    print(f"Memory-bench wall-time pairs excluded from gate: {len(memory_mb)}\n")
 
     if improvements:
         print("Improvements (faster, no action needed):")
@@ -111,6 +130,14 @@ def main() -> int:
         print("[INFO] sub-floor microbenchmarks (noise-dominated, not gated):")
         for name, m, b, delta in sub_floor:
             print(f"  ~ {name}  median {m * 1000:.2f} -> {b * 1000:.2f} ms  ({_format_delta(delta)})")
+        print()
+
+    if memory_mb:
+        print(
+            "[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject):"
+        )
+        for name, m, b, delta in memory_mb:
+            print(f"  ~ {name}  median {m:.2f} -> {b:.2f} s  ({_format_delta(delta)})")
         print()
 
     if regressions:

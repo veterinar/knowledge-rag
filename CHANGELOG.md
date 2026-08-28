@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(ci)** — perf regression gate: for memory benches
+  (`test_bench_orchestrator_idle_rss`, `test_bench_query_cache_5000_entries`)
+  their bench-JSON median is the wall-time of `measure()` in seconds
+  (`perf_counter`; the RSS MB delta is not written to the JSON, `extra_info`
+  is empty). Wall-time of an RSS measurement with two gc.collect runs swings
+  ±14–36% on no-op diffs and is not the subject of these benches — the
+  subject (RSS) is guarded by their own absolute asserts (<50 MB / <80 MB)
+  and Pillar 3. Pairs named in the new `MEMORY_BENCH_NAMES` set are therefore
+  excluded from the fail verdict and printed as
+  `[INFO] memory-bench wall-times (seconds; RSS is asserted inside the benches, wall-time is not their subject)`
+  with medians suffixed `s`. Time pairs gate exactly as before; floor
+  and ±10% unchanged; the summary prints the count of excluded pairs.
 - **docs(criteria)** — claim-ledger pilot: sidecar `claim-ledger.v1` contract
   (per-claim versioned evidence `repo://`/`vault://`/`runtime-receipt://`/
   `web-snapshot://`, deterministic `current|stale|unresolved`, `verified`
