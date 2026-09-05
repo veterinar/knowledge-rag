@@ -20,8 +20,6 @@ docs/criteria-offline-retrieval-boundary.md, acceptance OB-1..OB-5:
   network, no real model instantiation, no live-generation mutation.
 """
 
-import socket
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,9 +32,7 @@ def _versioned(monkeypatch, tmp_path=None):
 
     monkeypatch.setattr(srv.config, "index_mode", "versioned")
     monkeypatch.setattr(srv.config, "reranker_enabled", True)
-    monkeypatch.setattr(
-        srv.config, "reranker_model", "Xenova/ms-marco-MiniLM-L-6-v2"
-    )
+    monkeypatch.setattr(srv.config, "reranker_model", "Xenova/ms-marco-MiniLM-L-6-v2")
     monkeypatch.setattr(srv.config, "models_cache_dir", str(tmp_path or "."))
     return srv
 
@@ -58,9 +54,7 @@ def _admit_artifact(monkeypatch, srv, tmp_path):
     return artifact
 
 
-def test_ob1_admitted_artifact_pins_exact_path_and_local_only(
-    monkeypatch, tmp_path
-):
+def test_ob1_admitted_artifact_pins_exact_path_and_local_only(monkeypatch, tmp_path):
     """OB-1 (admission seam only): the production TextCrossEncoder
     constructor receives the exact resolved specific_model_path and
     local_files_only=True for an admitted artifact whose tree digest
@@ -88,7 +82,7 @@ def test_ob1_digest_mismatch_blocks_constructor(monkeypatch, tmp_path):
     returns False and the constructor is never invoked; enabled versioned
     retrieval fails closed with the typed error instead."""
     srv = _versioned(monkeypatch, tmp_path)
-    artifact = _admit_artifact(monkeypatch, srv, tmp_path)
+    _admit_artifact(monkeypatch, srv, tmp_path)
     # Pin a digest of different content: same gate, mismatching identity.
     other = tmp_path / "other-artifact"
     other.mkdir()
@@ -137,9 +131,7 @@ def test_ob3_load_failure_raises_typed_error_not_rrf(monkeypatch, tmp_path):
     docs = [{"document": "first", "rrf_score": 0.5}]
     reranker = srv.CrossEncoderReranker()
 
-    with patch(
-        "mcp_server.server.TextCrossEncoder", side_effect=RuntimeError("offline")
-    ) as constructor:
+    with patch("mcp_server.server.TextCrossEncoder", side_effect=RuntimeError("offline")) as constructor:
         with pytest.raises(srv.RerankerUnavailableError, match="load failed"):
             reranker.rerank("query", docs, top_k=1)
         # Same instance, second call: still the typed fail-closed error,
@@ -160,20 +152,18 @@ def test_ob4_expand_query_is_pure_and_local(monkeypatch):
         "sqli": ["sql injection"],
         "kerberos ticket": ["kerberoasting"],
     }
-    monkeypatch.setattr(
-        "mcp_server.server.config.query_expansions", frozen, raising=False
-    )
+    monkeypatch.setattr("mcp_server.server.config.query_expansions", frozen, raising=False)
 
     index = BM25Index()
-    with patch("socket.socket") as sock, patch(
-        "socket.create_connection"
-    ) as connect, patch("subprocess.Popen") as popen, patch(
-        "subprocess.run"
-    ) as run, patch("builtins.open") as fopen, patch(
-        "mcp_server.server.TextEmbedding"
-    ) as embed, patch(
-        "mcp_server.server.TextCrossEncoder"
-    ) as rerank_model:
+    with (
+        patch("socket.socket") as sock,
+        patch("socket.create_connection") as connect,
+        patch("subprocess.Popen") as popen,
+        patch("subprocess.run") as run,
+        patch("builtins.open") as fopen,
+        patch("mcp_server.server.TextEmbedding") as embed,
+        patch("mcp_server.server.TextCrossEncoder") as rerank_model,
+    ):
         result = index.expand_query("SQLI Kerberos Ticket")
         # Second call inside the spy window proves determinism with every
         # forbidden I/O entry point still patched.
