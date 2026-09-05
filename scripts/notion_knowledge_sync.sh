@@ -27,7 +27,7 @@ mkdir -p "$VKS_ROOT" "$VKS_STAGING_DOCS"
 LOG="$VKS_ROOT/sync.log"; RECEIPTS="$VKS_ROOT/receipts.jsonl"
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(now)" "$*" >>"$LOG"; }
-receipt() { printf '%s\n' "$1" >>"$RECEIPTS"; printf '%s\n' "$1"; }
+receipt() { local r; r="{\"ts\":\"$(now)\",${1#\{}"; printf '%s\n' "$r" >>"$RECEIPTS"; printf '%s\n' "$r"; }
 server_pid() { launchctl print "gui/$(id -u)/$VKS_LAUNCHD_LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = /{print $3}' || true; }
 STEP="init"
 # shellcheck disable=SC2154  # code присваивается в trap
@@ -38,8 +38,8 @@ STEP="lock"
 if ! mkdir "$VKS_ROOT/lock" 2>/dev/null; then
   STALE_PID=$(cat "$VKS_ROOT/lock/pid" 2>/dev/null || true)
   LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$VKS_ROOT/lock") ))
-  if [ -n "$STALE_PID" ] && ! kill -0 "$STALE_PID" 2>/dev/null && [ "$LOCK_AGE" -ge "$VKS_LOCK_STALE_S" ]; then
-    rm -rf "$VKS_ROOT/lock"; log "lock: stale removed pid=$STALE_PID age=${LOCK_AGE}s"; mkdir "$VKS_ROOT/lock"
+  if [ "$LOCK_AGE" -ge "$VKS_LOCK_STALE_S" ] && { [ -z "$STALE_PID" ] || ! kill -0 "$STALE_PID" 2>/dev/null; }; then
+    rm -rf "$VKS_ROOT/lock"; log "lock: stale removed pid=${STALE_PID:-none} age=${LOCK_AGE}s"; mkdir "$VKS_ROOT/lock"
   else
     log "skip: locked pid=${STALE_PID:-<нет>} age=${LOCK_AGE}s"; receipt '{"skip":"locked"}'; exit 0
   fi
@@ -98,7 +98,7 @@ log "gate: free=${FREE_GIB}GiB >= $VKS_MIN_FREE_GIB"
 
 # 5b. корпус build читает тот же каталог: documents_dir из config.yaml
 STEP="staging_check"
-if ! grep -Eq "^[[:space:]]*documents_dir:[[:space:]]*[\"']?$VKS_STAGING_DOCS[\"']?[[:space:]]*$" "$KNOWLEDGE_RAG_DIR/config.yaml"; then
+if ! grep -Eq "^[[:space:]]*documents_dir:[[:space:]]*[\"']?${VKS_STAGING_DOCS}[\"']?[[:space:]]*$" "$KNOWLEDGE_RAG_DIR/config.yaml"; then
   log "staging: documents_dir в config.yaml != '$VKS_STAGING_DOCS'"; receipt '{"error":"staging_mismatch"}'; exit 1
 fi
 
@@ -139,7 +139,8 @@ WAITED=0; SERVED=""
 while [ "$WAITED" -lt "$VKS_VERIFY_TIMEOUT" ]; do
   ST=$(KNOWLEDGE_RAG_DIR="$KNOWLEDGE_RAG_DIR" "$VKS_GEN_CLI" status 2>>"$LOG" || true)
   PID_AFTER=$(server_pid)
-  if printf '%s' "$ST" | grep -Eq '"servable": *true' && printf '%s' "$ST" | grep -q "$GEN_ID" \
+  if printf '%s' "$ST" | grep -Eq '"servable": *true' \
+     && printf '%s' "$ST" | grep -Eq "\"generation_id\": *\"$GEN_ID\"" \
      && [ -n "$PID_AFTER" ] && [ "$PID_AFTER" != "$PID_BEFORE" ]; then
     sleep 5
     if kill -0 "$PID_AFTER" 2>/dev/null; then SERVED=1; break; fi
@@ -149,10 +150,11 @@ done
 if [ -z "$SERVED" ]; then
   log "verify: сервер не на $GEN_ID (pid ${PID_BEFORE:-?}->${PID_AFTER:-?})"; receipt '{"error":"server_pointer"}'; exit 1
 fi
+RSHA=$(printf '%s' "$ST" | sed -nE 's/.*"receipt_sha256": *"([^"]+)".*/\1/p' | head -n 1)
 T_VERIFY=$(date +%s); log "verify: servable, generation $GEN_ID, pid ${PID_BEFORE:-?}->${PID_AFTER:-?}"
 
 # 9. accept: снимок становится принятым, итоговая квитанция
 STEP="accept"
 rm -rf "$SNAP"; mv "$SNAP_NEW" "$SNAP"
-receipt "{\"ts\":\"$(now)\",\"digest_before\":\"$DIG_OLD\",\"digest_after\":\"$DIG_NEW\",\"generation_id\":\"$GEN_ID\",\"repo_snapshot\":\"$REPO_SNAP\",\"seconds\":{\"export\":$((T_EXPORT - T0)),\"bridge\":$((T_BRIDGE - T_EXPORT)),\"build\":$((T_BUILD - T_BRIDGE)),\"verify\":$((T_VERIFY - T_BUILD))}}"
+receipt "{\"digest_before\":\"$DIG_OLD\",\"digest_after\":\"$DIG_NEW\",\"generation_id\":\"$GEN_ID\",\"receipt_sha256\":\"$RSHA\",\"repo_snapshot\":\"$REPO_SNAP\",\"seconds\":{\"export\":$((T_EXPORT - T0)),\"bridge\":$((T_BRIDGE - T_EXPORT)),\"build\":$((T_BUILD - T_BRIDGE)),\"verify\":$((T_VERIFY - T_BUILD))}}"
 log "accept: $GEN_ID (repo_snapshot=$REPO_SNAP)"

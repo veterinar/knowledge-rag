@@ -54,7 +54,7 @@ cat > "$BIN/genc" <<EOF
 case "\$1" in
   build) echo "\$3" >> "$EXPORTS/build.calls"; echo "\$3" >> "$EXPORTS/built.gen" ;;
   status) [ -z "\$KNOWLEDGE_RAG_DIR" ] && { echo legacy >&2; exit 2; }
-    G=\$(tail -n 1 "$EXPORTS/built.gen" 2>/dev/null || true); [ -n "\${VKS_STATUS_GEN:-}" ] && G="\${VKS_STATUS_GEN:-}"; printf '{"servable": true, "generation_id": "%s"}\n' "\$G" ;;
+    G=\$(tail -n 1 "$EXPORTS/built.gen" 2>/dev/null || true); [ -n "\${VKS_STATUS_GEN:-}" ] && G="\${VKS_STATUS_GEN:-}"; printf '{"servable": true, "generation_id": "%s", "receipt_sha256": "stub-receipt-sha"}\n' "\$G" ;;
 esac
 EOF
 # launchctl: kickstart печатает факт; print отдаёт pid живого процесса.
@@ -105,15 +105,25 @@ check() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1"; FAILED=1; fi; 
 mkdir -p "$ROOT/lock"
 reset_calls
 run_sync
-check "S9-lock receipt" '[ "$(last_receipt)" = "{\"skip\":\"locked\"}" ]'
+check "S9-lock receipt" 'last_receipt | grep -Eq "^\{\"ts\":\"[^\"]+\",\"skip\":\"locked\"\}$"'
 check "S9-lock no-calls" '[ "$(n_calls bridge)" = 0 ] && [ "$(n_calls build)" = 0 ] && [ "$(n_calls launchctl)" = 0 ]'
 # детектор регрессии r3: при чужом локе сценарий не должен снимать каталог lock
 check "S9-lock-kept" '[ -d "$ROOT/lock" ]'
 rm -rf "$ROOT/lock"
 
+# --- S9-lock-nopid: просроченный лок без файла pid снимается -----------------
+mkdir -p "$ROOT/lock"
+reset_calls
+VKS_TEST_MARKER=nopid VKS_LOCK_STALE_S=0 run_sync
+check "S9-lock-nopid not-skipped" '! (last_receipt | grep -q "\"skip\":\"locked\"")'
+check "S9-lock-nopid lock-removed" '[ ! -d "$ROOT/lock" ]'
+rm -rf "$ROOT/lock" 2>/dev/null || true
+
 # --- прогон 1: принятие базового снимка -------------------------------------
 VKS_TEST_MARKER=base run_sync
 check "run1 receipt-gen" 'last_receipt | grep -q generation_id'
+check "run1 receipt-sha" 'last_receipt | grep -q "\"receipt_sha256\":\"stub-receipt-sha\""'
+check "run1 receipt-ts" 'last_receipt | grep -Eq "^\{\"ts\":"'
 reset_calls
 
 # --- S3: прогон 2 без содержательных изменений ------------------------------
@@ -205,7 +215,7 @@ VKS_SECRET_ENV="$TMP/notion.env" VKS_EXPORTER="$BIN/exporter" \
   bash "$SYNC" >/dev/null 2>&1
 RC5P=$?
 set -e
-check "S5-pid-stuck receipt" 'last_receipt | grep -q "{\"error\":\"server_pointer\"}"'
+check "S5-pid-stuck receipt" 'last_receipt | grep -Eq "^\{\"ts\":\"[^\"]+\",\"error\":\"server_pointer\"\}$"'
 check "S5-pid-stuck exit1" "[ \"$RC5P\" = 1 ]"
 check "S5-pid-stuck lock-released" '[ ! -e "$ROOT/lock" ]'
 
