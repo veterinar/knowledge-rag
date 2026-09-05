@@ -20,8 +20,6 @@ docs/criteria-offline-retrieval-boundary.md, acceptance OB-1..OB-5:
   network, no real model instantiation, no live-generation mutation.
 """
 
-import socket
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -88,7 +86,7 @@ def test_ob1_digest_mismatch_blocks_constructor(monkeypatch, tmp_path):
     returns False and the constructor is never invoked; enabled versioned
     retrieval fails closed with the typed error instead."""
     srv = _versioned(monkeypatch, tmp_path)
-    artifact = _admit_artifact(monkeypatch, srv, tmp_path)
+    _admit_artifact(monkeypatch, srv, tmp_path)
     # Pin a digest of different content: same gate, mismatching identity.
     other = tmp_path / "other-artifact"
     other.mkdir()
