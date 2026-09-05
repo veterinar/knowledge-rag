@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **feat(sync)** — `scripts/notion_knowledge_sync.sh`: ежечасной прогон по контракту
+  `docs/criteria-notion-hourly-sync.md` — lock → export → normalize/digest (без
+  `exported_at`/`source_commit`) → diff → disk-gate 20 ГиБ → мост `build_notion_corpus.py`
+  → build поколения → `kickstart` + verify `servable`/`generation_id` → accept;
+  квитанция JSONL на каждый исход, токен только в подпроцессе экспорта из файла 0600.
+- **feat(sync)** — `scripts/launchd/com.vetclub.notion-knowledge-sync.plist.template`
+  (`StartInterval` 3600, без `RunAtLoad`-цикла/`KeepAlive`, плейсхолдеры путей) и
+  `scripts/notion_knowledge_sync_install.sh` (`install`/`uninstall`/`status` через
+  `launchctl bootstrap`/`bootout`, установка только вручную).
+- **test(sync)** — `tests/test_notion_knowledge_sync.sh`: стендовые пробы S3
+  (unchanged, ноль вызовов), S9-change/S9-lock, S4 (disk_low), S6 (канарейка токена),
+  S5 (server_pointer); только sh-заглушки, без сети.
 - **fix(tests)** — `tests/test_offline_retrieval_boundary.py`: remove two unused imports
   (`socket`, `subprocess`) and an unused local (`artifact`) flagged by current ruff (F401, F841);
   apply `ruff format` to that file and to one f-string in `mcp_server/server.py` so the
