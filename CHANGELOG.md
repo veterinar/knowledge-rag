@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(tests)** — `tests/test_offline_retrieval_boundary.py`: remove two unused imports
+  (`socket`, `subprocess`) and an unused local (`artifact`) flagged by current ruff (F401, F841);
+  apply `ruff format` to that file and to one f-string in `mcp_server/server.py` so the
+  Lint & Format job is green again on master. No behaviour change.
 - **fix(ci)** — perf regression gate: for memory benches
   (`test_bench_orchestrator_idle_rss`, `test_bench_query_cache_5000_entries`)
   their bench-JSON median is the wall-time of `measure()` in seconds
