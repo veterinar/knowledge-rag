@@ -852,8 +852,7 @@ class CrossEncoderReranker:
             # sticky flag silently degrade the reranker to RRF order.
             if self._load_failure is not None and _versioned_mode() and config.reranker_enabled:
                 raise RerankerUnavailableError(
-                    "versioned reranker load failed (enabled in config, "
-                    f"previous failure): {self._load_failure}"
+                    f"versioned reranker load failed (enabled in config, previous failure): {self._load_failure}"
                 ) from self._load_failure
             return False
         if self._model is None:
