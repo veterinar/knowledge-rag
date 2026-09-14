@@ -5956,6 +5956,8 @@ def get_index_stats() -> str:
                 "receipt_sha256": summary.get("receipt_sha256"),
                 "schema_version": summary.get("schema_version"),
                 "servable": summary.get("servable"),
+                "policy_valid": summary.get("policy_valid"),
+                "source_policy": summary.get("source_policy"),
                 "created_at": summary.get("created_at"),
                 "backends": summary.get("backends"),
             }

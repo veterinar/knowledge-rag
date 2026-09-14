@@ -200,7 +200,9 @@ def stage_generation(
         target_dir = building / rel
         target_dir.mkdir(parents=True, exist_ok=True)
         for name, blob in payload.items():
-            (target_dir / name).write_bytes(blob)
+            target = target_dir / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob)
     (building / gens.FTS_ARTIFACT).write_bytes(fts)
     (building / gens.FTS_STATE_ARTIFACT).write_bytes(fts_state)
     (building / gens.METADATA_ARTIFACT).write_bytes(metadata)
@@ -220,6 +222,9 @@ def publish_generation(
     chroma_evidence: dict | None = None,
     fts_evidence: dict | None = None,
     provenance: dict | None = None,
+    # None => omit (legacy); "derive" => build from the staged sealed corpus;
+    # a dict => the caller's exact (possibly mutated) policy block.
+    source_policy: dict | str | None = None,
     created_at: str | None = None,
 ) -> gens.ActivationResult:
     """Publish a well-formed generation.
@@ -281,6 +286,11 @@ def publish_generation(
             fts_evidence=fts_ev() if fts_evidence is None else fts_evidence,
             provenance=provenance,
             expected_current=expected_current,
+            source_policy=(
+                gens.build_source_policy(building / gens.CORPUS_ARTIFACT)
+                if source_policy == "derive"
+                else (source_policy if source_policy is not None else None)
+            ),
             created_at=created_at,
         )
 
@@ -1528,6 +1538,99 @@ def test_v2_receipt_is_inspectable_but_never_servable(store, tmp_path):
     assert summary["schema_version"] == 2
     assert summary["servable"] is False
     assert summary["reason"] == "schema_v2_rebuild_required"
+
+
+def test_mixed_generation_source_policy_contract(store, tmp_path, monkeypatch):
+    """Valid two-namespace policy reaches the real ``_build_command`` publish
+    seam; source/category admission failures fail closed with the pointer
+    untouched; legacy v3 receipts without a policy stay servable."""
+    from types import SimpleNamespace as NS
+
+    from mcp_server import generation_cli as cli
+
+    corpus = {"vault-vet/x.md": b"# vx\n", "vault-vet/sub/y.md": b"# vy\n", "notion-vet/z.md": b"# nz\n"}
+    good_meta = {f"d{i}": {"source": s, "category": c} for i, (s, c) in enumerate(
+        [("vault-vet/x.md", "vault-vet"), ("vault-vet/sub/y.md", "vault-vet"), ("notion-vet/z.md", "notion-vet")])}
+
+    def run_cli(gid, metadata):
+        """Real ``_build_command`` on a nested corpus; only population,
+        backend evidence, config identity and the store seam are patched."""
+        src = tmp_path / "src"
+        for rel, blob in corpus.items():
+            (src / rel).parent.mkdir(parents=True, exist_ok=True)
+            (src / rel).write_bytes(blob)
+        staging = tmp_path / "data" / f".building-{gid}"
+        staging.mkdir(parents=True)
+        (staging / "index_metadata.json").write_bytes(json.dumps(metadata).encode() + b"\n")
+        cfg = dict(index_mode="versioned", data_dir=str(tmp_path / "data"), source_documents_dir=str(src),
+                   supported_formats=[".md"], exclude_patterns=[], collection_name="knowledge_rag_v1",
+                   category_mappings={"vault-vet/": "vault-vet", "notion-vet/": "notion-vet"},
+                   generation_compatibility=lambda: {"model_artifact_sha256": HEX("model-artifact-v1")}, active_generation_id=None)
+        monkeypatch.setattr(cli, "config", NS(**cfg))
+        captured: dict = {}
+
+        fake = NS(
+            current_identity=lambda: None,
+            begin_build=lambda g: staging,
+            publish=lambda g, **kw: captured.__setitem__("publish", kw) or NS(receipt_sha256=HEX("receipt"), to_dict=lambda: {}),
+            abort_build=lambda g: captured.__setitem__("aborted", g),
+        )
+        monkeypatch.setattr(cli, "GenerationStore", lambda *a, **k: fake)
+        monkeypatch.setattr(cli, "_run_population_child", lambda s, g: {"docs": 3, "chunks": 3, "row_count": 3})
+        monkeypatch.setattr(cli, "_chroma_evidence_from_staging", lambda s: {"row_count": 3, "common_row_digest": HEX("c"), "row_digest": HEX("c")})
+        monkeypatch.setattr(cli, "_fts_evidence_from_staging", lambda s, c, r: {"row_count": r, "row_digest": c})
+        monkeypatch.setattr(cli, "generation_identity", lambda c, corpus_manifest_sha256: dict(IDENTITY, corpus_manifest_sha256=corpus_manifest_sha256))
+        monkeypatch.setattr(cli, "vault_head_or_none", lambda p: None)
+        return captured, NS(generation_id=gid)
+
+    # a valid two-namespace policy reaches the REAL _build_command publish seam (S8)
+    captured, args = run_cli("g2", good_meta)
+    assert cli._build_command(args) == 0
+    pol = captured["publish"]["source_policy"]
+    assert pol["schema_version"] == 1 and pol["count"] == 3 and pol["policy_sha256"] == gens.source_policy_digest()
+    v, n = pol["manifest"]["vault-vet"], pol["manifest"]["notion-vet"]
+    assert (v["path_prefix"], v["project_identity"], v["category"], v["count"]) == ("vault-vet/", None, "vault-vet", 2)
+    assert (n["path_prefix"], n["project_identity"], n["category"], n["count"]) == ("notion-vet/", "vetpilot", "notion-vet", 1)
+    # a staged reserved-namespace source resolved to a wrong category aborts before publish
+    captured, args = run_cli("g4", {"d1": {"source": "vault-vet/x.md", "category": "general"}})
+    with pytest.raises(SystemExit):
+        cli._build_command(args)
+    assert "publish" not in captured and captured["aborted"] == "g4"
+
+    # the real store publishes the same policy and the status seam stays path-free (S7)
+    result = publish_generation(store, "g1", corpus=corpus, provenance={"vault_head": None}, source_policy="derive")
+    assert result.receipt["source_policy"] == pol == gens.build_source_policy(store.generations_dir / "g1" / gens.CORPUS_ARTIFACT)
+    summary = gens.inspect_current_receipt(store.root)
+    assert summary["servable"] and summary["policy_valid"] and summary["source_policy"]["count"] == 3
+    assert not any(p in json.dumps(summary) for p in ("x.md", "sub/y.md", "z.md"))
+
+    # admission failures fail closed; the pointer stays byte-identical (S1/S3)
+    pointer = store.current_path.read_bytes()
+    scratch = store.begin_build("g0")
+    stage_generation(scratch, corpus=corpus)
+    base = gens.build_source_policy(scratch / gens.CORPUS_ARTIFACT)
+    store.abort_build("g0")
+    mutators = [
+        lambda p: p["manifest"]["vault-vet"].__setitem__("path_prefix", "vault-vet-x/"),
+        lambda p: p.__setitem__("count", p["count"] + 1),
+        lambda p: p["manifest"]["vault-vet"].__setitem__("manifest_sha256", HEX("wrong-digest")),
+        lambda p: p.__setitem__("policy_sha256", HEX("wrong-policy-digest")),
+    ]
+    for i, mutate in enumerate(mutators):
+        policy = json.loads(json.dumps(base))
+        mutate(policy)
+        with pytest.raises(VerificationError):
+            publish_generation(store, f"bad-m{i}", corpus=corpus, provenance={"vault_head": None}, source_policy=policy)
+    with pytest.raises(VerificationError):  # mixed corpus, policy omitted
+        publish_generation(store, "bad-none", corpus=corpus, provenance={"vault_head": None}, source_policy=None)
+    assert store.current_path.read_bytes() == pointer
+
+    # legacy v3 compatibility: no reserved path => no policy, still servable
+    publish_generation(store, "g9", expected_current="g1")
+    receipt = json.loads((store.generations_dir / "g9" / gens.RECEIPT_FILENAME).read_bytes())
+    assert "source_policy" not in receipt
+    legacy = gens.inspect_current_receipt(store.root)
+    assert legacy["servable"] is True and legacy["policy_valid"] is False and legacy["source_policy"] is None
 
 
 def test_backend_generation_ids_required_and_bound(store):
