@@ -89,12 +89,12 @@ from mcp_server.generations import (  # noqa: E402
     FTS_ARTIFACT,
     FTS_STATE_ARTIFACT,
     METADATA_ARTIFACT,
+    SOURCE_NAMESPACE_PRESET,
     CommitStateUncertainError,
     CurrentConflictError,
     DependencyUnverifiableError,
     GenerationError,
     GenerationStore,
-    SOURCE_NAMESPACE_PRESET,
     _namespace_of,
     _reserved_category_for,
     build_source_policy,
@@ -638,7 +638,7 @@ def _build_command(args: argparse.Namespace) -> int:
                 raise SystemExit(
                     "[GENERATION] staged index_metadata.json source set is not exactly "
                     "the sealed corpus relative-path set "
-                    f"(duplicate/missing/extra/unknown sources) — refusing to publish"
+                    "(duplicate/missing/extra/unknown sources) — refusing to publish"
                 )
             for _doc_id, info in sorted(metadata.items()):
                 rel_source = str(info.get("source", ""))
