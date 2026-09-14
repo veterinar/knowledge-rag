@@ -89,11 +89,15 @@ from mcp_server.generations import (  # noqa: E402
     FTS_ARTIFACT,
     FTS_STATE_ARTIFACT,
     METADATA_ARTIFACT,
+    SOURCE_NAMESPACE_PRESET,
     CommitStateUncertainError,
     CurrentConflictError,
     DependencyUnverifiableError,
     GenerationError,
     GenerationStore,
+    _namespace_of,
+    _reserved_category_for,
+    build_source_policy,
     corpus_manifest_digest,
     corpus_manifest_entries,
     generation_identity,
@@ -559,6 +563,18 @@ def _build_command(args: argparse.Namespace) -> int:
             f"code={identity_before['code_sha256'][:12]}..., lock={identity_before['dependency_lock_sha256'][:12]}...)"
         )
 
+        # -- pre-population reserved-category coverage (S2): when the sealed
+        # corpus proves reserved namespace paths, the PARSED category mapping
+        # must resolve BOTH reserved prefixes to their exact reserved
+        # categories BEFORE the expensive child population runs.
+        # ``_reserved_category_for`` raises when the mapping resolves a
+        # reserved prefix to anything else (including the implicit
+        # ``general`` when the mapping does not cover it).
+        if any(_namespace_of(rel) is not None for rel, _sha in sealed):
+            pre_mappings = dict(getattr(config, "category_mappings", None) or {})
+            for _ns, (_prefix, _identity, _reserved) in sorted(SOURCE_NAMESPACE_PRESET.items()):
+                _reserved_category_for(_prefix, pre_mappings)
+
         # -- population (isolated child; all writer handles die) ------------
         pop = _run_population_child(staging, gid)
         _print(
@@ -601,6 +617,48 @@ def _build_command(args: argparse.Namespace) -> int:
         if compat_after != compat_before:
             raise SystemExit("[GENERATION] compatibility changed during population — aborting")
 
+        # -- source policy (S1/S2/S8): derive from the SEALED staged corpus
+        # entry set (the same admitted set bound by the receipt's
+        # corpus_manifest_sha256), and hard-fail when the staged population
+        # output resolves any reserved-namespace file to a non-reserved
+        # category through the PARSED category mapping. A corpus with no
+        # reserved namespace path is a legacy build and carries no policy.
+        staged_entries = _sealed_manifest(staging)
+        has_reserved = any(_namespace_of(rel) is not None for rel, _sha in staged_entries)
+        source_policy = None
+        if has_reserved:
+            source_policy = build_source_policy(staging / CORPUS_ARTIFACT, staged_entries)
+            category_mappings = dict(getattr(config, "category_mappings", None) or {})
+            # Exact one-to-one relation (S2): every sealed corpus path has
+            # exactly one metadata record — duplicate, missing, extra, or
+            # unknown sources fail closed BEFORE publish.
+            sealed_paths = sorted(rel for rel, _sha in staged_entries)
+            recorded_sources = sorted(str(info.get("source", "")) for info in metadata.values())
+            if len(recorded_sources) != len(metadata) or recorded_sources != sealed_paths:
+                raise SystemExit(
+                    "[GENERATION] staged index_metadata.json source set is not exactly "
+                    "the sealed corpus relative-path set "
+                    "(duplicate/missing/extra/unknown sources) — refusing to publish"
+                )
+            for _doc_id, info in sorted(metadata.items()):
+                rel_source = str(info.get("source", ""))
+                if _namespace_of(rel_source) is None:
+                    continue
+                reserved = _reserved_category_for(rel_source, category_mappings)
+                recorded = info.get("category")
+                if recorded != reserved:
+                    raise SystemExit(
+                        f"[GENERATION] staged population resolved reserved-namespace file "
+                        f"{rel_source!r} to category {recorded!r} instead of the reserved "
+                        f"{reserved!r} — refusing to publish"
+                    )
+            _print(
+                "[GENERATION] source policy bound: "
+                f"count={source_policy['count']} "
+                f"(vault-vet={source_policy['manifest']['vault-vet']['count']}, "
+                f"notion-vet={source_policy['manifest']['notion-vet']['count']})"
+            )
+
         # -- publish with the PRE-POPULATION snapshot (never later bytes) ----
         activation = store.publish(
             gid,
@@ -610,6 +668,7 @@ def _build_command(args: argparse.Namespace) -> int:
             fts_evidence=fts_evidence,
             provenance=provenance_before,
             expected_current=expected_current,
+            source_policy=source_policy,
         )
         _print(
             f"[GENERATION] published + activated {gid} "

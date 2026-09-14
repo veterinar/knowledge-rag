@@ -251,6 +251,10 @@ _RECEIPT_KEYS = frozenset(
         "compatibility",
         "artifacts",
         "backends",
+        # Additive v3 extension (mixed Vault + Notion generations): optional,
+        # STRICTLY validated content-bound source policy. A legacy v3 receipt
+        # without reserved namespace paths keeps its historical exact keys.
+        "source_policy",
     }
 )
 # provenance: vault Git HEAD (nullable ONLY when the source is provably not a
@@ -760,6 +764,258 @@ def corpus_manifest(
     """(digest, entry_count) of a corpus tree under the canonical algorithm."""
     entries = corpus_manifest_entries(root, supported_suffixes=supported_suffixes, exclude_patterns=exclude_patterns)
     return corpus_manifest_digest(entries), len(entries)
+
+
+# ============================================================================
+# Source policy for mixed Vault + Notion generations (schema v3, additive).
+#
+# A mixed generation's staged corpus artifact carries exactly two reserved
+# namespace directories: ``vault-vet/`` and ``notion-vet/``. The producer
+# derives a content-bound ``source_policy`` block from the SAME admitted
+# corpus entry set that binds ``identity.corpus_manifest_sha256`` (never a
+# directory count or an external sidecar) and the receipt validates it
+# strictly. Per-namespace digests reuse the ONE canonical corpus-manifest
+# algorithm over namespace-relative entries; ``policy_sha256`` is the stable
+# canonical digest of exactly the sorted identity records (no counts, no
+# per-namespace manifest digests). A legacy v3 receipt without reserved
+# namespace paths remains valid with its historical exact keys; a corpus
+# that proves BOTH reserved prefixes MUST carry a complete policy.
+# ============================================================================
+
+SOURCE_POLICY_SCHEMA_VERSION = 1
+SOURCE_POLICY_KEY = "source_policy"
+
+# The closed producer preset: namespace -> (path_prefix, project_identity,
+# reserved category). ``vault-vet`` has NO owner-bound project identity
+# (``None``); ``notion-vet`` carries the literal ``vetpilot`` identity.
+SOURCE_NAMESPACE_PRESET: Dict[str, Tuple[str, Optional[str], str]] = {
+    "vault-vet": ("vault-vet/", None, "vault-vet"),
+    "notion-vet": ("notion-vet/", "vetpilot", "notion-vet"),
+}
+_SOURCE_POLICY_KEYS = frozenset({"schema_version", "policy_sha256", "count", "manifest"})
+_SOURCE_MANIFEST_KEYS = frozenset({"path_prefix", "project_identity", "category", "count", "manifest_sha256"})
+
+
+def _namespace_of(rel_posix: str) -> Optional[str]:
+    """Reserved namespace of an admitted relative POSIX path, boundary-aware.
+
+    A path belongs to namespace ``N`` iff it starts with ``N + "/"`` — a
+    path-boundary check, never a substring match (``vault-vet-evil/x.md``
+    matches NO namespace).
+    """
+    for namespace, (prefix, _identity, _category) in SOURCE_NAMESPACE_PRESET.items():
+        if rel_posix.startswith(prefix):
+            return namespace
+    return None
+
+
+def source_policy_identity_records() -> List[Dict[str, Any]]:
+    """Sorted closed-preset identity records ``{namespace, path_prefix,
+    category, project_identity}`` (the exact ``policy_sha256`` preimage)."""
+    return [
+        {
+            "namespace": namespace,
+            "path_prefix": prefix,
+            "category": category,
+            "project_identity": identity,
+        }
+        for namespace, (prefix, identity, category) in sorted(SOURCE_NAMESPACE_PRESET.items())
+    ]
+
+
+def source_policy_digest() -> str:
+    """Canonical SHA-256 of exactly the sorted identity records.
+
+    Uses the ONE shared stable-JSON digest helper — never a second ad-hoc
+    digest algorithm. Excludes all counts and per-namespace manifest digests
+    by construction (they are not in the preimage).
+    """
+    return _stable_json_digest(source_policy_identity_records())
+
+
+def build_source_policy(
+    corpus_root: Path,
+    entries: Optional[List[Tuple[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Derive the receipt ``source_policy`` from the admitted corpus set.
+
+    ``entries`` (when given) is the SAME canonical
+    :func:`corpus_manifest_entries` output that binds
+    ``identity.corpus_manifest_sha256`` — the S1 guarantee: one admitted set,
+    one derivation. When omitted, it is recomputed from ``corpus_root``
+    (production convenience; the builder always passes the sealed set).
+
+    Fail-closed rules:
+    * every admitted path must live under exactly one reserved namespace
+      (root files and unknown directories such as ``vault-vet-evil/`` are
+      rejected — the corpus is mixed and must be exactly the two namespaces);
+    * each namespace-relative entry set must be non-empty and duplicate-free
+      (``corpus_manifest_digest`` itself rejects duplicate relative paths);
+    * per-namespace ``manifest_sha256`` reuses the canonical
+      corpus-manifest algorithm over namespace-relative entries
+      (prefix stripped; the identity's ``path_prefix`` separately binds the
+      boundary).
+    """
+    if entries is None:
+        entries = corpus_manifest_entries(corpus_root)
+    by_ns: Dict[str, List[Tuple[str, str]]] = {ns: [] for ns in SOURCE_NAMESPACE_PRESET}
+    seen: Set[str] = set()
+    for rel, sha in entries:
+        if rel in seen:
+            raise VerificationError(f"duplicate admitted corpus entry: {rel}")
+        seen.add(rel)
+        namespace = _namespace_of(rel)
+        if namespace is None:
+            raise VerificationError(
+                f"mixed-generation corpus entry outside the reserved namespaces "
+                f"{sorted(SOURCE_NAMESPACE_PRESET)}: {rel!r}"
+            )
+        prefix = SOURCE_NAMESPACE_PRESET[namespace][0]
+        by_ns[namespace].append((rel[len(prefix) :], sha))
+    manifest: Dict[str, Dict[str, Any]] = {}
+    for namespace, (prefix, identity, category) in sorted(SOURCE_NAMESPACE_PRESET.items()):
+        ns_entries = by_ns[namespace]
+        if not ns_entries:
+            raise VerificationError(
+                f"mixed-generation corpus is missing the reserved namespace {namespace!r} (path_prefix {prefix!r})"
+            )
+        manifest[namespace] = {
+            "path_prefix": prefix,
+            "project_identity": identity,
+            "category": category,
+            "count": len(ns_entries),
+            "manifest_sha256": corpus_manifest_digest(ns_entries),
+        }
+    return {
+        "schema_version": SOURCE_POLICY_SCHEMA_VERSION,
+        "policy_sha256": source_policy_digest(),
+        "count": sum(m["count"] for m in manifest.values()),
+        "manifest": manifest,
+    }
+
+
+def _validate_source_policy(policy: Any) -> Dict[str, Any]:
+    """Strict structural validation of a receipt ``source_policy`` block.
+
+    Rejects missing/malformed/extra fields, wrong schema version, a
+    non-hex64 policy/manifest digest, a count that is not the sum of
+    namespace counts, and any deviation of the identity records from the
+    closed producer preset (prefix, category, project identity — the
+    ``policy_sha256`` canonical digest binds exactly those, so a reordering
+    or mutation that changes the canonical identity digest is rejected).
+    """
+    where = "receipt source_policy"
+    if not isinstance(policy, dict) or set(policy) != set(_SOURCE_POLICY_KEYS):
+        got = sorted(policy) if isinstance(policy, dict) else type(policy).__name__
+        raise VerificationError(f"{where} must be an object with exactly {sorted(_SOURCE_POLICY_KEYS)}, got: {got}")
+    version = policy["schema_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != SOURCE_POLICY_SCHEMA_VERSION:
+        raise VerificationError(f"{where} schema_version must be {SOURCE_POLICY_SCHEMA_VERSION}, got {version!r}")
+    _require_hex64(policy["policy_sha256"], f"{where} policy_sha256")
+    total = policy["count"]
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise VerificationError(f"{where} count must be a nonnegative integer, got {total!r}")
+    manifest = policy["manifest"]
+    if not isinstance(manifest, dict) or set(manifest) != set(SOURCE_NAMESPACE_PRESET):
+        got = sorted(manifest) if isinstance(manifest, dict) else type(manifest).__name__
+        raise VerificationError(
+            f"{where} manifest must be keyed by exactly {sorted(SOURCE_NAMESPACE_PRESET)}, got: {got}"
+        )
+    for namespace, (prefix, identity, category) in sorted(SOURCE_NAMESPACE_PRESET.items()):
+        rec = manifest[namespace]
+        nwhere = f"{where} manifest[{namespace!r}]"
+        if not isinstance(rec, dict) or set(rec) != set(_SOURCE_MANIFEST_KEYS):
+            got = sorted(rec) if isinstance(rec, dict) else type(rec).__name__
+            raise VerificationError(f"{nwhere} must have exactly {sorted(_SOURCE_MANIFEST_KEYS)}, got: {got}")
+        if rec["path_prefix"] != prefix:
+            raise VerificationError(f"{nwhere} path_prefix must be {prefix!r}, got {rec['path_prefix']!r}")
+        if rec["category"] != category:
+            raise VerificationError(f"{nwhere} category must be {category!r}, got {rec['category']!r}")
+        if rec["project_identity"] != identity:
+            raise VerificationError(f"{nwhere} project_identity must be {identity!r}, got {rec['project_identity']!r}")
+        count = rec["count"]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise VerificationError(f"{nwhere} count must be a nonnegative integer, got {count!r}")
+        _require_hex64(rec["manifest_sha256"], f"{nwhere} manifest_sha256")
+    if total != sum(manifest[ns]["count"] for ns in SOURCE_NAMESPACE_PRESET):
+        raise VerificationError(
+            f"{where} count {total} != sum of namespace counts "
+            f"{sum(manifest[ns]['count'] for ns in SOURCE_NAMESPACE_PRESET)}"
+        )
+    # The canonical identity digest binds namespace/prefix/category/identity
+    # for BOTH records; any preset deviation above already failed, and this
+    # cross-check rejects any digest that does not match the closed preset.
+    if policy["policy_sha256"] != source_policy_digest():
+        raise VerificationError(f"{where} policy_sha256 does not match the canonical closed-preset identity digest")
+    return policy
+
+
+def _reserved_category_for(rel_posix: str, category_mappings: Dict[str, str]) -> Optional[str]:
+    """Resolve an admitted path's category through the EXISTING mapping
+    pipeline semantics (longest-pattern-first substring match on the lower
+    relative POSIX path — mirrors ``ingestion.DocumentParser._detect_category``)
+    and require it to equal the reserved category of the path's namespace.
+
+    Boundary awareness comes from ``_namespace_of`` (prefix ``N + "/"``), so
+    ``vault-vet-evil/x.md`` belongs to NO namespace and never reaches this
+    check. Returns the reserved category when the mapping agrees, ``None``
+    when the path is outside the reserved namespaces, and raises on a
+    configured mapping that resolves a reserved-namespace file to a DIFFERENT
+    category (hard pre-publication failure, S2).
+    """
+    namespace = _namespace_of(rel_posix)
+    if namespace is None:
+        return None
+    reserved = SOURCE_NAMESPACE_PRESET[namespace][2]
+    path_str = rel_posix.lower()
+    resolved: Optional[str] = None
+    for path_pattern, category in sorted(category_mappings.items(), key=lambda x: len(x[0]), reverse=True):
+        if path_pattern in path_str:
+            resolved = category
+            break
+    if resolved is None:
+        resolved = "general"
+    if resolved != reserved:
+        raise VerificationError(
+            f"category mapping resolves reserved-namespace file {rel_posix!r} to "
+            f"{resolved!r} instead of the reserved category {reserved!r}"
+        )
+    return reserved
+
+
+def _crossbind_source_policy(gdir: Path, receipt: Dict[str, Any]) -> None:
+    """Bind the receipt's optional ``source_policy`` to the SEALED corpus tree.
+
+    The verification seam (S3): re-derive the admitted entry set from the
+    sealed ``corpus/`` artifact with the ONE canonical selector and require:
+
+    * ANY reserved-namespace path => the receipt MUST carry ``source_policy``
+      (a Tool Plane consumer fails closed on its absence);
+    * a policy-bearing receipt must match the COMPLETE re-derived policy
+      exactly (prefix coverage, per-namespace counts, per-namespace manifest
+      digests — ``build_source_policy`` re-raises on partial coverage);
+    * a corpus with NO reserved namespace path is a legacy v3 receipt and
+      must NOT carry ``source_policy``.
+
+    Read-only: hashes the sealed corpus tree; never mutates anything.
+    """
+    entries = corpus_manifest_entries(gdir / CORPUS_ARTIFACT)
+    has_reserved = any(_namespace_of(rel) is not None for rel, _sha in entries)
+    has_policy = SOURCE_POLICY_KEY in receipt
+    if has_reserved:
+        if not has_policy:
+            raise VerificationError(
+                "sealed corpus proves reserved namespace paths but the receipt carries no source_policy"
+            )
+        _validate_source_policy(receipt[SOURCE_POLICY_KEY])
+        expected = build_source_policy(gdir / CORPUS_ARTIFACT, entries)
+        if receipt[SOURCE_POLICY_KEY] != expected:
+            raise VerificationError(
+                "receipt source_policy disagrees with the sealed corpus tree "
+                "(prefix coverage, namespace counts, or manifest digests)"
+            )
+    elif has_policy:
+        raise VerificationError("receipt carries source_policy but the sealed corpus proves no reserved namespace path")
 
 
 def _stable_json_digest(payload: Any) -> str:
@@ -1877,14 +2133,49 @@ def inspect_current_receipt(root: Path) -> Optional[Dict[str, Any]]:
     backends = receipt.get("backends") or {}
     chroma_ev = backends.get("chroma") or {}
     fts_ev = backends.get("fts5") or {}
+    # S7: expose ONLY the validated source policy — identity records plus
+    # dynamic counts/manifest digests. A malformed policy can never be
+    # reported as valid; no raw paths, provenance, or caller scope leak.
+    # Legacy unscoped v3 receipts (no reserved namespace path, no policy)
+    # stay servable=True for legacy flows — they carry policy_valid=False so
+    # the new Tool Plane admission can fail closed on them.
+    policy = receipt.get(SOURCE_POLICY_KEY)
+    policy_valid = False
+    if policy is not None:
+        try:
+            _validate_source_policy(policy)
+            policy_valid = True
+        except GenerationError:
+            policy = None
+    v3 = version == RECEIPT_SCHEMA_VERSION
     return {
         "schema_version": version if isinstance(version, int) else None,
         "generation_id": receipt.get("generation_id"),
         "receipt_sha256": pointer.get("receipt_sha256"),
         "created_at": receipt.get("created_at"),
         "status": receipt.get("status"),
-        "servable": version == RECEIPT_SCHEMA_VERSION,
-        "reason": None if version == RECEIPT_SCHEMA_VERSION else "schema_v2_rebuild_required",
+        "servable": v3,
+        "policy_valid": policy_valid,
+        "reason": None if v3 else "schema_v2_rebuild_required",
+        "source_policy": (
+            {
+                "schema_version": policy["schema_version"],
+                "policy_sha256": policy["policy_sha256"],
+                "count": policy["count"],
+                "manifest": {
+                    ns: {
+                        "path_prefix": rec["path_prefix"],
+                        "project_identity": rec["project_identity"],
+                        "category": rec["category"],
+                        "count": rec["count"],
+                        "manifest_sha256": rec["manifest_sha256"],
+                    }
+                    for ns, rec in policy["manifest"].items()
+                },
+            }
+            if policy is not None
+            else None
+        ),
         "identity": {
             key: (str(value)[:12] + "...") if isinstance(value, str) and len(value) > 12 else value
             for key, value in ident.items()
@@ -2417,6 +2708,7 @@ class GenerationStore:
         provenance: Optional[Dict[str, Any]] = None,
         expected_current: Union[None, Dict[str, str], str] = None,
         created_at: Optional[str] = None,
+        source_policy: Optional[Dict[str, Any]] = None,
     ) -> ActivationResult:
         """Seal a staged generation and CAS-switch ``current`` to it.
 
@@ -2523,10 +2815,19 @@ class GenerationStore:
                 "artifacts": artifacts,
                 "backends": {"chroma": chroma_ev, "fts5": fts_ev},
             }
+            if source_policy is not None:
+                # Additive v3 extension: the content-bound source policy is
+                # part of the assembled receipt bytes (and therefore of the
+                # receipt SHA and the CAS swap) — never a separate anchor.
+                receipt[SOURCE_POLICY_KEY] = source_policy
 
             # Validate the ASSEMBLED receipt (schema, compatibility, parity,
             # canonical UTC created_at) BEFORE any fsync / rename / CAS step.
             self._validate_receipt(receipt, gid)
+            # Bind the optional source_policy to the STAGED sealed corpus
+            # bytes (S3): presence/absence must match the reserved namespace
+            # coverage, and a carried policy must equal the re-derived one.
+            _crossbind_source_policy(building, receipt)
             payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode("utf-8")
             if len(payload) > _MAX_RECEIPT_BYTES:
                 raise VerificationError(
@@ -2859,6 +3160,9 @@ class GenerationStore:
 
         receipt = self._read_receipt(gdir, gid)
         self._validate_receipt(receipt, gid)
+        # Re-derive the source policy from the SEALED corpus tree and require
+        # it to agree with the receipt (reserved coverage, counts, digests).
+        _crossbind_source_policy(gdir, receipt)
 
         for name, meta in receipt["artifacts"].items():
             digest, count = self._artifact_on_disk(gdir, name, meta)
@@ -2908,9 +3212,16 @@ class GenerationStore:
         set) — they remain INSPECTABLE through the lenient status reader
         only and must be rebuilt, never served/activated/rolled back.
         """
-        if not isinstance(receipt, dict) or set(receipt) != set(_RECEIPT_KEYS):
+        # Exact key set: the legacy v3 keys, or exactly those plus the
+        # optional ``source_policy`` extension. Missing mandatory keys and
+        # unknown keys are both rejected (an unknown-keys-only check is
+        # insufficient — a receipt that dropped a mandatory key must fail).
+        legacy_keys = _RECEIPT_KEYS - {SOURCE_POLICY_KEY}
+        if not isinstance(receipt, dict) or (set(receipt) != legacy_keys and set(receipt) != _RECEIPT_KEYS):
             got = sorted(receipt) if isinstance(receipt, dict) else type(receipt).__name__
-            raise VerificationError(f"receipt must be an object with exactly {sorted(_RECEIPT_KEYS)}, got: {got}")
+            raise VerificationError(
+                f"receipt keys must be exactly {sorted(legacy_keys)} or that set plus {SOURCE_POLICY_KEY!r}, got: {got}"
+            )
         version = receipt["schema_version"]
         if isinstance(version, bool) or not isinstance(version, int) or version != RECEIPT_SCHEMA_VERSION:
             raise VerificationError(f"unsupported receipt schema_version: {version!r} (want {RECEIPT_SCHEMA_VERSION})")
@@ -2975,6 +3286,11 @@ class GenerationStore:
         fts_ev = _validate_fts_evidence(backends["fts5"])
         _require_backend_parity(chroma_ev, fts_ev)
         _bind_collection_name(compat, chroma_ev)
+        # Strict structural validation of the OPTIONAL source_policy block.
+        # The corpus-bound cross-check (reserved presence vs. sealed bytes)
+        # lives at the disk-verification seams (_crossbind_source_policy).
+        if SOURCE_POLICY_KEY in receipt:
+            _validate_source_policy(receipt[SOURCE_POLICY_KEY])
 
     def _artifact_on_disk(self, gdir: Path, name: str, meta: Dict[str, Any]) -> Tuple[str, int]:
         """Recompute an artifact's (digest, count) from disk with strict typing."""
@@ -3049,6 +3365,9 @@ class GenerationStore:
                 )
             receipt = json.loads(payload.decode("utf-8"))
             self._validate_receipt(receipt, gid)
+            # The current pointer's receipt must prove its optional source
+            # policy against the sealed corpus bytes (fail-closed read).
+            _crossbind_source_policy(gdir, receipt)
             expected_block: Optional[Dict[str, Any]] = None
             if expected_identity is not None:
                 if isinstance(expected_identity, dict) and set(expected_identity) == set(_POINTER_KEYS):

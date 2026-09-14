@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(generation)** — mixed-generation source-policy admission now validates
+  exact staged-corpus/metadata coverage and reserved categories while preserving
+  legacy v3 receipt compatibility.
 - **feat(sync)** — `scripts/notion_knowledge_sync.sh`: ежечасной прогон по контракту
   `docs/criteria-notion-hourly-sync.md` — lock → export → normalize/digest (без
   `exported_at`/`source_commit`) → diff → disk-gate 20 ГиБ → мост `build_notion_corpus.py`
