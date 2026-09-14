@@ -12,8 +12,8 @@ VKS_STAGING_DOCS="${VKS_STAGING_DOCS:-$HOME/.local/share/vetclub-knowledge-rag/s
 VKS_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VKS_PYTHON="${VKS_PYTHON:-/usr/bin/python3}"  # мост — только stdlib
 VKS_BRIDGE="${VKS_BRIDGE:-$VKS_PYTHON $VKS_SCRIPT_DIR/build_notion_corpus.py}"
-VKS_GEN_CLI="${VKS_GEN_CLI:-$HOME/.local/share/vetclub-knowledge-rag-runtimes/4.9.1-7d47b03/venv/bin/knowledge-rag-generation}"
-KNOWLEDGE_RAG_DIR="${KNOWLEDGE_RAG_DIR:-$HOME/.local/share/vetclub-knowledge-rag/staging-reseal-20260828-pages-7d47b03/config}"
+VKS_GEN_CLI="${VKS_GEN_CLI:-$HOME/.local/share/vetclub-knowledge-rag-runtimes/4.9.1-092f671/venv/bin/knowledge-rag-generation}"
+KNOWLEDGE_RAG_DIR="${KNOWLEDGE_RAG_DIR:-$HOME/.local/share/vetclub-knowledge-rag-runtimes/4.9.1-092f671/build-config}"
 export KNOWLEDGE_RAG_DIR
 VKS_LAUNCHD_LABEL="${VKS_LAUNCHD_LABEL:-com.vetclub.knowledge-rag}"
 VKS_MIN_FREE_GIB="${VKS_MIN_FREE_GIB:-20}"

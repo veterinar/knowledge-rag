@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ### Unreleased
+- **fix(sync)** — repin the hourly scheduler defaults to the policy-aware
+  `4.9.1-092f671` generation CLI and build configuration.
 - **fix(generation)** — mixed-generation source-policy admission now validates
   exact staged-corpus/metadata coverage and reserved categories while preserving
   legacy v3 receipt compatibility.
