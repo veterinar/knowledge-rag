@@ -1549,8 +1549,12 @@ def test_mixed_generation_source_policy_contract(store, tmp_path, monkeypatch):
     from mcp_server import generation_cli as cli
 
     corpus = {"vault-vet/x.md": b"# vx\n", "vault-vet/sub/y.md": b"# vy\n", "notion-vet/z.md": b"# nz\n"}
-    good_meta = {f"d{i}": {"source": s, "category": c} for i, (s, c) in enumerate(
-        [("vault-vet/x.md", "vault-vet"), ("vault-vet/sub/y.md", "vault-vet"), ("notion-vet/z.md", "notion-vet")])}
+    good_meta = {
+        f"d{i}": {"source": s, "category": c}
+        for i, (s, c) in enumerate(
+            [("vault-vet/x.md", "vault-vet"), ("vault-vet/sub/y.md", "vault-vet"), ("notion-vet/z.md", "notion-vet")]
+        )
+    }
 
     def run_cli(gid, metadata):
         """Real ``_build_command`` on a nested corpus; only population,
@@ -1562,24 +1566,41 @@ def test_mixed_generation_source_policy_contract(store, tmp_path, monkeypatch):
         staging = tmp_path / "data" / f".building-{gid}"
         staging.mkdir(parents=True)
         (staging / "index_metadata.json").write_bytes(json.dumps(metadata).encode() + b"\n")
-        cfg = dict(index_mode="versioned", data_dir=str(tmp_path / "data"), source_documents_dir=str(src),
-                   supported_formats=[".md"], exclude_patterns=[], collection_name="knowledge_rag_v1",
-                   category_mappings={"vault-vet/": "vault-vet", "notion-vet/": "notion-vet"},
-                   generation_compatibility=lambda: {"model_artifact_sha256": HEX("model-artifact-v1")}, active_generation_id=None)
+        cfg = dict(
+            index_mode="versioned",
+            data_dir=str(tmp_path / "data"),
+            source_documents_dir=str(src),
+            supported_formats=[".md"],
+            exclude_patterns=[],
+            collection_name="knowledge_rag_v1",
+            category_mappings={"vault-vet/": "vault-vet", "notion-vet/": "notion-vet"},
+            generation_compatibility=lambda: {"model_artifact_sha256": HEX("model-artifact-v1")},
+            active_generation_id=None,
+        )
         monkeypatch.setattr(cli, "config", NS(**cfg))
         captured: dict = {}
 
         fake = NS(
             current_identity=lambda: None,
             begin_build=lambda g: staging,
-            publish=lambda g, **kw: captured.__setitem__("publish", kw) or NS(receipt_sha256=HEX("receipt"), to_dict=lambda: {}),
+            publish=lambda g, **kw: (
+                captured.__setitem__("publish", kw) or NS(receipt_sha256=HEX("receipt"), to_dict=lambda: {})
+            ),
             abort_build=lambda g: captured.__setitem__("aborted", g),
         )
         monkeypatch.setattr(cli, "GenerationStore", lambda *a, **k: fake)
         monkeypatch.setattr(cli, "_run_population_child", lambda s, g: {"docs": 3, "chunks": 3, "row_count": 3})
-        monkeypatch.setattr(cli, "_chroma_evidence_from_staging", lambda s: {"row_count": 3, "common_row_digest": HEX("c"), "row_digest": HEX("c")})
+        monkeypatch.setattr(
+            cli,
+            "_chroma_evidence_from_staging",
+            lambda s: {"row_count": 3, "common_row_digest": HEX("c"), "row_digest": HEX("c")},
+        )
         monkeypatch.setattr(cli, "_fts_evidence_from_staging", lambda s, c, r: {"row_count": r, "row_digest": c})
-        monkeypatch.setattr(cli, "generation_identity", lambda c, corpus_manifest_sha256: dict(IDENTITY, corpus_manifest_sha256=corpus_manifest_sha256))
+        monkeypatch.setattr(
+            cli,
+            "generation_identity",
+            lambda c, corpus_manifest_sha256: dict(IDENTITY, corpus_manifest_sha256=corpus_manifest_sha256),
+        )
         monkeypatch.setattr(cli, "vault_head_or_none", lambda p: None)
         return captured, NS(generation_id=gid)
 
@@ -1590,7 +1611,12 @@ def test_mixed_generation_source_policy_contract(store, tmp_path, monkeypatch):
     assert pol["schema_version"] == 1 and pol["count"] == 3 and pol["policy_sha256"] == gens.source_policy_digest()
     v, n = pol["manifest"]["vault-vet"], pol["manifest"]["notion-vet"]
     assert (v["path_prefix"], v["project_identity"], v["category"], v["count"]) == ("vault-vet/", None, "vault-vet", 2)
-    assert (n["path_prefix"], n["project_identity"], n["category"], n["count"]) == ("notion-vet/", "vetpilot", "notion-vet", 1)
+    assert (n["path_prefix"], n["project_identity"], n["category"], n["count"]) == (
+        "notion-vet/",
+        "vetpilot",
+        "notion-vet",
+        1,
+    )
     # a staged reserved-namespace source resolved to a wrong category aborts before publish
     captured, args = run_cli("g4", {"d1": {"source": "vault-vet/x.md", "category": "general"}})
     with pytest.raises(SystemExit):
@@ -1599,7 +1625,11 @@ def test_mixed_generation_source_policy_contract(store, tmp_path, monkeypatch):
 
     # the real store publishes the same policy and the status seam stays path-free (S7)
     result = publish_generation(store, "g1", corpus=corpus, provenance={"vault_head": None}, source_policy="derive")
-    assert result.receipt["source_policy"] == pol == gens.build_source_policy(store.generations_dir / "g1" / gens.CORPUS_ARTIFACT)
+    assert (
+        result.receipt["source_policy"]
+        == pol
+        == gens.build_source_policy(store.generations_dir / "g1" / gens.CORPUS_ARTIFACT)
+    )
     summary = gens.inspect_current_receipt(store.root)
     assert summary["servable"] and summary["policy_valid"] and summary["source_policy"]["count"] == 3
     assert not any(p in json.dumps(summary) for p in ("x.md", "sub/y.md", "z.md"))

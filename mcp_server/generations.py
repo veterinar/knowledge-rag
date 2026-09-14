@@ -793,9 +793,7 @@ SOURCE_NAMESPACE_PRESET: Dict[str, Tuple[str, Optional[str], str]] = {
     "notion-vet": ("notion-vet/", "vetpilot", "notion-vet"),
 }
 _SOURCE_POLICY_KEYS = frozenset({"schema_version", "policy_sha256", "count", "manifest"})
-_SOURCE_MANIFEST_KEYS = frozenset(
-    {"path_prefix", "project_identity", "category", "count", "manifest_sha256"}
-)
+_SOURCE_MANIFEST_KEYS = frozenset({"path_prefix", "project_identity", "category", "count", "manifest_sha256"})
 
 
 def _namespace_of(rel_posix: str) -> Optional[str]:
@@ -873,14 +871,13 @@ def build_source_policy(
                 f"{sorted(SOURCE_NAMESPACE_PRESET)}: {rel!r}"
             )
         prefix = SOURCE_NAMESPACE_PRESET[namespace][0]
-        by_ns[namespace].append((rel[len(prefix):], sha))
+        by_ns[namespace].append((rel[len(prefix) :], sha))
     manifest: Dict[str, Dict[str, Any]] = {}
     for namespace, (prefix, identity, category) in sorted(SOURCE_NAMESPACE_PRESET.items()):
         ns_entries = by_ns[namespace]
         if not ns_entries:
             raise VerificationError(
-                f"mixed-generation corpus is missing the reserved namespace {namespace!r} "
-                f"(path_prefix {prefix!r})"
+                f"mixed-generation corpus is missing the reserved namespace {namespace!r} (path_prefix {prefix!r})"
             )
         manifest[namespace] = {
             "path_prefix": prefix,
@@ -913,9 +910,7 @@ def _validate_source_policy(policy: Any) -> Dict[str, Any]:
         raise VerificationError(f"{where} must be an object with exactly {sorted(_SOURCE_POLICY_KEYS)}, got: {got}")
     version = policy["schema_version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != SOURCE_POLICY_SCHEMA_VERSION:
-        raise VerificationError(
-            f"{where} schema_version must be {SOURCE_POLICY_SCHEMA_VERSION}, got {version!r}"
-        )
+        raise VerificationError(f"{where} schema_version must be {SOURCE_POLICY_SCHEMA_VERSION}, got {version!r}")
     _require_hex64(policy["policy_sha256"], f"{where} policy_sha256")
     total = policy["count"]
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
@@ -937,9 +932,7 @@ def _validate_source_policy(policy: Any) -> Dict[str, Any]:
         if rec["category"] != category:
             raise VerificationError(f"{nwhere} category must be {category!r}, got {rec['category']!r}")
         if rec["project_identity"] != identity:
-            raise VerificationError(
-                f"{nwhere} project_identity must be {identity!r}, got {rec['project_identity']!r}"
-            )
+            raise VerificationError(f"{nwhere} project_identity must be {identity!r}, got {rec['project_identity']!r}")
         count = rec["count"]
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise VerificationError(f"{nwhere} count must be a nonnegative integer, got {count!r}")
@@ -953,9 +946,7 @@ def _validate_source_policy(policy: Any) -> Dict[str, Any]:
     # for BOTH records; any preset deviation above already failed, and this
     # cross-check rejects any digest that does not match the closed preset.
     if policy["policy_sha256"] != source_policy_digest():
-        raise VerificationError(
-            f"{where} policy_sha256 does not match the canonical closed-preset identity digest"
-        )
+        raise VerificationError(f"{where} policy_sha256 does not match the canonical closed-preset identity digest")
     return policy
 
 
@@ -1024,9 +1015,7 @@ def _crossbind_source_policy(gdir: Path, receipt: Dict[str, Any]) -> None:
                 "(prefix coverage, namespace counts, or manifest digests)"
             )
     elif has_policy:
-        raise VerificationError(
-            "receipt carries source_policy but the sealed corpus proves no reserved namespace path"
-        )
+        raise VerificationError("receipt carries source_policy but the sealed corpus proves no reserved namespace path")
 
 
 def _stable_json_digest(payload: Any) -> str:
@@ -3231,8 +3220,7 @@ class GenerationStore:
         if not isinstance(receipt, dict) or (set(receipt) != legacy_keys and set(receipt) != _RECEIPT_KEYS):
             got = sorted(receipt) if isinstance(receipt, dict) else type(receipt).__name__
             raise VerificationError(
-                f"receipt keys must be exactly {sorted(legacy_keys)} or that set "
-                f"plus {SOURCE_POLICY_KEY!r}, got: {got}"
+                f"receipt keys must be exactly {sorted(legacy_keys)} or that set plus {SOURCE_POLICY_KEY!r}, got: {got}"
             )
         version = receipt["schema_version"]
         if isinstance(version, bool) or not isinstance(version, int) or version != RECEIPT_SCHEMA_VERSION:
